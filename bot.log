@@ -1,0 +1,36 @@
+2026-05-20 19:10:48,297 INFO ============================================================
+2026-05-20 19:10:48,298 INFO Discord Signal Bot starting — DRY_RUN=True
+2026-05-20 19:10:48,299 INFO BloFin base: https://demo-trading-openapi.blofin.com
+2026-05-20 19:10:48,299 INFO Analysts (10): Soul Alerts, Prestige Alerts, Sveezy Alerts, Caleb Alerts, Nurse-Neil Alerts, Sherlock Alerts, Wilsauce Alerts, Badillusion Alerts, Ajmal Alerts, Grasady Alerts
+2026-05-20 19:10:48,299 INFO Poll interval: 60s
+2026-05-20 19:10:48,299 INFO ============================================================
+2026-05-20 19:10:48,306 ERROR Cannot reach Discord in Chrome!
+Make sure Chrome is running with --remote-debugging-port=9222
+and Discord is open in a tab. Use run_bot.bat to launch correctly.
+2026-05-20 19:14:57,108 INFO ============================================================
+2026-05-20 19:14:57,108 INFO Discord Signal Bot starting — DRY_RUN=True
+2026-05-20 19:14:57,108 INFO BloFin base: https://demo-trading-openapi.blofin.com
+2026-05-20 19:14:57,108 INFO Analysts (10): Soul Alerts, Prestige Alerts, Sveezy Alerts, Caleb Alerts, Nurse-Neil Alerts, Sherlock Alerts, Wilsauce Alerts, Badillusion Alerts, Ajmal Alerts, Grasady Alerts
+2026-05-20 19:14:57,108 INFO Poll interval: 60s
+2026-05-20 19:14:57,108 INFO ============================================================
+2026-05-20 19:14:57,113 ERROR Cannot reach Discord in Chrome!
+Make sure Chrome is running with --remote-debugging-port=9222
+and Discord is open in a tab. Use run_bot.bat to launch correctly.
+2026-05-20 19:23:41,209 INFO ============================================================
+2026-05-20 19:23:41,210 INFO Discord Signal Bot starting — DRY_RUN=True
+2026-05-20 19:23:41,210 INFO BloFin base: https://demo-trading-openapi.blofin.com
+2026-05-20 19:23:41,210 INFO Analysts (10): Soul Alerts, Prestige Alerts, Sveezy Alerts, Caleb Alerts, Nurse-Neil Alerts, Sherlock Alerts, Wilsauce Alerts, Badillusion Alerts, Ajmal Alerts, Grasady Alerts
+2026-05-20 19:23:41,210 INFO Poll interval: 60s
+2026-05-20 19:23:41,210 INFO ============================================================
+2026-05-20 19:23:41,217 ERROR Cannot reach Discord in Chrome!
+Make sure Chrome is running with --remote-debugging-port=9222
+and Discord is open in a tab. Use run_bot.bat to launch correctly.
+2026-05-20 19:27:51,157 INFO ============================================================
+2026-05-20 19:27:51,157 INFO Discord Signal Bot starting — DRY_RUN=True
+2026-05-20 19:27:51,158 INFO BloFin base: https://demo-trading-openapi.blofin.com
+2026-05-20 19:27:51,158 INFO Analysts (10): Soul Alerts, Prestige Alerts, Sveezy Alerts, Caleb Alerts, Nurse-Neil Alerts, Sherlock Alerts, Wilsauce Alerts, Badillusion Alerts, Ajmal Alerts, Grasady Alerts
+2026-05-20 19:27:51,158 INFO Poll interval: 60s
+2026-05-20 19:27:51,158 INFO ============================================================
+2026-05-20 19:27:51,163 ERROR Cannot reach Discord in Chrome!
+Make sure Chrome is running with --remote-debugging-port=9222
+and Discord is open in a tab. Use run_bot.bat to launch correctly.
