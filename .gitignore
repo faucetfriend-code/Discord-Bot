@@ -1,0 +1,16 @@
+# Credentials — never commit
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data
+bot.log
+bot.db
+signals_log.csv
+
+# Chrome CDP isolated profile
+/chrome-cdp-profile/
+C:/chrome-cdp-profile/
