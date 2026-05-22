@@ -74,6 +74,41 @@ def place_order(signal, size: float) -> dict:
     return resp
 
 
+def amend_order(inst_id: str, order_id: str,
+                new_sl: Optional[float] = None,
+                new_tp: Optional[float] = None) -> dict:
+    """Amend SL and/or TP on an existing open order."""
+    params: dict = {"inst_id": inst_id, "ord_id": order_id}
+    if new_sl is not None:
+        params["new_sl_trigger_px"] = str(new_sl)
+    if new_tp is not None:
+        params["new_tp_trigger_px"] = str(new_tp)
+    try:
+        client = _get_client()
+        resp = client.trading.amend_order(**params)
+        log.info(f"Amend order response: {resp}")
+        return resp
+    except Exception as e:
+        log.error(f"amend_order failed: {e}")
+        return {}
+
+
+def close_position_api(inst_id: str, position_side: str) -> dict:
+    """Market-close an entire open position."""
+    try:
+        client = _get_client()
+        resp = client.trading.close_position(
+            inst_id=inst_id,
+            margin_mode="cross",
+            position_side=position_side,
+        )
+        log.info(f"Close position response: {resp}")
+        return resp
+    except Exception as e:
+        log.error(f"close_position_api failed: {e}")
+        return {}
+
+
 def cancel_all_orders() -> dict:
     try:
         return _get_client().trading.cancel_all_orders()

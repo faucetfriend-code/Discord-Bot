@@ -80,6 +80,34 @@ def get_open_positions() -> list[Position]:
     ]
 
 
+def update_position_sl_tp(order_id: str,
+                          new_sl: Optional[float],
+                          new_tp: Optional[float]):
+    """Update SL and/or TP on an open position in the DB."""
+    fields, vals = [], []
+    if new_sl is not None:
+        fields.append("sl=?")
+        vals.append(new_sl)
+    if new_tp is not None:
+        fields.append("tp=?")
+        vals.append(new_tp)
+    if not fields:
+        return
+    vals.append(order_id)
+    con = sqlite3.connect(DB_PATH)
+    con.execute(f"UPDATE positions SET {', '.join(fields)} WHERE order_id=?", vals)
+    con.commit()
+    con.close()
+
+
+def find_open_by_symbol(symbol: str) -> Optional["Position"]:
+    """Return the first open position matching the symbol, or None."""
+    for pos in get_open_positions():
+        if pos.symbol == symbol:
+            return pos
+    return None
+
+
 def mark_seen(msg_id: str):
     con = sqlite3.connect(DB_PATH)
     con.execute("INSERT OR IGNORE INTO seen_messages (msg_id) VALUES (?)", (msg_id,))

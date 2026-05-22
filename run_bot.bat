@@ -7,7 +7,8 @@ timeout /t 3 /nobreak >nul
 echo Launching Chrome with CDP debug port + Discord...
 start "" "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" ^
   --remote-debugging-port=9222 ^
-  --profile-directory="Default" ^
+  --remote-allow-origins=* ^
+  --user-data-dir="C:\chrome-cdp-profile" ^
   --no-first-run ^
   --no-default-browser-check ^
   "https://discord.com/channels/@me"
