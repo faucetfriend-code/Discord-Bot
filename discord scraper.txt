@@ -1,0 +1,61 @@
+Running your Discord signal parser + BloFin trading bot (Python with discord.py + blofin-sdk-python) directly from your home PC in Toronto is totally feasible and the easiest/cheapest starting point—no VPS cost, full control, instant edits, and zero latency issues since you're already on a decent Canadian internet connection (BloFin API pings should be fine from NA, usually <100-150ms).
+The main challenge is keeping it running 24/7 without your PC sleeping, shutting down, or you closing the terminal. Here's how to do it properly, ranked from easiest to most robust.
+Quick & Easy Options (Good for Testing/Starting)
+
+Just Run It in a Terminal + Prevent Sleep (Simplest, Zero Extra Tools)
+Open Command Prompt or PowerShell (as admin if needed).
+cd to your bot folder.
+Run: python bot.py (or python3 bot.py).
+Keep the window open/minimized.
+Make PC stay awake: Settings → System → Power & sleep → Set "Screen" and "Sleep" to Never when plugged in (important for laptops). Also disable hibernation if it's a laptop.
+Pros: Instant, no learning curve.
+Cons: Bot dies if PC restarts, sleeps, power outage, Windows Update forces reboot, or you accidentally close the window. Fine for daytime testing, not true 24/7.
+
+Use Task Scheduler to Auto-Start on Boot/Login (Free, Built-in Windows)
+Search "Task Scheduler" in Start menu.
+Create Basic Task → Name it "BloFin Discord Bot".
+Trigger: "When the computer starts" (or "When I log on").
+Action: Start a program → Browse to python.exe (usually C:\Python312\python.exe or wherever installed) → Add arguments: full path to your script, e.g. "C:\Users\YourName\bot\bot.py".
+In Conditions: Uncheck "Start only if on AC power" if laptop.
+Settings: Check "Run with highest privileges", "Run whether user is logged on or not" (store password when prompted), "Do not store password" if issues.
+Also add a second task to restart every day at 3 AM (to handle memory leaks or crashes).
+Pros: Auto-starts after reboots/power cycles.
+Cons: If script crashes, it won't auto-restart unless you script a wrapper loop or add retry logic.
+
+
+Most Reliable for True 24/7 (Recommended for Trading Bot)
+Run as a Windows Service using NSSM (Non-Sucking Service Manager) — this is the gold standard for Python bots/scripts on Windows home setups. It's free, lightweight (~300KB), and battle-tested for exactly this (Discord bots, trading scripts).
+Step-by-Step Setup:
+
+Download NSSM: Go to https://nssm.cc/download → Get the latest zip (64-bit version).
+Unzip to a permanent folder, e.g. C:\nssm.
+Open Command Prompt as Administrator.
+cd C:\nssm\win64 (or wherever you unzipped).
+Install the service:textnssm install BloFinBotA GUI pops up:
+Path: Browse to your python.exe (e.g. C:\Python312\python.exe).
+Startup directory: Your bot folder (e.g. C:\Users\Faucet\bot).
+Arguments: bot.py (or full path if needed: C:\Users\Faucet\bot\bot.py).
+Service name: BloFinBot (or whatever).
+Tab "Details": Display name "BloFin Discord Trading Bot".
+Tab "Log on": Use your user account (or Local System if simple).
+Tab "I/O": Optional — redirect stdout/stderr to files for logs (e.g. Output: C:\bot\bot.log).
+Click Install service.
+
+Start it:
+nssm start BloFinBot
+Or open Services app (search "services.msc") → Find "BloFinBot" → Right-click Start.
+Set to auto-start: In Services → Properties → Startup type: Automatic.
+Test: Reboot PC → Check if bot is online in Discord (or tail your log file).
+To edit code: Stop service (nssm stop BloFinBot), edit .py, restart.
+
+Pros of NSSM: Runs in background even if logged out, auto-restarts on crash (configurable), survives reboots/Windows updates (mostly), easy logs.
+Cons: Slight learning curve first time; if Python crashes hard, service may need manual restart (add retry in code or use a wrapper script with while True + try/except).
+Extra Tips for Your Crypto Bot Specifically
+
+Power/Internet Reliability: Toronto power is solid, but add a cheap UPS (~$50-100) for outages. Use wired Ethernet if possible (more stable than WiFi for API calls).
+Security: Never hardcode BloFin API keys in code—use .env file + python-dotenv lib. Run bot under a limited Windows user if paranoid. Firewall: Allow outbound only to api.blofin.com.
+Monitoring: Add simple Telegram/Discord notifications on trade execution or errors (use python-telegram-bot or just requests to your own channel). Or free UptimeRobot to ping a tiny Flask endpoint your bot hosts (if you add one).
+Code Improvements: Wrap main loop in while True: try: ... except Exception as e: log(e); time.sleep(60) for auto-reconnect on crashes.
+When to Switch to VPS: If PC restarts often (updates, family use), power bills spike (laptop plugged in 24/7 uses ~50-100W), or you want true hands-off + better uptime → back to Hostinger/Vultr (~$5-10/mo). Home PC is great for months/years if it's dedicated-ish.
+
+This home setup costs $0 extra and works perfectly for signal-based trading (no need for microsecond execution). Start with the terminal method to test, then move to NSSM once stable. If you hit any snags (e.g. NSSM path issues), drop the error and I'll troubleshoot!
