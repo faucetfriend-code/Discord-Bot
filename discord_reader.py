@@ -98,7 +98,7 @@ def ensure_discord_open() -> bool:
 
 
 def open_inbox() -> bool:
-    """Clicks the Discord notification inbox button (bell icon)."""
+    """Opens the Discord notification inbox panel. No-ops if already open."""
     ws_url = _get_discord_ws_url()
     if not ws_url:
         log.warning("No Discord tab found for inbox click")
@@ -106,14 +106,19 @@ def open_inbox() -> bool:
     js = """(function() {
       var btn = document.querySelector('[aria-label="Inbox"]')
              || document.querySelector('[aria-label="inbox"]');
-      if (btn) { btn.click(); return true; }
-      return false;
+      if (!btn) return 'not_found';
+      if (btn.getAttribute('aria-expanded') === 'true') return 'already_open';
+      btn.click();
+      return 'clicked';
     })()"""
     try:
         result = _eval_js(ws_url, js, timeout=10)
-        if not result:
+        if result == 'not_found':
             log.warning("Inbox button not found in DOM (aria-label='Inbox' missing)")
-        return result is True
+            return False
+        if result == 'already_open':
+            log.debug("Inbox already open — skipping click")
+        return True
     except Exception as e:
         log.warning(f"Could not click inbox button: {e}")
         return False
@@ -216,14 +221,23 @@ def poll_inbox(seen_ids: set[str], whitelist: list[str]) -> list[dict]:
         return []
 
     whitelist_lower = {name.lower() for name in whitelist}
+    # Log unique authors seen so we can verify whitelist matches
+    seen_authors = {msg.get("author", "") for msg in messages if msg.get("author")}
+    if seen_authors:
+        log.info(f"Authors seen in inbox: {sorted(seen_authors)}")
+    else:
+        log.warning("No author field extracted from any notification card — JS author selector may need updating")
+
     new_msgs = []
     for msg in messages:
         if not msg.get("id"):
             continue
         if msg["id"] in seen_ids:
             continue
-        author_lower = msg.get("author", "").lower()
-        if not any(w in author_lower for w in whitelist_lower):
+        # Analyst name appears as a @mention in content (e.g. "@Soul Alerts"),
+        # not necessarily as the author field — check both.
+        haystack = (msg.get("author", "") + " " + msg.get("content", "")).lower()
+        if not any(w in haystack for w in whitelist_lower):
             continue
         new_msgs.append(msg)
 
