@@ -47,6 +47,21 @@ def get_balance() -> float:
         return 0.0
 
 
+def get_market_price(symbol: str) -> Optional[float]:
+    """Return the last traded price for a symbol (used for CMP / market-order sizing)."""
+    try:
+        inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+        client = _get_client()
+        resp = client.market.get_tickers(inst_id=inst_id)
+        data = resp.get("data", [])
+        if isinstance(data, list) and data:
+            return float(data[0].get("last", 0) or 0) or None
+        return None
+    except Exception as e:
+        log.warning(f"get_market_price({symbol}) failed: {e}")
+        return None
+
+
 def place_order(signal, size: float) -> dict:
     """
     Place a limit order with TP and SL attached.
@@ -71,6 +86,33 @@ def place_order(signal, size: float) -> dict:
         sl_trigger_px=str(signal.sl),
     )
     log.info(f"Order response: {resp}")
+    return resp
+
+
+def place_market_order(signal, size: float) -> dict:
+    """
+    Place a market order (no limit price) with optional TP and SL.
+    Used for CMP / 'at market' signals where no entry price is specified.
+    """
+    inst_id = signal.symbol if "-USDT" in signal.symbol else f"{signal.symbol}-USDT"
+    position_side = "long" if signal.side == "buy" else "short"
+
+    params: dict = dict(
+        inst_id=inst_id,
+        margin_mode="cross",
+        position_side=position_side,
+        side=signal.side,
+        order_type="market",
+        size=str(size),
+    )
+    if signal.tp is not None:
+        params["tp_trigger_px"] = str(signal.tp)
+    if signal.sl is not None:
+        params["sl_trigger_px"] = str(signal.sl)
+
+    client = _get_client()
+    resp = client.trading.place_order(**params)
+    log.info(f"Market order response: {resp}")
     return resp
 
 

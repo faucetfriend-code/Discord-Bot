@@ -1,8 +1,10 @@
 """
-Two-stage signal parser with message classification.
+Three-stage signal parser with message classification.
 
 Stage 1: regex fast-path for new entries and common update phrases.
 Stage 2: local Qwen via LM Studio (fallback and classifier for ambiguous messages).
+Stage 3: vision LLM — if a chart image is attached and entry/SL/TP still missing,
+         ask the vision model to read price levels off the chart.
 
 MessageType routing:
   NEW    → open a new position
@@ -11,13 +13,15 @@ MessageType routing:
   NONE   → not a trade message (ignore)
 """
 
+import base64
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+import requests as _http
 from openai import OpenAI
 from logger import log
 
@@ -47,11 +51,12 @@ class Signal:
     side: str           # "buy" or "sell" — may be empty string for UPDATE/CLOSE
     analyst: str
     raw_text: str
-    entry: Optional[float] = None   # new signals only
-    sl: Optional[float] = None      # new signal SL
-    tp: Optional[float] = None      # new signal TP
-    new_sl: Optional[float] = None  # update: new stop loss value
-    new_tp: Optional[float] = None  # update: new take profit value
+    entry: Optional[float] = None    # new signals only; None = market order (CMP)
+    sl: Optional[float] = None       # new signal SL
+    tp: Optional[float] = None       # new signal TP
+    new_sl: Optional[float] = None   # update: new stop loss value
+    new_tp: Optional[float] = None   # update: new take profit value
+    is_market_order: bool = False    # True when analyst says "at CMP" / no limit price
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +65,7 @@ class Signal:
 _NEW_PATTERNS = [
     # "LONG BTC | Entry: 45000 | SL: 44000 | TP: 47000"
     r'(?P<side>long|short|buy|sell)\s+(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\b'
-    r'.*?entr(?:y|:)[\s:]*(?P<entry>[\d,.]+)'
+    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*(?P<entry>[\d,.]+)'
     r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
     r'.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+)',
 
@@ -71,9 +76,15 @@ _NEW_PATTERNS = [
 
     # "⚡ ASTER/USDT LONG  Entry 0.67  SL 0.63  TP 0.70"
     r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s+(?P<side>long|short|buy|sell)'
-    r'.*?entr(?:y|:)[\s:]*(?P<entry>[\d,.]+)'
+    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*(?P<entry>[\d,.]+)'
     r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
     r'.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+)',
+
+    # "CHZ LONG CMP/ 0.3622 SL: 0.03514" — no TP (tp group intentionally absent)
+    r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s+(?P<side>long|short|buy|sell)'
+    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*(?P<entry>[\d,.]+)'
+    r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
+    r'(?:.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+))?',
 ]
 
 # ---------------------------------------------------------------------------
@@ -110,6 +121,28 @@ _SYMBOL_EXTRACT = re.compile(
     r'\b([A-Z]{2,10})(?:[/-]USDT?)?\b',
 )
 
+# Detects "at CMP", "market long/short", "longing X at CMP" — no limit entry price.
+_CMP_PATTERN = re.compile(
+    r'\bat\s+cmp\b'
+    r'|market\s+(?:long|short|buy|sell|order)'
+    r'|(?:long|short)ing\b[^.]*\bat\s+cmp\b',
+    re.IGNORECASE,
+)
+
+# "4H close under 0.0939", "close below 0.09" — stop loss phrasing without "SL:" keyword.
+_CLOSE_UNDER_SL = re.compile(
+    r'close[sd]?\s+(?:under|below)\s*([\d,.]+)',
+    re.IGNORECASE,
+)
+
+# Pre-filter: if NONE of these appear in a message it cannot be a trade signal.
+# Avoids sending pure chatter / memes / announcements through the LLM.
+_TRADE_HINT = re.compile(
+    r'\b(?:long|short|buy|sell|entry|cmp|sl|tp|stop|target|lev(?:erage)?|'
+    r'usdt|futures|perp|trade|signal|alert|close|exit|scalp|swing|position)\b',
+    re.IGNORECASE,
+)
+
 
 def _normalise_symbol(raw: str) -> str:
     raw = raw.upper().replace("/", "-").replace("USDT", "").rstrip("-")
@@ -122,12 +155,15 @@ def _to_float(s: str) -> float:
 
 def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
     try:
-        side_raw = m.group("side").lower()
+        gd = m.groupdict()
+        side_raw = gd["side"].lower()
         side = "buy" if side_raw in ("buy", "long") else "sell"
-        symbol = _normalise_symbol(m.group("sym"))
-        entry = _to_float(m.group("entry"))
-        sl = _to_float(m.group("sl"))
-        tp = _to_float(m.group("tp"))
+        symbol = _normalise_symbol(gd["sym"])
+        entry = _to_float(gd["entry"])
+        sl = _to_float(gd["sl"])
+        # tp group is optional in the 4th pattern — may be None
+        tp_raw = gd.get("tp")
+        tp = _to_float(tp_raw) if tp_raw is not None else None
         return Signal(
             message_type=MessageType.NEW,
             symbol=symbol, side=side, entry=entry, sl=sl, tp=tp,
@@ -184,16 +220,19 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
         "You are a trading signal classifier. Analyse the message below and return ONLY "
         "a raw JSON object (no markdown, no explanation) with these exact keys:\n"
         '  "type": "new" | "update" | "close" | "none"\n'
-        '    "new"    = opening a new position (has entry price)\n'
+        '    "new"    = opening a new position\n'
         '    "update" = modifying SL/TP on an existing position '
         '(break even, trailing stop, partial TP hit, SL move)\n'
         '    "close"  = fully exiting/closing a position\n'
         '    "none"   = not a trade message\n'
         '  "symbol": string e.g. "BTC-USDT"  (null if absent)\n'
         '  "side":   "buy" | "sell"           (null if absent)\n'
-        '  "entry":  number                   (null if absent, new only)\n'
-        '  "sl":     number                   (null if absent, new signal SL)\n'
-        '  "tp":     number                   (null if absent, new signal TP)\n'
+        '  "entry":  number or null — use null when analyst says "at CMP", "at market",\n'
+        '            or gives no specific entry price (market order)\n'
+        '  "sl":     number — also extract from "close under X", "close below X",\n'
+        '            "4H close under X for stops" phrasing  (null if absent)\n'
+        '  "tp":     number or null — use null when TP is described as "above in white",\n'
+        '            "on chart", or no numeric TP is given\n'
         '  "new_sl": number                   (null if absent, update new SL)\n'
         '  "new_tp": number                   (null if absent, update new TP)\n\n'
         f"Message:\n{text[:800]}"
@@ -244,6 +283,138 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
         return None
 
 
+def _vision_parse(image_url: str) -> dict:
+    """
+    Download a chart screenshot from Discord CDN and ask the vision LLM to
+    extract entry, SL, and TP price levels.
+
+    Returns a dict with keys "entry", "sl", "tp" (each float or None).
+    Returns {} if LOCAL_VISION_MODEL is not configured or on any error.
+    """
+    vision_model = os.getenv("LOCAL_VISION_MODEL", "").strip()
+    if not vision_model:
+        return {}
+    try:
+        r = _http.get(image_url, timeout=20)
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "image/png").split(";")[0].strip()
+        img_b64 = base64.b64encode(r.content).decode("utf-8")
+
+        client = _get_llm()
+        response = client.chat.completions.create(
+            model=vision_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a price-extraction tool. "
+                        "You output ONLY valid JSON. No prose, no analysis, no markdown."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{ct};base64,{img_b64}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Look at this TradingView chart. Find the entry price, "
+                                "stop loss (SL), and take profit (TP) price levels shown "
+                                "as horizontal lines or labeled levels on the chart. "
+                                "Pick ONE precise number for each (the most prominent level). "
+                                "Output ONLY this JSON — nothing else:\n"
+                                '{"entry": 0.0, "sl": 0.0, "tp": 0.0}\n'
+                                "Use null for any value you cannot confidently identify."
+                            ),
+                        },
+                    ],
+                },
+            ],
+            max_tokens=60,
+            temperature=0.0,
+        )
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown fences if the model wraps despite instructions
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+
+        # Try direct parse first
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Fallback: pull the first {...} blob from a verbose response
+            m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+            if not m:
+                log.debug(f"Vision parse: no JSON found in: {raw[:300]}")
+                return {}
+            data = json.loads(m.group())
+
+        def _sf(k):
+            v = data.get(k)
+            return float(v) if v is not None else None
+
+        result = {"entry": _sf("entry"), "sl": _sf("sl"), "tp": _sf("tp")}
+        log.info(f"Vision parse result: {result}")
+        return result
+    except Exception as e:
+        log.debug(f"Vision parse failed: {e}")
+        return {}
+
+
+def _vision_fill(sig: Signal, msg: dict) -> Signal:
+    """
+    For a NEW signal missing entry/SL/TP, attempt to fill the gaps using the
+    chart image attached to the Discord notification (if any).
+    UPDATE and CLOSE signals are returned unchanged.
+    """
+    if sig.message_type != MessageType.NEW:
+        return sig
+    image_url = msg.get("image_url", "") or ""
+    if not image_url:
+        return sig
+    # All three fields present — nothing to do
+    if sig.entry is not None and sig.sl is not None and sig.tp is not None:
+        return sig
+
+    vision = _vision_parse(image_url)
+    if not vision:
+        return sig
+
+    if sig.entry is None and vision.get("entry") is not None:
+        sig.entry = vision["entry"]
+        log.info(f"Vision filled entry={sig.entry} for {sig.symbol}")
+    if sig.sl is None and vision.get("sl") is not None:
+        sig.sl = vision["sl"]
+        log.info(f"Vision filled sl={sig.sl} for {sig.symbol}")
+    if sig.tp is None and vision.get("tp") is not None:
+        sig.tp = vision["tp"]
+        log.info(f"Vision filled tp={sig.tp} for {sig.symbol}")
+    return sig
+
+
+def _apply_cmp_flags(sig: Signal, text: str) -> Signal:
+    """
+    Post-process a NEW signal:
+    - Mark is_market_order=True if CMP phrasing detected and entry is still None.
+    - Backfill SL from "close under/below X" phrasing if sl is still None.
+    """
+    if sig.message_type != MessageType.NEW:
+        return sig
+    if sig.entry is None and _CMP_PATTERN.search(text):
+        sig.is_market_order = True
+    if sig.sl is None:
+        m = _CLOSE_UNDER_SL.search(text)
+        if m:
+            try:
+                sig.sl = _to_float(m.group(1))
+                log.debug(f"Extracted SL from 'close under' phrasing: {sig.sl}")
+            except Exception:
+                pass
+    return sig
+
+
 def parse(msg: dict) -> Optional[Signal]:
     """
     Classify and parse a notification message dict into a Signal.
@@ -252,10 +423,14 @@ def parse(msg: dict) -> Optional[Signal]:
     Priority:
       1. Update keyword regex fast-path
       2. Close keyword regex fast-path
-      3. New entry regex patterns
-      4. LLM fallback (classifies type + extracts fields)
+      3. New entry regex patterns  [+ CMP flags + Stage 3 vision fill]
+      4. LLM fallback              [+ CMP flags + Stage 3 vision fill]
     """
     text = msg.get("content", "")
+
+    # Quick pre-filter: skip pure chatter with no trading vocabulary at all.
+    if not _TRADE_HINT.search(text):
+        return None
 
     # Stage 1a — update fast-path
     sig = _try_update_regex(text, msg)
@@ -275,11 +450,15 @@ def parse(msg: dict) -> Optional[Signal]:
         if m:
             sig = _build_new_signal(m, msg)
             if sig:
-                log.debug(f"Regex NEW: {sig.side} {sig.symbol} @ {sig.entry}")
-                return sig
+                sig = _apply_cmp_flags(sig, text)
+                log.debug(f"Regex NEW: {sig.side} {sig.symbol} @ {sig.entry} "
+                          f"sl={sig.sl} tp={sig.tp} market={sig.is_market_order}")
+                return _vision_fill(sig, msg)
 
     # Stage 2 — LLM
     sig = _llm_parse(text, msg)
     if sig:
-        log.debug(f"LLM {sig.message_type.value}: {sig.symbol}")
+        sig = _apply_cmp_flags(sig, text)
+        log.debug(f"LLM {sig.message_type.value}: {sig.symbol} market={sig.is_market_order}")
+        return _vision_fill(sig, msg)
     return sig

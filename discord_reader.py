@@ -162,7 +162,13 @@ def _parse_notifications_js() -> list[dict]:
         var timeEl = el.querySelector('time');
         var time = timeEl ? timeEl.getAttribute('datetime') : '';
 
-        return {id: id, author: author, content: content, time: time};
+        // Extract first image URL (chart screenshots attached to signals)
+        var imgEl = el.querySelector(
+          'img[src*="cdn.discordapp"], img[src*="media.discordapp"], img[src*="cdn.discord"]'
+        );
+        var image_url = imgEl ? imgEl.src : '';
+
+        return {id: id, author: author, content: content, time: time, image_url: image_url};
       }).filter(function(m) { return m.content; });
     })()
     """
@@ -199,12 +205,14 @@ def _dump_inbox_panel_html() -> str:
     return str(result or "eval_returned_none")
 
 
-def poll_inbox(seen_ids: set[str], whitelist: list[str]) -> list[dict]:
+def poll_inbox(seen_ids: set[str]) -> list[dict]:
     """
-    Opens the inbox, scrapes notification cards, filters by analyst whitelist,
-    and returns only messages not already in seen_ids.
+    Opens the inbox, scrapes notification cards, and returns all messages
+    not already in seen_ids.  Whitelist filtering is intentionally NOT done
+    here — every unseen message is returned so the parser can classify it
+    and the bot can decide whether to execute based on the whitelist.
 
-    Each returned dict: {id, author, content, time}
+    Each returned dict: {id, author, content, time, image_url}
     """
     ensure_discord_open()
 
@@ -220,26 +228,13 @@ def poll_inbox(seen_ids: set[str], whitelist: list[str]) -> list[dict]:
         log.warning(_dump_inbox_panel_html())
         return []
 
-    whitelist_lower = {name.lower() for name in whitelist}
-    # Log unique authors seen so we can verify whitelist matches
-    seen_authors = {msg.get("author", "") for msg in messages if msg.get("author")}
-    if seen_authors:
-        log.info(f"Authors seen in inbox: {sorted(seen_authors)}")
-    else:
-        log.warning("No author field extracted from any notification card — JS author selector may need updating")
-
     new_msgs = []
     for msg in messages:
         if not msg.get("id"):
             continue
         if msg["id"] in seen_ids:
             continue
-        # Analyst name appears as a @mention in content (e.g. "@Soul Alerts"),
-        # not necessarily as the author field — check both.
-        haystack = (msg.get("author", "") + " " + msg.get("content", "")).lower()
-        if not any(w in haystack for w in whitelist_lower):
-            continue
         new_msgs.append(msg)
 
-    log.info(f"Inbox poll: {len(messages)} total, {len(new_msgs)} new from whitelisted analysts")
+    log.info(f"Inbox poll: {len(messages)} total, {len(new_msgs)} unseen")
     return new_msgs

@@ -37,9 +37,54 @@ def _get_whitelist() -> list[str]:
 # Per-type handlers
 # ---------------------------------------------------------------------------
 
+def _calc_auto_tp(signal: sp.Signal) -> float | None:
+    """
+    Auto-calculate TP using DEFAULT_RR risk:reward ratio when analyst omits it.
+    Long:  TP = entry + RR * (entry - SL)
+    Short: TP = entry - RR * (SL - entry)
+    Returns None if entry/SL are missing or the geometry is wrong.
+    """
+    try:
+        rr = float(os.getenv("DEFAULT_RR", "2.0"))
+        entry, sl = signal.entry, signal.sl
+        if entry is None or sl is None:
+            return None
+        if signal.side == "buy":
+            risk = entry - sl
+            if risk <= 0:
+                return None
+            return round(entry + rr * risk, 8)
+        else:  # sell / short
+            risk = sl - entry
+            if risk <= 0:
+                return None
+            return round(entry - rr * risk, 8)
+    except Exception:
+        return None
+
+
 def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool):
-    """Validate and place a new order."""
+    """Validate and place a new order (limit or market)."""
     analyst = signal.analyst
+
+    # For market/CMP orders: fetch live price so we can size and auto-TP correctly.
+    if signal.is_market_order and signal.entry is None:
+        live_price = bf.get_market_price(signal.symbol)
+        if live_price:
+            signal.entry = live_price
+            log.info(f"[{analyst}] CMP signal — fetched live price {live_price} for {signal.symbol}")
+        else:
+            log.warning(f"[{analyst}] CMP signal but could not fetch live price — skipping")
+            _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                                   outcome="cmp_price_fetch_failed")
+            return
+
+    # Auto-calculate TP at DEFAULT_RR if analyst didn't provide one
+    if signal.tp is None and signal.entry is not None and signal.sl is not None:
+        signal.tp = _calc_auto_tp(signal)
+        if signal.tp is not None:
+            log.info(f"[{analyst}] No TP in signal — auto-calculated at "
+                     f"{os.getenv('DEFAULT_RR', '2.0')}:1 R:R → TP={signal.tp}")
 
     if signal.entry is None or signal.sl is None or signal.tp is None:
         log.warning(f"[{analyst}] NEW signal missing entry/sl/tp — skipping")
@@ -47,7 +92,8 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool):
                                outcome="incomplete_signal")
         return
 
-    log.info(f"[{analyst}] NEW {signal.side.upper()} {signal.symbol} "
+    order_label = "MARKET" if signal.is_market_order else "LIMIT"
+    log.info(f"[{analyst}] NEW {order_label} {signal.side.upper()} {signal.symbol} "
              f"entry={signal.entry} sl={signal.sl} tp={signal.tp}")
 
     ok, reason = rm.validate(signal, open_positions)
@@ -73,7 +119,10 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool):
         return
 
     try:
-        resp = bf.place_order(signal, size)
+        if signal.is_market_order:
+            resp = bf.place_market_order(signal, size)
+        else:
+            resp = bf.place_order(signal, size)
         order_id = resp.get("data", {}).get("ordId", "") or str(resp)
         log.info(f"Order placed: {order_id}")
 
@@ -159,16 +208,29 @@ def _process_close(signal: sp.Signal, position: pt.Position, dry_run: bool):
 # Message router
 # ---------------------------------------------------------------------------
 
-def _process_message(msg: dict, dry_run: bool):
+def _is_whitelisted(msg: dict, whitelist_lower: set[str]) -> bool:
+    """Return True if the message author or content contains a whitelisted analyst name."""
+    haystack = (msg.get("author", "") + " " + msg.get("content", "")).lower()
+    return any(w in haystack for w in whitelist_lower)
+
+
+def _process_message(msg: dict, dry_run: bool, whitelist_lower: set[str]):
     signal = sp.parse(msg)
     analyst = msg.get("author", "unknown")
 
     if signal is None:
-        log.info(f"[{analyst}] No trade signal detected")
+        log.debug(f"[{analyst}] No trade signal detected")
         _logger_mod.log_signal(analyst, msg.get("content", ""), outcome="no_signal")
         return
 
     log.info(f"[{analyst}] Classified as {signal.message_type.value.upper()} | {signal.symbol}")
+
+    # Whitelist gate — log the signal but don't execute if analyst isn't whitelisted.
+    if not _is_whitelisted(msg, whitelist_lower):
+        log.info(f"[{analyst}] Signal parsed but analyst not whitelisted — skipping execution")
+        _logger_mod.log_signal(analyst, msg.get("content", ""), signal=signal,
+                               outcome="not_whitelisted")
+        return
 
     if signal.message_type == MessageType.NEW:
         open_positions = pt.get_open_positions()
@@ -254,13 +316,14 @@ def main():
             bot_state["discord_tab"] = bool(dr._get_discord_ws_url())
             log.info(f"--- Poll #{bot_state['poll_count']} ---")
 
-            new_msgs = dr.poll_inbox(seen_ids, whitelist)
+            new_msgs = dr.poll_inbox(seen_ids)
             bot_state["last_poll_found"] = len(new_msgs)
 
+            whitelist_lower = {name.lower() for name in whitelist}
             for msg in new_msgs:
                 pt.mark_seen(msg["id"])
                 seen_ids.add(msg["id"])
-                _process_message(msg, dry_run)
+                _process_message(msg, dry_run, whitelist_lower)
                 bot_state["last_signal_at"] = datetime.now(timezone.utc).isoformat()
 
         except KeyboardInterrupt:
