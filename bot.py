@@ -1,13 +1,19 @@
 """
-Main bot loop.
-Polls Discord notification inbox every POLL_INTERVAL seconds.
-Parses and classifies signals, then routes:
+Main bot loop — real-time event-driven via CDP MutationObserver.
+
+A persistent Chrome DevTools Protocol WebSocket injects a MutationObserver
+into Discord's notification inbox.  New notifications are delivered to a
+queue instantly.  A periodic sweep (SWEEP_INTERVAL seconds) re-injects the
+observer and does a full inbox scan as a safety net.
+
+Signal routing:
   NEW    → validate risk, size, place order on BloFin
   UPDATE → amend SL/TP on existing BloFin order
   CLOSE  → market-close existing BloFin position
 """
 
 import os
+import queue as _queue
 import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -264,12 +270,28 @@ def _process_message(msg: dict, dry_run: bool, whitelist_lower: set[str]):
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _handle_msg(msg: dict, dry_run: bool, whitelist: list[str], bot_state: dict, seen_ids: set):
+    """Mark a message seen and run the full parse + route pipeline."""
+    msg_id = msg.get("id", "")
+    if not msg_id or msg_id in seen_ids:
+        return
+    pt.mark_seen(msg_id)
+    seen_ids.add(msg_id)
+    bot_state["poll_count"] += 1
+    bot_state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+    whitelist_lower = {name.lower() for name in whitelist}
+    _process_message(msg, dry_run, whitelist_lower)
+    bot_state["last_signal_at"] = datetime.now(timezone.utc).isoformat()
+
+
 def main():
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-    poll_interval = int(os.getenv("POLL_INTERVAL", 60))
+    # SWEEP_INTERVAL: how often to re-inject the observer and do a full inbox scan.
+    # This is the only remaining periodic operation; real-time delivery is via the listener.
+    sweep_interval = int(os.getenv("POLL_INTERVAL", 300))
     whitelist = _get_whitelist()
+    server_filter = os.getenv("DISCORD_SERVER_FILTER", "")
 
-    # Shared state for the dashboard
     bot_state = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
@@ -287,9 +309,11 @@ def main():
     log.info(f"Discord Signal Bot starting — DRY_RUN={dry_run}")
     log.info(f"BloFin base: {os.getenv('BLOFIN_BASE_URL')}")
     log.info(f"Analysts ({len(whitelist)}): {', '.join(whitelist)}")
-    log.info(f"Poll interval: {poll_interval}s")
+    log.info(f"Server filter: '{server_filter or 'none'}'")
+    log.info(f"Sweep interval: {sweep_interval}s")
     log.info("=" * 60)
 
+    # Wait for Chrome CDP to be ready
     connected = False
     for attempt in range(1, 7):
         if dr.verify_connected():
@@ -301,7 +325,7 @@ def main():
     if not connected:
         log.error(
             "Cannot reach Chrome on port 9222 after 30s.\n"
-            "Make sure Chrome launched via run_bot.bat (it must start fresh with --remote-debugging-port=9222)."
+            "Make sure Chrome launched via run_bot.bat."
         )
         return
 
@@ -309,30 +333,56 @@ def main():
     seen_ids = pt.get_seen_ids()
     log.info(f"Loaded {len(seen_ids)} previously-seen message IDs")
 
+    # Startup sweep — catch any messages that arrived while the bot was offline
+    log.info("Running startup inbox sweep…")
+    for msg in dr.poll_inbox(seen_ids, server_filter):
+        _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
+
+    # Start real-time listener
+    listener = dr.NotificationListener(seen_ids, server_filter)
+    try:
+        listener.start()
+    except Exception as e:
+        log.error(f"Failed to start real-time listener: {e} — falling back to sweep-only mode")
+        listener = None
+
+    last_sweep = time.time()
+
     while True:
         try:
-            bot_state["poll_count"] += 1
-            bot_state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
             bot_state["discord_tab"] = bool(dr._get_discord_ws_url())
-            log.info(f"--- Poll #{bot_state['poll_count']} ---")
 
-            new_msgs = dr.poll_inbox(seen_ids)
-            bot_state["last_poll_found"] = len(new_msgs)
+            if listener and listener.is_alive:
+                # Block until a notification arrives or timeout for maintenance
+                try:
+                    msg = listener.queue.get(timeout=30)
+                    bot_state["last_poll_found"] = 1
+                    log.info("--- Real-time notification ---")
+                    _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
+                except _queue.Empty:
+                    pass  # no new message in 30s — proceed to maintenance check
+            else:
+                # Listener dead or unavailable — fall back to periodic sweep
+                time.sleep(sweep_interval)
 
-            whitelist_lower = {name.lower() for name in whitelist}
-            for msg in new_msgs:
-                pt.mark_seen(msg["id"])
-                seen_ids.add(msg["id"])
-                _process_message(msg, dry_run, whitelist_lower)
-                bot_state["last_signal_at"] = datetime.now(timezone.utc).isoformat()
+            # Periodic sweep: re-inject observer + full inbox scan
+            if time.time() - last_sweep >= sweep_interval:
+                log.info("Periodic sweep: re-injecting observer and scanning inbox")
+                if listener:
+                    listener.reinject()
+                sweep_msgs = dr.poll_inbox(seen_ids, server_filter)
+                bot_state["last_poll_found"] = len(sweep_msgs)
+                for msg in sweep_msgs:
+                    _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
+                last_sweep = time.time()
 
         except KeyboardInterrupt:
             log.info("Shutting down.")
+            if listener:
+                listener.stop()
             break
         except Exception as e:
-            log.error(f"Poll loop error: {e}")
-
-        time.sleep(poll_interval)
+            log.error(f"Main loop error: {e}")
 
 
 if __name__ == "__main__":

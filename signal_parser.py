@@ -65,26 +65,33 @@ class Signal:
 _NEW_PATTERNS = [
     # "LONG BTC | Entry: 45000 | SL: 44000 | TP: 47000"
     r'(?P<side>long|short|buy|sell)\s+(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\b'
-    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*(?P<entry>[\d,.]+)'
-    r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
-    r'.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+)',
+    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*\$?(?P<entry>[\d,.]+)'
+    r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
+    r'.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+)',
 
     # "BUY BTC-USDT @ 45000, SL 44000, TP 47000"
-    r'(?P<side>buy|sell)\s+(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s*@\s*(?P<entry>[\d,.]+)'
-    r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
-    r'.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+)',
+    r'(?P<side>buy|sell)\s+(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s*@\s*\$?(?P<entry>[\d,.]+)'
+    r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
+    r'.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+)',
 
     # "⚡ ASTER/USDT LONG  Entry 0.67  SL 0.63  TP 0.70"
     r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s+(?P<side>long|short|buy|sell)'
-    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*(?P<entry>[\d,.]+)'
-    r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
-    r'.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+)',
+    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*\$?(?P<entry>[\d,.]+)'
+    r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
+    r'.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+)',
+
+    # "VVV/USDT — SHORT (Leverage) ... Entry $17.33 ... Stop Loss $18.65"
+    # Embed/bot message format with em-dash separator and no TP
+    r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s*[—–-]+\s*(?P<side>long|short|buy|sell)'
+    r'.*?(?:entr(?:y|:)?)[\s:]*\$?(?P<entry>[\d,.]+)'
+    r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
+    r'(?:.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+))?',
 
     # "CHZ LONG CMP/ 0.3622 SL: 0.03514" — no TP (tp group intentionally absent)
     r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s+(?P<side>long|short|buy|sell)'
-    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*(?P<entry>[\d,.]+)'
-    r'.*?s\.?l\.?[\s:]*(?P<sl>[\d,.]+)'
-    r'(?:.*?t\.?p\.?[\s:]*(?P<tp>[\d,.]+))?',
+    r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*\$?(?P<entry>[\d,.]+)'
+    r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
+    r'(?:.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+))?',
 ]
 
 # ---------------------------------------------------------------------------
@@ -110,11 +117,11 @@ _CLOSE_KEYWORDS = re.compile(
 
 # Extract a number after SL/stop keywords in an update message
 _UPDATE_SL_EXTRACT = re.compile(
-    r'(?:s\.?l|stop)(?:\s+to|\s*=|:)?\s*([\d,.]+)',
+    r'(?:s\.?l\.?|stop(?:\s+loss)?)(?:\s+to|\s*=|:)?\s*\$?([\d,.]+)',
     re.IGNORECASE,
 )
 _UPDATE_TP_EXTRACT = re.compile(
-    r'(?:t\.?p\b|take\s*profit)(?:\s+to|\s*=|:)?\s*([\d,.]+)',
+    r'(?:t\.?p\.?\b|take\s*profit)(?:\s+to|\s*=|:)?\s*\$?([\d,.]+)',
     re.IGNORECASE,
 )
 _SYMBOL_EXTRACT = re.compile(
@@ -150,7 +157,7 @@ def _normalise_symbol(raw: str) -> str:
 
 
 def _to_float(s: str) -> float:
-    return float(s.replace(",", ""))
+    return float(str(s).lstrip("$").replace(",", ""))
 
 
 def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:

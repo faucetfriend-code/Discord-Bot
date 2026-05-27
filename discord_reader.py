@@ -5,17 +5,115 @@ Chrome exposes a DevTools Protocol API on port 9222:
   - HTTP  http://localhost:9222/json   → list of open tabs
   - WS    tab["webSocketDebuggerUrl"]  → Runtime.evaluate, etc.
 
+Two operation modes:
+  poll_inbox()          — one-shot scrape of current inbox cards (used as fallback sweep)
+  NotificationListener  — persistent CDP WebSocket + MutationObserver for real-time delivery
+
 Discord uses obfuscated class names that change with updates. The JS selectors
 here are best-effort; update them when Discord pushes a class-name rotation.
 """
 
 import json
+import queue
+import threading
 import time
 import requests
 import websocket
 from logger import log
 
 CDP_BASE = "http://localhost:9222"
+
+# ---------------------------------------------------------------------------
+# MutationObserver script — injected once, fires for every new inbox card
+# ---------------------------------------------------------------------------
+_OBSERVER_JS = r"""
+(function() {
+  if (window.__botObserver) {
+    try { window.__botObserver.disconnect(); } catch(e) {}
+  }
+
+  function extractCard(el) {
+    var id = el.getAttribute('data-list-item-id')
+           || el.getAttribute('id')
+           || (el.querySelector('[id]') ? el.querySelector('[id]').id : '')
+           || '';
+
+    var content = (
+      (el.querySelector('[id^="message-content-"]') || {}).textContent
+      || (el.querySelector('[class*="messageContent"]') || {}).textContent
+      || ''
+    ).trim();
+
+    // Always append embed text — signals arrive as an embed alongside a role ping.
+    var embeds = el.querySelectorAll('[class*="embed"]');
+    if (embeds.length) {
+      var embedText = Array.from(embeds)
+        .map(function(e) { return e.textContent; })
+        .join(' ').replace(/\s+/g, ' ').trim();
+      if (embedText) {
+        content = content ? content + ' ' + embedText : embedText;
+      }
+    }
+
+    if (!id || !content) return null;
+
+    var author = (
+      (el.querySelector('[class*="username"],[class*="author"]') || {}).textContent || ''
+    ).trim();
+    var timeEl = el.querySelector('time');
+    var time   = timeEl ? timeEl.getAttribute('datetime') : '';
+    var imgEl  = el.querySelector(
+      'img[src*="cdn.discordapp"],img[src*="media.discordapp"],img[src*="cdn.discord"]'
+    );
+    var image_url = imgEl ? imgEl.src : '';
+    var headerEl  = el.querySelector('[class*="headerText"]');
+    var header    = headerEl ? headerEl.textContent.trim() : '';
+    var server    = header.split(/\s[·•]\s/)[0].trim();
+
+    return {id:id, author:author, content:content, time:time,
+            image_url:image_url, server:server};
+  }
+
+  function isCard(node) {
+    return node.nodeType === 1 &&
+      (node.matches('[class*="notificationItem"],[class*="notification-item"]') ||
+       (node.matches('[class*="container_"]') &&
+        !!node.querySelector('[id^="message-content-"],[class*="messageContent"],[class*="embed"]')));
+  }
+
+  var observer = new MutationObserver(function(mutations) {
+    mutations.forEach(function(mut) {
+      mut.addedNodes.forEach(function(node) {
+        var candidates = [];
+        if (isCard(node)) {
+          candidates.push(node);
+        } else if (node.nodeType === 1) {
+          var found = node.querySelectorAll(
+            '[class*="notificationItem"],[class*="notification-item"],[class*="container_"]'
+          );
+          found.forEach(function(n) {
+            if (n.querySelector('[id^="message-content-"],[class*="messageContent"],[class*="embed"]'))
+              candidates.push(n);
+          });
+        }
+        candidates.forEach(function(el) {
+          var card = extractCard(el);
+          if (card) { window.__botNotify(JSON.stringify(card)); }
+        });
+      });
+    });
+  });
+
+  var panel = document.querySelector('[class*="inbox"]')
+           || document.querySelector('[aria-label*="nbox"]')
+           || document.querySelector('[class*="notif"]');
+
+  if (!panel) return 'no_panel';
+  observer.observe(panel, {childList: true, subtree: true});
+  window.__botObserver = observer;
+  return 'ok';
+})()
+"""
 
 
 def _get_tabs() -> list[dict]:
@@ -159,8 +257,30 @@ def _parse_notifications_js() -> list[dict]:
           || ''
         ).trim();
 
+        // Always append embed text — Unity Academy signals arrive as an embed
+        // alongside a plain-text role ping (e.g. "@Sveezy Alerts").  If we only
+        // capture the ping, the signal is invisible to the parser.
+        var embedEls = el.querySelectorAll('[class*="embed"]');
+        if (embedEls.length) {
+          var embedText = Array.from(embedEls)
+            .map(function(e) { return e.textContent; })
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (embedText) {
+            content = content ? content + ' ' + embedText : embedText;
+          }
+        }
+
         var timeEl = el.querySelector('time');
         var time = timeEl ? timeEl.getAttribute('datetime') : '';
+
+        // Extract server/guild name from the notification header.
+        // Discord renders it in the headerText area — typically "Server · #channel".
+        var headerEl = el.querySelector('[class*="headerText"]');
+        var header = headerEl ? headerEl.textContent.trim() : '';
+        // The guild name is usually the part before " · " or " • "
+        var server = header.split(/\s[·•]\s/)[0].trim();
 
         // Extract first image URL (chart screenshots attached to signals)
         var imgEl = el.querySelector(
@@ -168,7 +288,8 @@ def _parse_notifications_js() -> list[dict]:
         );
         var image_url = imgEl ? imgEl.src : '';
 
-        return {id: id, author: author, content: content, time: time, image_url: image_url};
+        return {id: id, author: author, content: content, time: time,
+                image_url: image_url, server: server};
       }).filter(function(m) { return m.content; });
     })()
     """
@@ -205,14 +326,16 @@ def _dump_inbox_panel_html() -> str:
     return str(result or "eval_returned_none")
 
 
-def poll_inbox(seen_ids: set[str]) -> list[dict]:
+def poll_inbox(seen_ids: set[str], server_filter: str = "") -> list[dict]:
     """
-    Opens the inbox, scrapes notification cards, and returns all messages
-    not already in seen_ids.  Whitelist filtering is intentionally NOT done
-    here — every unseen message is returned so the parser can classify it
-    and the bot can decide whether to execute based on the whitelist.
+    Opens the inbox, scrapes notification cards, and returns all unseen messages.
 
-    Each returned dict: {id, author, content, time, image_url}
+    server_filter: if non-empty, only messages whose extracted 'server' field
+    contains this string (case-insensitive) are returned.  Set via
+    DISCORD_SERVER_FILTER in .env (e.g. "Unity Academy").
+    Whitelist filtering is NOT done here — that happens in bot.py after parsing.
+
+    Each returned dict: {id, author, content, time, image_url, server}
     """
     ensure_discord_open()
 
@@ -228,13 +351,195 @@ def poll_inbox(seen_ids: set[str]) -> list[dict]:
         log.warning(_dump_inbox_panel_html())
         return []
 
+    sf = server_filter.lower().strip()
+
+    # Log unique server names seen so we can verify the filter value
+    servers_seen = {m.get("server", "") for m in messages if m.get("server")}
+    if servers_seen:
+        log.debug(f"Servers in inbox: {sorted(servers_seen)}")
+    elif sf:
+        log.warning("Server field empty on all cards — DISCORD_SERVER_FILTER may be blocking everything")
+
     new_msgs = []
     for msg in messages:
         if not msg.get("id"):
             continue
         if msg["id"] in seen_ids:
             continue
+        if sf and sf not in msg.get("server", "").lower():
+            continue
         new_msgs.append(msg)
 
-    log.info(f"Inbox poll: {len(messages)} total, {len(new_msgs)} unseen")
+    log.info(f"Inbox poll: {len(messages)} total, {len(new_msgs)} unseen"
+             + (f" from '{server_filter}'" if sf else ""))
     return new_msgs
+
+
+# ---------------------------------------------------------------------------
+# Real-time listener
+# ---------------------------------------------------------------------------
+
+class NotificationListener:
+    """
+    Maintains a persistent CDP WebSocket and a MutationObserver injected into
+    the Discord inbox panel.  New notification cards are delivered instantly
+    via self.queue (a threading.Queue of message dicts).
+
+    Usage:
+        listener = NotificationListener(seen_ids, server_filter="Unity Academy")
+        listener.start()
+        while True:
+            try:
+                msg = listener.queue.get(timeout=30)
+                process(msg)
+            except queue.Empty:
+                listener.reinject()   # re-inject observer periodically
+    """
+
+    def __init__(self, seen_ids: set, server_filter: str = ""):
+        self.queue: queue.Queue = queue.Queue()
+        self.seen_ids = seen_ids          # shared reference — grows as msgs are marked
+        self.server_filter = server_filter.lower().strip()
+        self._ws = None
+        self._thread: threading.Thread | None = None
+        self._send_lock = threading.Lock()
+        self._stopped = False
+        self._msg_id = 100               # CDP message ID counter (avoid clashing with _eval_js)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self):
+        """Connect, register the JS binding, inject observer, start recv thread."""
+        ws_url = _get_discord_ws_url()
+        if not ws_url:
+            raise RuntimeError("NotificationListener: no Discord tab found")
+        # Use a long recv timeout so the socket stays open during quiet periods.
+        # Timeouts are caught in _recv_loop and treated as normal (not errors).
+        self._ws = websocket.create_connection(ws_url, timeout=90)
+        self._cdp("Runtime.enable")
+        self._cdp("Runtime.addBinding", {"name": "__botNotify"})
+        time.sleep(0.3)   # let Chrome register the binding before we inject JS
+        self._do_inject()
+        self._thread = threading.Thread(
+            target=self._recv_loop, daemon=True, name="cdp-listener"
+        )
+        self._thread.start()
+        log.info("Real-time notification listener active")
+
+    def reinject(self):
+        """Re-open inbox and re-inject observer — call every few minutes as a safety net."""
+        try:
+            open_inbox()
+            time.sleep(1.0)
+            self._do_inject()
+            log.debug("Observer re-injected")
+        except Exception as e:
+            log.warning(f"Observer reinject failed: {e}")
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self):
+        self._stopped = True
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _cdp(self, method: str, params: dict | None = None) -> int:
+        mid = self._msg_id
+        self._msg_id += 1
+        payload = json.dumps({"id": mid, "method": method, "params": params or {}})
+        with self._send_lock:
+            self._ws.send(payload)
+        return mid
+
+    def _do_inject(self):
+        self._cdp("Runtime.evaluate", {
+            "expression": _OBSERVER_JS,
+            "returnByValue": True,
+        })
+
+    def _handle_card(self, card: dict):
+        if not card.get("content") or not card.get("id"):
+            return
+        server = card.get("server", "")
+        if self.server_filter:
+            if self.server_filter not in server.lower():
+                log.debug(f"Listener: dropped card (server={server!r} doesn't match filter)")
+                return
+        if card["id"] in self.seen_ids:
+            return
+        log.debug(f"Listener: queuing card from server={server!r} author={card.get('author','')!r}")
+        self.queue.put(card)
+
+    def _recv_loop(self):
+        import socket as _socket
+        _timeout_types = (
+            websocket.WebSocketTimeoutException,
+            _socket.timeout,
+            TimeoutError,
+        )
+        while not self._stopped:
+            try:
+                raw = self._ws.recv()
+                data = json.loads(raw)
+                if data.get("method") == "Runtime.bindingCalled":
+                    p = data.get("params", {})
+                    if p.get("name") == "__botNotify":
+                        try:
+                            card = json.loads(p.get("payload", "{}"))
+                            self._handle_card(card)
+                        except Exception as e:
+                            log.debug(f"Listener card parse error: {e}")
+            except _timeout_types:
+                # No CDP event in the recv window — normal during quiet periods.
+                # Send a lightweight keepalive so Chrome doesn't drop the connection.
+                try:
+                    self._cdp("Runtime.evaluate", {
+                        "expression": "1",
+                        "returnByValue": True,
+                    })
+                except Exception:
+                    pass
+                continue
+            except websocket.WebSocketConnectionClosedException:
+                if not self._stopped:
+                    log.warning("CDP listener WebSocket closed — attempting reconnect")
+                    self._reconnect()
+                return
+            except Exception as e:
+                if not self._stopped:
+                    log.warning(f"CDP listener recv error: {e}")
+                    time.sleep(2)
+
+    def _reconnect(self):
+        for attempt in range(1, 7):
+            wait = 5 * attempt
+            log.info(f"CDP reconnect attempt {attempt}/6 in {wait}s…")
+            time.sleep(wait)
+            try:
+                ws_url = _get_discord_ws_url()
+                if not ws_url:
+                    continue
+                self._ws = websocket.create_connection(ws_url, timeout=90)
+                self._cdp("Runtime.enable")
+                self._cdp("Runtime.addBinding", {"name": "__botNotify"})
+                time.sleep(0.3)
+                open_inbox()
+                time.sleep(1.0)
+                self._do_inject()
+                log.info("CDP listener reconnected successfully")
+                self._recv_loop()   # re-enter the loop on the same thread
+                return
+            except Exception as e:
+                log.warning(f"Reconnect attempt {attempt} failed: {e}")
+        log.error("CDP listener could not reconnect after 6 attempts")
