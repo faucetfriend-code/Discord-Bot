@@ -38,11 +38,36 @@ _OBSERVER_JS = r"""
            || (el.querySelector('[id]') ? el.querySelector('[id]').id : '')
            || '';
 
+    // --- Author ---
+    var author = (
+      (el.querySelector('[class*="username"],[class*="author"]') || {}).textContent || ''
+    ).trim();
+    if (!author) {
+      var roleMentionEl = el.querySelector(
+        '[class*="roleMention"],[class*="mention"][role="button"]'
+      );
+      if (roleMentionEl) author = roleMentionEl.textContent.replace(/^@/, '').trim();
+    }
+
+    // --- Content ---
     var content = (
       (el.querySelector('[id^="message-content-"]') || {}).textContent
       || (el.querySelector('[class*="messageContent"]') || {}).textContent
       || ''
     ).trim();
+
+    // Prepend role mention text so whitelist matching always finds the analyst name
+    var roleMentionEls = el.querySelectorAll(
+      '[class*="roleMention"],[class*="mention"][role="button"]'
+    );
+    if (roleMentionEls.length) {
+      var roleText = Array.from(roleMentionEls)
+        .map(function(r) { return r.textContent.trim(); })
+        .filter(Boolean).join(' ');
+      if (roleText && content.indexOf(roleText) === -1) {
+        content = roleText + (content ? ' ' + content : '');
+      }
+    }
 
     // Always append embed text — signals arrive as an embed alongside a role ping.
     var embeds = el.querySelectorAll('[class*="embed"]');
@@ -57,18 +82,23 @@ _OBSERVER_JS = r"""
 
     if (!id || !content) return null;
 
-    var author = (
-      (el.querySelector('[class*="username"],[class*="author"]') || {}).textContent || ''
-    ).trim();
     var timeEl = el.querySelector('time');
     var time   = timeEl ? timeEl.getAttribute('datetime') : '';
     var imgEl  = el.querySelector(
       'img[src*="cdn.discordapp"],img[src*="media.discordapp"],img[src*="cdn.discord"]'
     );
     var image_url = imgEl ? imgEl.src : '';
-    var headerEl  = el.querySelector('[class*="headerText"]');
-    var header    = headerEl ? headerEl.textContent.trim() : '';
-    var server    = header.split(/\s[·•]\s/)[0].trim();
+
+    // --- Server ---
+    var headerEl = el.querySelector('[class*="headerText"]')
+                || el.querySelector('[class*="guildName"]')
+                || el.querySelector('[class*="serverName"]');
+    var header   = headerEl ? headerEl.textContent.trim() : '';
+    var server   = header.split(/\s[·•|]\s/)[0].trim();
+    if (!server && content) {
+      var sm = content.match(/([A-Za-z][\w ]{2,30})\s*[|·•]\s*#?\w/);
+      if (sm) server = sm[1].trim();
+    }
 
     return {id:id, author:author, content:content, time:time,
             image_url:image_url, server:server};
@@ -236,7 +266,7 @@ def _parse_notifications_js() -> list[dict]:
       var cards = Array.from(document.querySelectorAll(
         '[class*="notificationItem"], [class*="notification-item"], [class*="container_"]'
       )).filter(function(el) {
-        return el.querySelector('[id^="message-content-"], [class*="messageContent"]');
+        return el.querySelector('[id^="message-content-"], [class*="messageContent"], [class*="embed"]');
       }).slice(0, 40);
 
       return cards.map(function(el) {
@@ -245,17 +275,45 @@ def _parse_notifications_js() -> list[dict]:
                || (el.querySelector('[id]') && el.querySelector('[id]').id)
                || '';
 
+        // --- Author extraction ---
+        // Try standard username/author element first (works for regular users)
         var author = (
           (el.querySelector('[class*="username"], [class*="author"]') || {}).textContent
           || (el.querySelector('[class*="headerText"] span') || {}).textContent
           || ''
         ).trim();
 
+        // Fallback: role mention element (Unity bots ping a role like "@Sveezy Alerts")
+        if (!author) {
+          var roleMentionEl = el.querySelector(
+            '[class*="roleMention"], [class*="mention"][role="button"]'
+          );
+          if (roleMentionEl) {
+            author = roleMentionEl.textContent.replace(/^@/, '').trim();
+          }
+        }
+
+        // --- Content extraction ---
         var content = (
           (el.querySelector('[id^="message-content-"]') || {}).textContent
           || (el.querySelector('[class*="messageContent"]') || {}).textContent
           || ''
         ).trim();
+
+        // Prepend role mention text into content so whitelist matching works in poll path.
+        // Real-time path already has this; poll path often loses it after Discord re-renders.
+        var roleMentionEls = el.querySelectorAll(
+          '[class*="roleMention"], [class*="mention"][role="button"]'
+        );
+        if (roleMentionEls.length) {
+          var roleText = Array.from(roleMentionEls)
+            .map(function(r) { return r.textContent.trim(); })
+            .filter(Boolean)
+            .join(' ');
+          if (roleText && content.indexOf(roleText) === -1) {
+            content = roleText + (content ? ' ' + content : '');
+          }
+        }
 
         // Always append embed text — Unity Academy signals arrive as an embed
         // alongside a plain-text role ping (e.g. "@Sveezy Alerts").  If we only
@@ -275,12 +333,20 @@ def _parse_notifications_js() -> list[dict]:
         var timeEl = el.querySelector('time');
         var time = timeEl ? timeEl.getAttribute('datetime') : '';
 
-        // Extract server/guild name from the notification header.
-        // Discord renders it in the headerText area — typically "Server · #channel".
-        var headerEl = el.querySelector('[class*="headerText"]');
+        // --- Server extraction ---
+        // Try the headerText area first ("Server · #channel"), then fall back to
+        // any element that looks like a guild name.
+        var headerEl = el.querySelector('[class*="headerText"]')
+                    || el.querySelector('[class*="guildName"]')
+                    || el.querySelector('[class*="serverName"]');
         var header = headerEl ? headerEl.textContent.trim() : '';
-        // The guild name is usually the part before " · " or " • "
-        var server = header.split(/\s[·•]\s/)[0].trim();
+        var server = header.split(/\s[·•|]\s/)[0].trim();
+
+        // If still empty, scan embed text for a trailing "ServerName | #channel" pattern
+        if (!server && content) {
+          var m = content.match(/([A-Za-z][\w ]{2,30})\s*[|·•]\s*#?\w/);
+          if (m) server = m[1].trim();
+        }
 
         // Extract first image URL (chart screenshots attached to signals)
         var imgEl = el.querySelector(
@@ -356,7 +422,7 @@ def poll_inbox(seen_ids: set[str], server_filter: str = "") -> list[dict]:
     # Log unique server names seen so we can verify the filter value
     servers_seen = {m.get("server", "") for m in messages if m.get("server")}
     if servers_seen:
-        log.debug(f"Servers in inbox: {sorted(servers_seen)}")
+        log.info(f"Servers in inbox: {sorted(servers_seen)}")
     elif sf:
         log.warning("Server field empty on all cards — DISCORD_SERVER_FILTER may be blocking everything")
 

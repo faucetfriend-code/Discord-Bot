@@ -4,9 +4,11 @@ Reads credentials from environment; base_url selects demo vs live.
 """
 
 import os
+import sys
 from typing import Optional
 
 from blofin import BloFinClient as _BloFinClient
+from blofin.utils import send_request as _send_request
 from dotenv import load_dotenv
 from logger import log
 
@@ -15,36 +17,193 @@ load_dotenv()
 _client: Optional[_BloFinClient] = None
 
 
+def _patch_base_url(base_url: str) -> None:
+    """
+    The installed `blofin` SDK hardcodes the LIVE endpoint
+    (https://openapi.blofin.com) in blofin.constants.REST_API_URL and does NOT
+    accept a base_url constructor argument.  send_request() reads REST_API_URL
+    as a module-level global (imported via `from blofin.constants import ...`),
+    so a single constant edit won't reach the copies already bound in other
+    modules.  We rebind REST_API_URL in every loaded blofin.* module that has it
+    — this is the only way to point the SDK at the demo endpoint.
+    """
+    base_url = base_url.rstrip("/")
+    patched = []
+    for mod_name, mod in list(sys.modules.items()):
+        if not mod_name.startswith("blofin"):
+            continue
+        if hasattr(mod, "REST_API_URL"):
+            setattr(mod, "REST_API_URL", base_url)
+            patched.append(mod_name)
+    log.info(f"BloFin endpoint patched to {base_url} in modules: {patched}")
+
+
+def _select_credentials(base_url: str) -> tuple[str, str, str]:
+    """
+    Pick the credential set that matches the endpoint.
+
+    Demo and live BloFin issue DIFFERENT API keys. When BLOFIN_BASE_URL points
+    at the demo endpoint we use the Demo-* keys; otherwise the live keys.
+    Falls back to the live keys if the Demo-* vars aren't set.
+    """
+    is_demo = "demo" in base_url.lower()
+    if is_demo:
+        api_key = os.getenv("Demo-BloFinAPI") or os.getenv("BloFinAPI")
+        secret = os.getenv("Demo-Blofin_secret_key") or os.getenv("Blofin_secret_key")
+        passphrase = os.getenv("Demo-Passphrase") or os.getenv("Passphrase")
+        log.info("Using DEMO BloFin credentials")
+    else:
+        api_key = os.getenv("BloFinAPI")
+        secret = os.getenv("Blofin_secret_key")
+        passphrase = os.getenv("Passphrase")
+        log.info("Using LIVE BloFin credentials")
+    return api_key, secret, passphrase
+
+
 def _get_client() -> _BloFinClient:
     global _client
     if _client is None:
         base_url = os.getenv("BLOFIN_BASE_URL", "https://demo-trading-openapi.blofin.com")
+        _patch_base_url(base_url)
+        api_key, secret, passphrase = _select_credentials(base_url)
         _client = _BloFinClient(
-            api_key=os.getenv("BloFinAPI"),
-            api_secret=os.getenv("Blofin_secret_key"),
-            passphrase=os.getenv("Passphrase"),
-            base_url=base_url,
+            api_key=api_key,
+            api_secret=secret,
+            passphrase=passphrase,
         )
     return _client
 
 
-def get_balance() -> float:
-    """Return available USDT balance."""
+def _extract_usdt_available(resp: dict) -> Optional[float]:
+    """
+    Pull available USDT out of a BloFin balance response, or None if absent.
+
+    Handles both response shapes the API returns:
+      /api/v1/asset/balances  → data: [{currency, available, ...}]        (flat list)
+      /api/v1/account/balance → data: {details: [{currency, available}]}  (nested)
+    """
+    data = resp.get("data", {})
+
+    # Shape A: data is a flat list of currency dicts
+    if isinstance(data, list):
+        rows = data
+    # Shape B: data is a dict with a nested "details" list
+    elif isinstance(data, dict):
+        rows = data.get("details", [])
+    else:
+        rows = []
+
+    for asset in rows:
+        if asset.get("currency", "").upper() == "USDT":
+            return float(asset.get("available", 0) or 0)
+    return None
+
+
+def get_balance() -> Optional[float]:
+    """
+    Return available USDT balance in the futures account.
+
+    Returns None (NOT 0.0) on any API/auth failure so the caller can tell the
+    difference between "account is empty" and "we couldn't reach the API".
+    A silent 0.0 previously caused every trade to size to zero for days when
+    the credentials/endpoint were misconfigured.
+    """
     try:
         client = _get_client()
+        # Primary: futures trading-account balance (correct margin balance for perps).
         resp = client.account.get_balance(account_type="futures")
-        # SDK returns a dict; navigate to USDT available
-        details = resp.get("data", {})
-        if isinstance(details, list):
-            details = details[0] if details else {}
-        details = details.get("details", [])
-        for asset in details:
-            if asset.get("currency", "").upper() == "USDT":
-                return float(asset.get("available", 0))
-        return 0.0
+
+        code = str(resp.get("code", "0"))
+        if code != "0":
+            log.error(
+                f"get_balance API error {code}: {resp.get('msg', 'unknown')} "
+                f"— check BloFin API key/secret/passphrase and BLOFIN_BASE_URL "
+                f"(demo keys only work on the demo endpoint)."
+            )
+            return None
+
+        usdt = _extract_usdt_available(resp)
+        if usdt is None:
+            log.warning(f"get_balance: no USDT entry in response: {resp}")
+            return None
+        return usdt
     except Exception as e:
         log.error(f"get_balance failed: {e}")
-        return 0.0
+        return None
+
+
+_instruments_cache: Optional[dict] = None
+
+
+def _load_instruments() -> dict:
+    """Fetch and cache all SWAP instrument specs, keyed by instId."""
+    global _instruments_cache
+    if _instruments_cache is None:
+        try:
+            resp = _get_client().public.get_instruments()
+            data = resp.get("data", []) or []
+            _instruments_cache = {d["instId"]: d for d in data if d.get("instId")}
+            log.info(f"Loaded {len(_instruments_cache)} BloFin instrument specs")
+        except Exception as e:
+            log.error(f"Failed to load instruments: {e}")
+            _instruments_cache = {}
+    return _instruments_cache
+
+
+def get_contract_specs(symbol: str) -> Optional[dict]:
+    """
+    Return contract specs for a symbol, or None if the instrument is unknown.
+
+    BloFin order `size` is expressed in CONTRACTS, not base-currency coins:
+      contract_value — base-currency amount per 1 contract (e.g. BTC: 0.001)
+      lot_size       — size increment, in contracts (e.g. 0.1)
+      min_size       — minimum order size, in contracts (e.g. 0.1)
+      max_leverage   — exchange max leverage for the instrument
+    """
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+    inst = _load_instruments().get(inst_id)
+    if not inst:
+        return None
+    try:
+        return {
+            "contract_value": float(inst.get("contractValue", 0) or 0),
+            "lot_size": float(inst.get("lotSize", 0) or 0),
+            "min_size": float(inst.get("minSize", 0) or 0),
+            "max_leverage": float(inst.get("maxLeverage", 0) or 0),
+        }
+    except (TypeError, ValueError) as e:
+        log.warning(f"get_contract_specs({symbol}) parse error: {e}")
+        return None
+
+
+def set_leverage(symbol: str, leverage: int, margin_mode: str = "cross") -> int:
+    """
+    Set leverage for a symbol before placing an order.
+
+    The requested leverage is clamped to the instrument's exchange maximum
+    (e.g. some alts cap at 75x while BTC allows 150x). Returns the leverage
+    actually applied (after clamping). The SDK doesn't wrap this endpoint, so
+    we POST to /api/v1/account/set-leverage directly.
+    """
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+    specs = get_contract_specs(symbol)
+    max_lev = int(specs["max_leverage"]) if specs and specs.get("max_leverage") else int(leverage)
+    lev = max(1, min(int(leverage), max_lev))
+
+    data = {"instId": inst_id, "leverage": str(lev), "marginMode": margin_mode}
+    try:
+        client = _get_client()
+        resp = _send_request("POST", "/api/v1/account/set-leverage",
+                             client.auth, data=data, authenticate=True)
+        code = str(resp.get("code", "0"))
+        if code != "0":
+            log.warning(f"set_leverage {inst_id} {lev}x failed: {resp.get('msg', resp)}")
+        else:
+            clamp_note = f" (clamped from {leverage}x, max {max_lev}x)" if lev != int(leverage) else ""
+            log.info(f"Set leverage {inst_id} → {lev}x {margin_mode}{clamp_note}")
+    except Exception as e:
+        log.warning(f"set_leverage {inst_id} error: {e}")
+    return lev
 
 
 def get_market_price(symbol: str) -> Optional[float]:
@@ -52,7 +211,8 @@ def get_market_price(symbol: str) -> Optional[float]:
     try:
         inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
         client = _get_client()
-        resp = client.market.get_tickers(inst_id=inst_id)
+        # SDK exposes market data on the `public` API, not `market`.
+        resp = client.public.get_tickers(inst_id=inst_id)
         data = resp.get("data", [])
         if isinstance(data, list) and data:
             return float(data[0].get("last", 0) or 0) or None

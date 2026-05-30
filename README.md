@@ -107,10 +107,14 @@ When new signal formats appear that none of the regex patterns catch, add a new 
 Size is calculated as:
 
 ```
-size = floor((balance * RISK_PCT) / |entry - sl|  /  lot_size) * lot_size
+coins     = (balance * RISK_PCT) / |entry - sl|
+contracts = floor(coins / contractValue / lotSize) * lotSize   # rejected if < minSize
 ```
 
-BloFin lot sizes are hardcoded in `risk_manager.LOT_SIZES`. If a symbol is missing from that dict it defaults to `1.0` — safe, but potentially wrong. Add new symbols to `LOT_SIZES` as you encounter them.
+Order size is in **contracts**, not coins. Contract specs (`contractValue`,
+`lotSize`, `minSize`) are fetched live from BloFin's instruments endpoint and
+cached per run — no hardcoded lot table. Symbols not listed on BloFin are
+skipped automatically.
 
 Signals are also rejected if:
 

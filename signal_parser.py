@@ -63,35 +63,42 @@ class Signal:
 # Regex — new entry patterns (ordered most-to-least specific)
 # ---------------------------------------------------------------------------
 _NEW_PATTERNS = [
+    # Unity embed format: "BTC/USDT — LONG ... Entry $71,010 ... Stop Loss $68,000"
+    # Most specific — tried first. Requires /USDT and dollar signs (embed always has them).
+    # TP label numbers ("Take Profit 1 $72,000") are skipped via (?:[1-9]\s*)? before $.
+    r'(?P<sym>[A-Z]{2,10})/USDT\s*[—–\-]+\s*(?P<side>long|short|buy|sell)'
+    r'.*?(?:entr(?:y|:)?)[\s:]*\$(?P<entry>[\d,.]+)'
+    r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$(?P<sl>[\d,.]+)'
+    r'(?:.*?(?:t\.?p\.?|take\s*profit)\s*(?:[1-9]\s*)?\$(?P<tp>[\d,.]+))?',
+
     # "LONG BTC | Entry: 45000 | SL: 44000 | TP: 47000"
     r'(?P<side>long|short|buy|sell)\s+(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\b'
     r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*\$?(?P<entry>[\d,.]+)'
     r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
-    r'.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+)',
+    r'.*?(?:t\.?p\.?|take\s*profit)\s*(?:[1-9](?=[\s:$]))?\s*[\s:]*\$?(?P<tp>[\d,.]+)',
 
     # "BUY BTC-USDT @ 45000, SL 44000, TP 47000"
     r'(?P<side>buy|sell)\s+(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s*@\s*\$?(?P<entry>[\d,.]+)'
     r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
-    r'.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+)',
+    r'.*?(?:t\.?p\.?|take\s*profit)\s*(?:[1-9](?=[\s:$]))?\s*[\s:]*\$?(?P<tp>[\d,.]+)',
 
     # "⚡ ASTER/USDT LONG  Entry 0.67  SL 0.63  TP 0.70"
     r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s+(?P<side>long|short|buy|sell)'
     r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*\$?(?P<entry>[\d,.]+)'
     r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
-    r'.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+)',
+    r'.*?(?:t\.?p\.?|take\s*profit)\s*(?:[1-9](?=[\s:$]))?\s*[\s:]*\$?(?P<tp>[\d,.]+)',
 
-    # "VVV/USDT — SHORT (Leverage) ... Entry $17.33 ... Stop Loss $18.65"
-    # Embed/bot message format with em-dash separator and no TP
-    r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s*[—–-]+\s*(?P<side>long|short|buy|sell)'
+    # "VVV/USDT — SHORT ... Entry $17.33 ... Stop Loss $18.65" (non-BTC embed, optional TP)
+    r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s*[—–\-]+\s*(?P<side>long|short|buy|sell)'
     r'.*?(?:entr(?:y|:)?)[\s:]*\$?(?P<entry>[\d,.]+)'
     r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
-    r'(?:.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+))?',
+    r'(?:.*?(?:t\.?p\.?|take\s*profit)\s*(?:[1-9](?=[\s:$]))?\s*[\s:]*\$?(?P<tp>[\d,.]+))?',
 
-    # "CHZ LONG CMP/ 0.3622 SL: 0.03514" — no TP (tp group intentionally absent)
+    # "CHZ LONG CMP/ 0.3622 SL: 0.03514" — no TP, no dollar signs
     r'(?P<sym>[A-Z]{2,10})(?:[/-]USDT?)?\s+(?P<side>long|short|buy|sell)'
     r'.*?(?:entr(?:y|:)|cmp/?)[\s:]*\$?(?P<entry>[\d,.]+)'
     r'.*?(?:s\.?l\.?|stop\s+loss)[\s:]*\$?(?P<sl>[\d,.]+)'
-    r'(?:.*?(?:t\.?p\.?|take\s*profit)[\s:]*\$?(?P<tp>[\d,.]+))?',
+    r'(?:.*?(?:t\.?p\.?|take\s*profit)\s*(?:[1-9](?=[\s:$]))?\s*[\s:]*\$?(?P<tp>[\d,.]+))?',
 ]
 
 # ---------------------------------------------------------------------------
@@ -127,6 +134,17 @@ _UPDATE_TP_EXTRACT = re.compile(
 _SYMBOL_EXTRACT = re.compile(
     r'\b([A-Z]{2,10})(?:[/-]USDT?)?\b',
 )
+# Common English/trading words that must NOT be treated as ticker symbols.
+_SYMBOL_BLOCKLIST = frozenset({
+    'STOP', 'LOSS', 'TRADE', 'LONG', 'SHORT', 'TAKE', 'ENTRY', 'SIGNAL',
+    'UNITY', 'ALERT', 'ALERTS', 'NEW', 'OLD', 'MAX', 'MIN', 'RSI', 'EMA',
+    'SMA', 'THE', 'BOS', 'BREAK', 'ADDED', 'MOVED', 'UPDATED', 'CLOSED',
+    'OPEN', 'FROM', 'INTO', 'OVER', 'UNDER', 'BEEN', 'WITH', 'YOUR', 'THIS',
+    'THAT', 'HAVE', 'WILL', 'CALL', 'FULL', 'MARK', 'BULL', 'BEAR', 'SELL',
+    'BUYS', 'HITS', 'BACK', 'NEXT', 'LAST', 'MOVE', 'DOWN', 'PUSH', 'PAIR',
+    'SIZE', 'RISK', 'BIAS', 'JUST', 'ONLY', 'SOME', 'ALSO', 'VERY', 'HERE',
+    'TOOK', 'VERY', 'GOLD', 'FORE', 'INFO', 'DATA', 'NOTE', 'IDEA', 'GOOD',
+})
 
 # Detects "at CMP", "market long/short", "longing X at CMP" — no limit entry price.
 _CMP_PATTERN = re.compile(
@@ -181,14 +199,21 @@ def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
         return None
 
 
+def _extract_symbol(text: str) -> str:
+    """Find the first plausible ticker symbol in text, skipping common noise words."""
+    for m in _SYMBOL_EXTRACT.finditer(text.upper()):
+        candidate = m.group(1)
+        if candidate not in _SYMBOL_BLOCKLIST:
+            return _normalise_symbol(candidate)
+    return "UNKNOWN-USDT"
+
+
 def _try_update_regex(text: str, msg: dict) -> Optional[Signal]:
     """Fast-path: detect common update phrases and extract new SL/TP if present."""
     if not _UPDATE_KEYWORDS.search(text):
         return None
 
-    # Try to find a symbol
-    sym_match = _SYMBOL_EXTRACT.search(text.upper())
-    symbol = _normalise_symbol(sym_match.group(1)) if sym_match else "UNKNOWN-USDT"
+    symbol = _extract_symbol(text)
 
     new_sl_m = _UPDATE_SL_EXTRACT.search(text)
     new_tp_m = _UPDATE_TP_EXTRACT.search(text)
@@ -210,8 +235,7 @@ def _try_close_regex(text: str, msg: dict) -> Optional[Signal]:
     if re.search(r'entr(?:y|:)[\s:]*[\d,.]+', text, re.IGNORECASE):
         return None
 
-    sym_match = _SYMBOL_EXTRACT.search(text.upper())
-    symbol = _normalise_symbol(sym_match.group(1)) if sym_match else "UNKNOWN-USDT"
+    symbol = _extract_symbol(text)
 
     return Signal(
         message_type=MessageType.CLOSE,
@@ -253,6 +277,8 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
             temperature=0.0,
         )
         raw = response.choices[0].message.content.strip()
+        # Strip Qwen3 thinking blocks — <think>...</think> — before parsing JSON.
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
         data = json.loads(raw)
 
@@ -344,7 +370,8 @@ def _vision_parse(image_url: str) -> dict:
             temperature=0.0,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if the model wraps despite instructions
+        # Strip Qwen3 thinking blocks and markdown fences if the model wraps the answer
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
 
         # Try direct parse first

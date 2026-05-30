@@ -52,6 +52,26 @@ def _read_positions() -> list[dict]:
         return []
 
 
+def _read_analyst_stats() -> list[dict]:
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT analyst, leverage, wins, losses FROM analyst_stats "
+            "ORDER BY leverage DESC, wins DESC, analyst"
+        ).fetchall()
+        con.close()
+        out = []
+        for r in rows:
+            wins, losses = r[2] or 0, r[3] or 0
+            total = wins + losses
+            wr = f"{(wins / total * 100):.0f}%" if total else "—"
+            out.append({"analyst": r[0], "leverage": r[1], "wins": wins,
+                        "losses": losses, "total": total, "win_rate": wr})
+        return out
+    except Exception:
+        return []
+
+
 def _read_signals(limit: int = 40) -> list[dict]:
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
@@ -93,6 +113,7 @@ def api_status():
     return jsonify({
         "state": _state,
         "positions": _read_positions(),
+        "analyst_stats": _read_analyst_stats(),
         "recent_signals": _read_signals(20),
     })
 
@@ -102,6 +123,7 @@ def index():
     s        = _state
     positions = _read_positions()
     signals  = _read_signals(40)
+    analysts = _read_analyst_stats()
     log_tail = _read_log_tail()
 
     mode_badge  = '<span class="badge dry">DRY RUN</span>' if s.get("dry_run") else '<span class="badge live">LIVE</span>'
@@ -124,6 +146,29 @@ def index():
               <td>{p['size']}</td>
               <td class="mono small">{p['order_id'][:16]}…</td>
               <td class="small">{p['opened_at'][:19]}</td>
+            </tr>"""
+        return html
+
+    def analyst_rows():
+        if not analysts:
+            return '<tr><td colspan="5" class="empty">No analyst trades resolved yet</td></tr>'
+        html = ""
+        for a in analysts:
+            # Leverage bar across the 50–125 band
+            pct = max(0, min(100, (a["leverage"] - 50) / 75 * 100))
+            html += f"""<tr>
+              <td><b>{a['analyst']}</b></td>
+              <td>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <div style="flex:1;background:#21262d;border-radius:4px;height:8px;min-width:80px;">
+                    <div style="width:{pct:.0f}%;background:#58a6ff;height:8px;border-radius:4px;"></div>
+                  </div>
+                  <b style="color:#f0f6fc;">{a['leverage']}x</b>
+                </div>
+              </td>
+              <td class="buy">{a['wins']}</td>
+              <td class="sell">{a['losses']}</td>
+              <td>{a['win_rate']}</td>
             </tr>"""
         return html
 
@@ -216,6 +261,14 @@ def index():
       <table>
         <thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Size</th><th>Order ID</th><th>Opened</th></tr></thead>
         <tbody>{pos_rows()}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Analyst Leverage &amp; Performance ({len(analysts)})</div>
+      <table>
+        <thead><tr><th>Analyst</th><th>Leverage (50–125x)</th><th>Wins</th><th>Losses</th><th>Win&nbsp;Rate</th></tr></thead>
+        <tbody>{analyst_rows()}</tbody>
       </table>
     </div>
 

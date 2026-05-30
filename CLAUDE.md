@@ -54,6 +54,20 @@ When new signal formats appear in dry-run logs, add regex patterns at the top of
 2. Set `DRY_RUN=false`
 3. Restart bot
 
-## Lot Sizes
+## Position Sizing & Contract Specs
 
-BloFin lot sizes are hardcoded in `risk_manager.LOT_SIZES`. Add new symbols there as needed. If a symbol is missing it defaults to 1.0 (safe but may be wrong).
+Order `size` on BloFin is in **contracts**, not coins. Contract specs
+(`contractValue`, `lotSize`, `minSize`) are fetched live from BloFin's
+instruments endpoint via `blofin_client.get_contract_specs()` and cached once
+per run. `risk_manager.calculate_size()`:
+
+1. risk budget = balance × `RISK_PCT`
+2. coins wanted = risk budget ÷ |entry − SL|
+3. contracts = coins wanted ÷ `contractValue`, floored to `lotSize`
+4. rejects (returns None) if below the exchange `minSize`, or if the symbol
+   isn't listed on BloFin (e.g. some altcoins exist on demo but not live, or
+   vice-versa)
+
+No hardcoded lot table — the exchange is the source of truth, so newly-listed
+symbols size correctly with no code change. The instrument cache is loaded once
+at first use; restart the bot to pick up brand-new listings.
