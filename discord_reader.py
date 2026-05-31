@@ -84,10 +84,20 @@ _OBSERVER_JS = r"""
 
     var timeEl = el.querySelector('time');
     var time   = timeEl ? timeEl.getAttribute('datetime') : '';
-    var imgEl  = el.querySelector(
-      'img[src*="cdn.discordapp"],img[src*="media.discordapp"],img[src*="cdn.discord"]'
-    );
-    var image_url = imgEl ? imgEl.src : '';
+    var image_url = '';
+    var imgs = el.querySelectorAll('img');
+    for (var ii = 0; ii < imgs.length; ii++) {
+      var s = imgs[ii].src
+           || imgs[ii].getAttribute('data-safe-src')
+           || imgs[ii].getAttribute('data-src') || '';
+      if (s.indexOf('/attachments/') > -1 || s.indexOf('/external/') > -1) {
+        image_url = s; break;
+      }
+    }
+    if (!image_url) {
+      var a = el.querySelector('a[href*="/attachments/"],a[href*="/external/"]');
+      if (a) image_url = a.href || '';
+    }
 
     // --- Server ---
     var headerEl = el.querySelector('[class*="headerText"]')
@@ -261,102 +271,99 @@ def _parse_notifications_js() -> list[dict]:
     if not ws_url:
         return []
 
+    # Anchor on each message-content node and walk up to the SMALLEST card that
+    # still holds exactly one message. Discord's inbox nests `container_` divs, so
+    # selecting containers directly grabs a giant wrapper whose text/embeds/images
+    # bleed across every notification (one "card" came back as 10k chars spanning
+    # the whole inbox). Anchoring per message keeps content, image and author
+    # correctly scoped to a single notification.
     js = r"""
     (function() {
-      var cards = Array.from(document.querySelectorAll(
-        '[class*="notificationItem"], [class*="notification-item"], [class*="container_"]'
-      )).filter(function(el) {
-        return el.querySelector('[id^="message-content-"], [class*="messageContent"], [class*="embed"]');
-      }).slice(0, 40);
+      var contents = Array.from(document.querySelectorAll(
+        '[id^="message-content-"], [class*="messageContent"]'
+      ));
+      var seen = {};
+      var out = [];
 
-      return cards.map(function(el) {
-        var id = el.getAttribute('data-list-item-id')
-               || el.getAttribute('id')
-               || (el.querySelector('[id]') && el.querySelector('[id]').id)
-               || '';
-
-        // --- Author extraction ---
-        // Try standard username/author element first (works for regular users)
-        var author = (
-          (el.querySelector('[class*="username"], [class*="author"]') || {}).textContent
-          || (el.querySelector('[class*="headerText"] span') || {}).textContent
-          || ''
-        ).trim();
-
-        // Fallback: role mention element (Unity bots ping a role like "@Sveezy Alerts")
-        if (!author) {
-          var roleMentionEl = el.querySelector(
-            '[class*="roleMention"], [class*="mention"][role="button"]'
-          );
-          if (roleMentionEl) {
-            author = roleMentionEl.textContent.replace(/^@/, '').trim();
-          }
+      contents.slice(0, 60).forEach(function(mc) {
+        // Walk up until the parent would merge a second message into the card.
+        var node = mc, card = mc.parentElement;
+        for (var up = 0; up < 8 && node; up++) {
+          node = node.parentElement;
+          if (!node) break;
+          var n = node.querySelectorAll(
+            '[id^="message-content-"], [class*="messageContent"]'
+          ).length;
+          if (n >= 2) break;
+          card = node;
         }
 
-        // --- Content extraction ---
-        var content = (
-          (el.querySelector('[id^="message-content-"]') || {}).textContent
-          || (el.querySelector('[class*="messageContent"]') || {}).textContent
-          || ''
-        ).trim();
+        var id = mc.id || ((card.querySelector('[id^="message-content-"]') || {}).id) || '';
+        if (!id || seen[id]) return;
+        seen[id] = 1;
 
-        // Prepend role mention text into content so whitelist matching works in poll path.
-        // Real-time path already has this; poll path often loses it after Discord re-renders.
-        var roleMentionEls = el.querySelectorAll(
+        var content = (mc.textContent || '').trim();
+
+        // Role mentions in THIS card (analyst ping) — prepend for whitelist match.
+        var rms = card.querySelectorAll(
           '[class*="roleMention"], [class*="mention"][role="button"]'
         );
-        if (roleMentionEls.length) {
-          var roleText = Array.from(roleMentionEls)
+        if (rms.length) {
+          var roleText = Array.from(rms)
             .map(function(r) { return r.textContent.trim(); })
-            .filter(Boolean)
-            .join(' ');
+            .filter(Boolean).join(' ');
           if (roleText && content.indexOf(roleText) === -1) {
             content = roleText + (content ? ' ' + content : '');
           }
         }
 
-        // Always append embed text — Unity Academy signals arrive as an embed
-        // alongside a plain-text role ping (e.g. "@Sveezy Alerts").  If we only
-        // capture the ping, the signal is invisible to the parser.
-        var embedEls = el.querySelectorAll('[class*="embed"]');
-        if (embedEls.length) {
-          var embedText = Array.from(embedEls)
+        // Embed text in THIS card (Unity signals arrive as an embed).
+        var embeds = card.querySelectorAll('[class*="embed"]');
+        if (embeds.length) {
+          var et = Array.from(embeds)
             .map(function(e) { return e.textContent; })
-            .join(' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (embedText) {
-            content = content ? content + ' ' + embedText : embedText;
-          }
+            .join(' ').replace(/\s+/g, ' ').trim();
+          if (et) content = content ? content + ' ' + et : et;
         }
 
-        var timeEl = el.querySelector('time');
+        // Author: username/author element, else the card's role mention.
+        var author = (
+          (card.querySelector('[class*="username"], [class*="author"]') || {}).textContent || ''
+        ).trim();
+        if (!author && rms.length) author = rms[0].textContent.replace(/^@/, '').trim();
+
+        var timeEl = card.querySelector('time');
         var time = timeEl ? timeEl.getAttribute('datetime') : '';
 
-        // --- Server extraction ---
-        // Try the headerText area first ("Server · #channel"), then fall back to
-        // any element that looks like a guild name.
-        var headerEl = el.querySelector('[class*="headerText"]')
-                    || el.querySelector('[class*="guildName"]')
-                    || el.querySelector('[class*="serverName"]');
+        // Chart image scoped to THIS card (/attachments/ upload or /external/ proxy).
+        var image_url = '';
+        var imgs = card.querySelectorAll('img');
+        for (var i = 0; i < imgs.length; i++) {
+          var s = imgs[i].src
+               || imgs[i].getAttribute('data-safe-src')
+               || imgs[i].getAttribute('data-src') || '';
+          if (s.indexOf('/attachments/') > -1 || s.indexOf('/external/') > -1) {
+            image_url = s; break;
+          }
+        }
+        if (!image_url) {
+          var a = card.querySelector('a[href*="/attachments/"], a[href*="/external/"]');
+          if (a) image_url = a.href || '';
+        }
+
+        // Server/guild from the card header.
+        var headerEl = card.querySelector('[class*="headerText"]')
+                    || card.querySelector('[class*="guildName"]')
+                    || card.querySelector('[class*="serverName"]');
         var header = headerEl ? headerEl.textContent.trim() : '';
         var server = header.split(/\s[·•|]\s/)[0].trim();
 
-        // If still empty, scan embed text for a trailing "ServerName | #channel" pattern
-        if (!server && content) {
-          var m = content.match(/([A-Za-z][\w ]{2,30})\s*[|·•]\s*#?\w/);
-          if (m) server = m[1].trim();
+        if (content) {
+          out.push({id: id, author: author, content: content,
+                    time: time, image_url: image_url, server: server});
         }
-
-        // Extract first image URL (chart screenshots attached to signals)
-        var imgEl = el.querySelector(
-          'img[src*="cdn.discordapp"], img[src*="media.discordapp"], img[src*="cdn.discord"]'
-        );
-        var image_url = imgEl ? imgEl.src : '';
-
-        return {id: id, author: author, content: content, time: time,
-                image_url: image_url, server: server};
-      }).filter(function(m) { return m.content; });
+      });
+      return out;
     })()
     """
     try:

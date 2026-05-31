@@ -12,6 +12,7 @@ Signal routing:
   CLOSE  → market-close existing BloFin position
 """
 
+import math
 import os
 import queue as _queue
 import re
@@ -116,18 +117,71 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
                                    outcome="cmp_price_fetch_failed")
             return
 
-    # Auto-calculate TP at DEFAULT_RR if analyst didn't provide one
+    # tp_ladder = ordered TP targets (nearest first) for scale-out management.
+    tp_ladder: list[float] = []
+
+    # RSI Extreme strategy: derive SL/TP as fixed percentages around the live
+    # entry (mean-reversion). Long: TP above / SL below; short: the reverse.
+    if signal.source == "rsi_extreme" and signal.entry is not None:
+        tp_pct = float(os.getenv("RSI_TP_PCT", "0.10"))
+        sl_pct = float(os.getenv("RSI_SL_PCT", "0.05"))
+        if signal.side == "buy":
+            signal.sl = round(signal.entry * (1 - sl_pct), 8)
+            signal.tp = round(signal.entry * (1 + tp_pct), 8)
+        else:
+            signal.sl = round(signal.entry * (1 + sl_pct), 8)
+            signal.tp = round(signal.entry * (1 - tp_pct), 8)
+        tp_ladder = [signal.tp]
+        log.info(f"[RSI] {signal.symbol} {signal.side.upper()} reversion — entry {signal.entry} "
+                 f"SL {signal.sl} ({sl_pct*100:.0f}%) TP {signal.tp} (+{tp_pct*100:.0f}%)")
+
+    # Assign SL + the full TP ladder from chart levels by geometry now that the
+    # entry (live price for market orders) is known. The vision model reads the
+    # numbers reliably but mislabels roles, so derive them from the side:
+    # short → SL above / TPs below entry; long → the reverse.
+    if getattr(signal, "vision_levels", None) and signal.entry is not None and not tp_ladder:
+        chart_sl, chart_tps = rm.chart_sl_tp(signal.entry, signal.side, signal.vision_levels)
+        if signal.sl is None and chart_sl is not None:
+            signal.sl = chart_sl
+            log.info(f"[{analyst}] {signal.symbol} SL from chart (geometry) → {signal.sl}")
+        if chart_tps:
+            tp_ladder = chart_tps                 # full ladder (TP1, TP2, TP3 …)
+            signal.tp = chart_tps[-1]             # furthest target = final/attached TP
+            log.info(f"[{analyst}] {signal.symbol} TP ladder from chart → {tp_ladder}")
+
+    # Auto-calculate TP at DEFAULT_RR if still none (analyst gave no TP, no chart).
     if signal.tp is None and signal.entry is not None and signal.sl is not None:
         signal.tp = _calc_auto_tp(signal)
         if signal.tp is not None:
+            tp_ladder = [signal.tp]
             log.info(f"[{analyst}] No TP in signal — auto-calculated at "
                      f"{os.getenv('DEFAULT_RR', '2.0')}:1 R:R → TP={signal.tp}")
+
+    # Single TP supplied directly (analyst text / regex) — make it the ladder.
+    if not tp_ladder and signal.tp is not None:
+        tp_ladder = [signal.tp]
 
     if signal.entry is None or signal.sl is None or signal.tp is None:
         log.warning(f"[{analyst}] NEW signal missing entry/sl/tp — skipping")
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome="incomplete_signal")
         return
+
+    # Sanity guard for vision/market levels: SL or TP implausibly far from the
+    # live entry usually means the vision model misread the chart axis (e.g. read
+    # $16 for a coin trading at $44). Reject rather than trade on a bad level.
+    # RSI levels (fixed 5/10%) and normal analyst stops sit well inside this band.
+    if signal.is_market_order and signal.source != "rsi_extreme":
+        band = float(os.getenv("VISION_MAX_DEVIATION_PCT", "0.5"))
+        sl_dev = abs(signal.sl / signal.entry - 1)
+        tp_dev = abs(signal.tp / signal.entry - 1)
+        if sl_dev > band or tp_dev > band:
+            log.warning(f"[{analyst}] {signal.symbol} levels implausible vs live entry "
+                        f"{signal.entry} (SL {sl_dev*100:.0f}%, TP {tp_dev*100:.0f}% away; "
+                        f"max {band*100:.0f}%) — likely vision misread, skipping")
+            _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                                   outcome="levels_implausible")
+            return
 
     order_label = "MARKET" if signal.is_market_order else "LIMIT"
     log.info(f"[{analyst}] NEW {order_label} {signal.side.upper()} {signal.symbol} "
@@ -162,6 +216,10 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     log.info(f"Balance ${balance:.2f} | Size {size} {signal.symbol} | "
              f"[{analyst_key}] Leverage {leverage}x cross | DRY_RUN={dry_run}")
 
+    if len(tp_ladder) > 1:
+        log.info(f"[{analyst}] {signal.symbol} scale-out ladder: {tp_ladder} "
+                 f"(partial close + SL ratchet at each target)")
+
     if dry_run:
         # Record a virtual position so the outcome resolver can track it and
         # adapt the analyst's leverage exactly as it would in live mode.
@@ -170,6 +228,7 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
             symbol=signal.symbol, side=signal.side, entry=signal.entry,
             sl=signal.sl, tp=signal.tp, size=size, order_id=order_id,
             opened_at=now_local().isoformat(), analyst=analyst_key,
+            tps=tp_ladder, orig_size=size,
         ))
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome=f"dry_run (lev {leverage}x)", order_id=order_id)
@@ -196,6 +255,8 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
             order_id=order_id,
             opened_at=now_local().isoformat(),
             analyst=analyst_key,
+            tps=tp_ladder,
+            orig_size=size,
         )
         pt.open_position(pos)
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
@@ -242,17 +303,17 @@ def _process_update(signal: sp.Signal, position: pt.Position, dry_run: bool):
                                outcome=f"amend_error:{e}", order_id=position.order_id)
 
 
-def _settle_position(position: pt.Position, exit_price: float, reason: str):
+def _settle_position(position: pt.Position, exit_price: float, reason: str,
+                     won: bool = None):
     """
     Close a position locally, decide win/loss, and adapt the analyst's leverage.
-    won = exit favourable vs entry (long: exit >= entry; short: exit <= entry).
-    reason is one of "tp", "sl", "manual_close".
+    If `won` is not given, it's inferred from exit vs entry (long: exit >= entry).
+    For scale-outs the caller passes won explicitly (any banked TP = net win).
     """
     start, lo, hi, step = _leverage_params()
-    if position.side == "buy":
-        won = exit_price >= position.entry
-    else:
-        won = exit_price <= position.entry
+    if won is None:
+        won = exit_price >= position.entry if position.side == "buy" \
+            else exit_price <= position.entry
 
     new_lev = pt.record_outcome(position.analyst, won, step, lo, hi)
     pt.close_position(position.order_id)
@@ -260,7 +321,8 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str):
     verdict = "WIN" if won else "LOSS"
     arrow = f"+{step}" if won else f"-{step}"
     log.info(f"[{position.analyst}] {position.symbol} {verdict} ({reason}) "
-             f"exit={exit_price} vs entry={position.entry} → leverage {arrow} = {new_lev}x")
+             f"exit={exit_price} entry={position.entry} tps_hit={position.tps_hit} "
+             f"→ leverage {arrow} = {new_lev}x")
     _logger_mod.log_signal(position.analyst, f"{position.symbol} {reason}",
                            outcome=f"{'win' if won else 'loss'}:{reason} lev={new_lev}x",
                            order_id=position.order_id)
@@ -295,29 +357,99 @@ def _process_close(signal: sp.Signal, position: pt.Position, dry_run: bool):
                                outcome="closed_no_price", order_id=position.order_id)
 
 
-def _resolve_open_positions():
+def _resolve_open_positions(dry_run: bool = True):
     """
-    Poll market price for every open position and settle any that have reached
-    their TP or SL. Runs each sweep — drives the adaptive-leverage system in
-    both dry-run (virtual positions) and live (mirrors the exchange triggers).
+    Poll market price for every open position and manage it as a scale-out ladder:
+
+      • At each TP target (nearest first): close an equal slice of the original
+        size and ratchet the stop up — to break-even after TP1, then to the
+        previous TP after each subsequent target.
+      • At the FINAL target: close the remainder (win).
+      • If the (ratcheted) stop is hit: close the remainder. It's a win if any TP
+        was already banked (stop sits at BE or a prior TP), otherwise a loss.
+
+    Single-TP positions (RSI, plain analyst calls) are just full-close-at-TP.
+    Works in dry-run (virtual sizes) and live (reduce-only orders + SL amend).
     """
     for pos in pt.get_open_positions():
         price = bf.get_market_price(pos.symbol)
         if price is None:
             continue
-        reason = None
-        if pos.side == "buy":      # long
-            if price >= pos.tp:
-                reason = "tp"
-            elif price <= pos.sl:
-                reason = "sl"
-        else:                       # short
-            if price <= pos.tp:
-                reason = "tp"
-            elif price >= pos.sl:
-                reason = "sl"
-        if reason:
-            _settle_position(pos, price, reason)
+
+        ladder = pos.tps or ([pos.tp] if pos.tp else [])
+        n = len(ladder)
+        if n == 0:
+            continue
+        is_long = pos.side == "buy"
+
+        # 1) Stop-loss (possibly ratcheted) hit?
+        sl_hit = (is_long and price <= pos.sl) or (not is_long and price >= pos.sl)
+        if sl_hit:
+            won = pos.tps_hit >= 1  # banked >=TP1 → net win; raw stop with none → loss
+            reason = "trail_stop" if pos.tps_hit >= 1 else "sl"
+            if not dry_run:
+                _live_close_remaining(pos)
+            _settle_position(pos, price, reason, won=won)
+            continue
+
+        # 2) Next take-profit target hit?
+        if pos.tps_hit >= n:
+            continue
+        next_tp = ladder[pos.tps_hit]
+        tp_hit = (is_long and price >= next_tp) or (not is_long and price <= next_tp)
+        if not tp_hit:
+            continue
+
+        new_hit = pos.tps_hit + 1
+
+        # Final target → close the remainder.
+        if new_hit >= n:
+            if not dry_run:
+                _live_close_remaining(pos)
+            _settle_position(pos, price, f"tp{new_hit}_final", won=True)
+            continue
+
+        # Intermediate target → partial close + ratchet SL.
+        specs = bf.get_contract_specs(pos.symbol)
+        lot = specs["lot_size"] if specs and specs.get("lot_size") else 0
+        chunk = pos.orig_size / n
+        if lot:
+            chunk = math.floor(chunk / lot) * lot
+        remaining = round(pos.size - chunk, 8)
+
+        # Too small to split (or rounding wiped the chunk) → take it all here as a win.
+        if chunk <= 0 or remaining <= 0:
+            if not dry_run:
+                _live_close_remaining(pos)
+            _settle_position(pos, price, f"tp{new_hit}_nosplit", won=True)
+            continue
+
+        new_sl = pos.entry if new_hit == 1 else ladder[new_hit - 2]
+        sl_label = "break-even" if new_hit == 1 else f"TP{new_hit - 1}"
+
+        if not dry_run:
+            try:
+                bf.reduce_position(pos.symbol, pos.side, chunk)
+                inst = pos.symbol if "-USDT" in pos.symbol else f"{pos.symbol}-USDT"
+                bf.amend_order(inst, pos.order_id, new_sl=new_sl)
+            except Exception as e:
+                log.error(f"Scale-out order/amend failed for {pos.symbol}: {e}")
+
+        pt.apply_partial(pos.order_id, remaining, new_sl, new_hit)
+        log.info(f"[{pos.analyst}] {pos.symbol} TP{new_hit} hit @ {price} — closed {chunk}, "
+                 f"{remaining} left, SL → {new_sl} ({sl_label})")
+        _logger_mod.log_signal(pos.analyst, f"{pos.symbol} TP{new_hit} scale-out",
+                               outcome=f"scaled_tp{new_hit} sl={new_sl}", order_id=pos.order_id)
+
+
+def _live_close_remaining(pos: pt.Position):
+    """Market-close whatever remains of a live position (reduce-only)."""
+    inst = pos.symbol if "-USDT" in pos.symbol else f"{pos.symbol}-USDT"
+    side = "long" if pos.side == "buy" else "short"
+    try:
+        bf.close_position_api(inst, side)
+    except Exception as e:
+        log.error(f"Live close failed for {pos.symbol}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +501,26 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         return
 
     log.info(f"[{analyst}] Classified as {signal.message_type.value.upper()} | {signal.symbol}")
+
+    # RSI Extreme strategy — its own gate (RSI_EXTREME_ENABLED) and its own
+    # adaptive-leverage track record under the "RSI Extreme" key. Handled here,
+    # before the analyst whitelist (the RSI bot is not a whitelisted analyst).
+    if signal.source == "rsi_extreme":
+        if os.getenv("RSI_EXTREME_ENABLED", "true").lower() != "true":
+            log.info(f"[RSI] {signal.side.upper()} {signal.symbol} — RSI strategy disabled, skipping")
+            _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
+                                   outcome="rsi_disabled")
+            return
+        existing = pt.find_open_by_symbol(signal.symbol)
+        if existing:
+            log.info(f"[RSI] {signal.symbol} already open — skipping duplicate RSI entry")
+            _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
+                                   outcome="rsi_already_open")
+            return
+        start, lo, hi, _step = _leverage_params()
+        leverage = pt.get_analyst_leverage("RSI Extreme", start, lo, hi)
+        _process_new(signal, pt.get_open_positions(), dry_run, leverage, "RSI Extreme")
+        return
 
     # Whitelist gate — log the signal but don't execute if analyst isn't whitelisted.
     if not _is_whitelisted(msg, whitelist_lower):
@@ -516,8 +668,8 @@ def main():
                 for msg in sweep_msgs:
                     _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
 
-                # Resolve open positions against TP/SL and adapt analyst leverage.
-                _resolve_open_positions()
+                # Manage open positions (scale-out TPs, SL ratchet) and adapt leverage.
+                _resolve_open_positions(dry_run)
                 last_sweep = time.time()
 
         except KeyboardInterrupt:

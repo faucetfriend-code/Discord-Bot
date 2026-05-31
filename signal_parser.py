@@ -57,6 +57,9 @@ class Signal:
     new_sl: Optional[float] = None   # update: new stop loss value
     new_tp: Optional[float] = None   # update: new take profit value
     is_market_order: bool = False    # True when analyst says "at CMP" / no limit price
+    source: str = ""                 # "" = analyst follow-trade; "rsi_extreme" = RSI strategy
+    vision_tps: Optional[list] = None    # multiple TP targets read off a chart, if any
+    vision_levels: Optional[list] = None # ALL price levels read off a chart (roles assigned by geometry)
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +163,39 @@ _CLOSE_UNDER_SL = re.compile(
     re.IGNORECASE,
 )
 
+# Entry-less directional calls where the analyst entered at market and the
+# numeric levels live only on an attached chart, e.g.:
+#   "Took this HYPE short, .5R size ... TP's in gold"
+#   "shorted SOL here", "longing ME at CMP"
+_ENTRY_VERB = re.compile(
+    r'\b(?:took|taking|shorted|longed|shorting|longing|entered|'
+    r'grabbed|sniped|scal(?:e|ed|ing)\s+in)\b',
+    re.IGNORECASE,
+)
+# "HYPE short" / "HYPE long"  (ticker before direction)
+_TICKER_DIR = re.compile(r'\b([A-Za-z]{2,10})\s+(short|long)\b', re.IGNORECASE)
+# "shorted HYPE" / "longing this ME"  (direction before ticker)
+_DIR_TICKER = re.compile(
+    r'\b(short|long)(?:ed|ing)?\s+(?:this\s+|the\s+)?([A-Za-z]{2,10})\b',
+    re.IGNORECASE,
+)
+
+# OracleAlgo "RSI Extreme" alerts, e.g.:
+#   "RSI Extreme — OverboughtSIGN/USDTRSI90.3Price$0.0135 24h Change+14.84%"
+# Overbought → mean-reversion SHORT; Oversold → mean-reversion LONG.
+_RSI_EXTREME = re.compile(
+    r'RSI\s*Extreme\s*[—–\-]+\s*'
+    r'(?P<dir>Overbought|Oversold)\s*'
+    r'(?P<sym>[A-Z0-9]{2,12})/USDT',
+    re.IGNORECASE,
+)
+
 # Pre-filter: if NONE of these appear in a message it cannot be a trade signal.
 # Avoids sending pure chatter / memes / announcements through the LLM.
 _TRADE_HINT = re.compile(
-    r'\b(?:long|short|buy|sell|entry|cmp|sl|tp|stop|target|lev(?:erage)?|'
-    r'usdt|futures|perp|trade|signal|alert|close|exit|scalp|swing|position)\b',
+    r'\b(?:long(?:ed|ing)?|short(?:ed|ing)?|buy|sell|entry|cmp|sl|tp|stop|target|'
+    r'lev(?:erage)?|usdt|futures|perp|trade|signal|alert|close|exit|scalp|swing|'
+    r'position|took|grabbed|sniped)\b',
     re.IGNORECASE,
 )
 
@@ -206,6 +237,66 @@ def _extract_symbol(text: str) -> str:
         if candidate not in _SYMBOL_BLOCKLIST:
             return _normalise_symbol(candidate)
     return "UNKNOWN-USDT"
+
+
+def _try_directional_market(text: str, msg: dict) -> Optional[Signal]:
+    """
+    Catch entry-less directional calls ("Took this HYPE short") where the analyst
+    entered at market and the numeric levels are only on an attached chart.
+    Returns a market-order NEW signal with symbol+side; entry is fetched live and
+    SL/TP are filled by the vision model (or left missing → skipped) downstream.
+    Requires an entry verb AND an uppercase ticker, to avoid matching prose.
+    """
+    if not _ENTRY_VERB.search(text):
+        return None
+
+    sym = side = None
+    m = _TICKER_DIR.search(text)
+    if m and m.group(1).isupper() and m.group(1) not in _SYMBOL_BLOCKLIST:
+        sym = m.group(1)
+        side = "sell" if m.group(2).lower().startswith("short") else "buy"
+    if sym is None:
+        m = _DIR_TICKER.search(text)
+        if m and m.group(2).isupper() and m.group(2) not in _SYMBOL_BLOCKLIST:
+            sym = m.group(2)
+            side = "sell" if m.group(1).lower().startswith("short") else "buy"
+    if sym is None:
+        return None
+
+    return Signal(
+        message_type=MessageType.NEW,
+        symbol=_normalise_symbol(sym),
+        side=side,
+        analyst=msg.get("author", ""),
+        raw_text=text,
+        entry=None,                 # entered at market — entry fetched live
+        is_market_order=True,
+    )
+
+
+def _try_rsi_extreme(text: str, msg: dict) -> Optional[Signal]:
+    """
+    Detect an OracleAlgo "RSI Extreme" alert and build a mean-reversion market order:
+      Oversold   → LONG  (expect bounce up)
+      Overbought → SHORT (expect pullback down)
+    Entry/SL/TP are resolved at execution time in bot.py from the live price.
+    """
+    m = _RSI_EXTREME.search(text)
+    if not m:
+        return None
+    direction = m.group("dir").lower()
+    side = "buy" if direction == "oversold" else "sell"
+    symbol = _normalise_symbol(m.group("sym"))
+    return Signal(
+        message_type=MessageType.NEW,
+        symbol=symbol,
+        side=side,
+        analyst=msg.get("author", ""),
+        raw_text=text,
+        entry=None,                 # market order — entry fetched live
+        is_market_order=True,
+        source="rsi_extreme",
+    )
 
 
 def _try_update_regex(text: str, msg: dict) -> Optional[Signal]:
@@ -318,20 +409,47 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
 
 def _vision_parse(image_url: str) -> dict:
     """
-    Download a chart screenshot from Discord CDN and ask the vision LLM to
-    extract entry, SL, and TP price levels.
+    Download a chart screenshot from Discord and read its price levels with the
+    vision LLM. Returns {"entry", "sl", "tps":[...], "levels":[...]} where
+    "levels" is every distinct price number read off the chart; roles (entry/
+    SL/TP) are assigned later by geometry in the bot, since the model reliably
+    reads the NUMBERS but often mislabels which is entry vs SL.
 
-    Returns a dict with keys "entry", "sl", "tp" (each float or None).
     Returns {} if LOCAL_VISION_MODEL is not configured or on any error.
     """
     vision_model = os.getenv("LOCAL_VISION_MODEL", "").strip()
     if not vision_model:
         return {}
     try:
-        r = _http.get(image_url, timeout=20)
+        # media.discordapp.net is Discord's RESIZING PROXY — it serves a small
+        # thumbnail (e.g. 490x350) where the axis price tags are unreadable.
+        # cdn.discordapp.com serves the full-resolution original (same signature),
+        # which is what makes the digits legible to the model.
+        full_url = image_url.replace("media.discordapp.net", "cdn.discordapp.com")
+        r = _http.get(full_url, timeout=20)
+        if r.status_code != 200:   # fall back to the original URL if the swap fails
+            r = _http.get(image_url, timeout=20)
         r.raise_for_status()
         ct = r.headers.get("Content-Type", "image/png").split(";")[0].strip()
-        img_b64 = base64.b64encode(r.content).decode("utf-8")
+        content = r.content
+
+        # Discord's media proxy serves charts as WEBP, which LM Studio rejects
+        # ("'url' field must be a base64 encoded image"). Convert anything that
+        # isn't PNG/JPEG to PNG before sending.
+        if ct not in ("image/png", "image/jpeg", "image/jpg"):
+            try:
+                import io
+                from PIL import Image
+                im = Image.open(io.BytesIO(content)).convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                content = buf.getvalue()
+                ct = "image/png"
+            except Exception as conv_err:
+                log.warning(f"Could not convert chart image ({ct}) to PNG: {conv_err}")
+                return {}
+
+        img_b64 = base64.b64encode(content).decode("utf-8")
 
         client = _get_llm()
         response = client.chat.completions.create(
@@ -354,19 +472,27 @@ def _vision_parse(image_url: str) -> dict:
                         {
                             "type": "text",
                             "text": (
-                                "Look at this TradingView chart. Find the entry price, "
-                                "stop loss (SL), and take profit (TP) price levels shown "
-                                "as horizontal lines or labeled levels on the chart. "
-                                "Pick ONE precise number for each (the most prominent level). "
-                                "Output ONLY this JSON — nothing else:\n"
-                                '{"entry": 0.0, "sl": 0.0, "tp": 0.0}\n'
-                                "Use null for any value you cannot confidently identify."
+                                "This is a TradingView trade-setup chart. Read the EXACT price "
+                                "numbers from the COLORED PRICE TAGS on the right-hand price axis "
+                                "(not the grey axis gridline numbers, and not the candles).\n"
+                                "The tags are colour-coded:\n"
+                                "- A RED tag is the STOP LOSS (sl).\n"
+                                "- The highlighted current-price tag (often boxed and showing a "
+                                "time like 12:33:10) is the ENTRY / CMP (entry).\n"
+                                "- ORANGE/yellow tags are TAKE-PROFIT targets (tps). There are "
+                                "usually several — list ALL of them.\n"
+                                "Read each number digit-for-digit from its tag (e.g. 71.594, "
+                                "67.761, 64.931, 59.412, 45.773).\n"
+                                "Output ONLY this JSON, numbers only, no labels:\n"
+                                '{"entry": 0.0, "sl": 0.0, "tps": [0.0, 0.0, 0.0]}\n'
+                                "Use null for entry/sl if you cannot read them, and [] for tps "
+                                "if there are none."
                             ),
                         },
                     ],
                 },
             ],
-            max_tokens=60,
+            max_tokens=160,
             temperature=0.0,
         )
         raw = response.choices[0].message.content.strip()
@@ -387,9 +513,33 @@ def _vision_parse(image_url: str) -> dict:
 
         def _sf(k):
             v = data.get(k)
-            return float(v) if v is not None else None
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
 
-        result = {"entry": _sf("entry"), "sl": _sf("sl"), "tp": _sf("tp")}
+        # Take-profit targets: prefer the "tps" list, fall back to a single "tp".
+        tps = []
+        raw_tps = data.get("tps")
+        if isinstance(raw_tps, list):
+            for v in raw_tps:
+                try:
+                    if v is not None:
+                        tps.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+        elif _sf("tp") is not None:
+            tps.append(_sf("tp"))
+
+        # Merge every number the model read into a single deduped, sorted list.
+        # Roles are assigned later by geometry (entry/SL/TP) using the trade side.
+        levels = []
+        for v in [_sf("entry"), _sf("sl")] + tps:
+            if v is not None and v > 0 and v not in levels:
+                levels.append(v)
+        levels.sort()
+
+        result = {"entry": _sf("entry"), "sl": _sf("sl"), "tps": tps, "levels": levels}
         log.info(f"Vision parse result: {result}")
         return result
     except Exception as e:
@@ -407,24 +557,25 @@ def _vision_fill(sig: Signal, msg: dict) -> Signal:
         return sig
     image_url = msg.get("image_url", "") or ""
     if not image_url:
+        log.debug(f"No chart image for {sig.symbol} — cannot vision-fill missing levels")
         return sig
     # All three fields present — nothing to do
     if sig.entry is not None and sig.sl is not None and sig.tp is not None:
         return sig
 
+    log.info(f"Attempting vision parse for {sig.symbol} from chart: {image_url[:70]}")
     vision = _vision_parse(image_url)
     if not vision:
+        log.info(f"Vision returned no usable levels for {sig.symbol}")
         return sig
 
-    if sig.entry is None and vision.get("entry") is not None:
-        sig.entry = vision["entry"]
-        log.info(f"Vision filled entry={sig.entry} for {sig.symbol}")
-    if sig.sl is None and vision.get("sl") is not None:
-        sig.sl = vision["sl"]
-        log.info(f"Vision filled sl={sig.sl} for {sig.symbol}")
-    if sig.tp is None and vision.get("tp") is not None:
-        sig.tp = vision["tp"]
-        log.info(f"Vision filled tp={sig.tp} for {sig.symbol}")
+    # Stash ALL levels read off the chart. Roles (entry/SL/TP) are assigned later
+    # in bot._process_new by geometry using the trade side + live entry — the model
+    # reads the numbers reliably but often mislabels which is entry vs SL.
+    levels = vision.get("levels") or []
+    if levels:
+        sig.vision_levels = levels
+        log.info(f"Vision read {len(levels)} price level(s) for {sig.symbol}: {levels}")
     return sig
 
 
@@ -466,6 +617,13 @@ def parse(msg: dict) -> Optional[Signal]:
     if not _TRADE_HINT.search(text):
         return None
 
+    # Stage 0 — RSI Extreme alerts (OracleAlgo). Checked first: very specific,
+    # and it's a market-order strategy distinct from analyst follow-trades.
+    sig = _try_rsi_extreme(text, msg)
+    if sig:
+        log.debug(f"RSI Extreme: {sig.side} {sig.symbol} (market)")
+        return sig
+
     # Stage 1a — update fast-path
     sig = _try_update_regex(text, msg)
     if sig:
@@ -488,6 +646,15 @@ def parse(msg: dict) -> Optional[Signal]:
                 log.debug(f"Regex NEW: {sig.side} {sig.symbol} @ {sig.entry} "
                           f"sl={sig.sl} tp={sig.tp} market={sig.is_market_order}")
                 return _vision_fill(sig, msg)
+
+    # Stage 1d — entry-less directional market call ("Took this HYPE short").
+    # Runs before the LLM so the ticker is extracted deterministically rather
+    # than the LLM mistaking a ticker like HYPE for the English word.
+    sig = _try_directional_market(text, msg)
+    if sig:
+        sig = _apply_cmp_flags(sig, text)
+        log.debug(f"Directional market: {sig.side} {sig.symbol} (entry live, levels from chart)")
+        return _vision_fill(sig, msg)
 
     # Stage 2 — LLM
     sig = _llm_parse(text, msg)

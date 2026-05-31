@@ -1,5 +1,6 @@
+import json
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,9 @@ class Position:
     opened_at: str
     status: str = "open"
     analyst: str = ""        # canonical analyst key, for performance attribution
+    tps: list = field(default_factory=list)  # full TP ladder (nearest target first)
+    tps_hit: int = 0         # how many ladder targets have been taken so far
+    orig_size: float = 0.0   # original size at open (for computing scale-out chunks)
     id: Optional[int] = None
 
 
@@ -39,10 +43,16 @@ def init_db():
             status      TEXT DEFAULT 'open'
         )
     """)
-    # Migration: add analyst column to existing DBs that predate it.
+    # Migrations: add columns to existing DBs that predate them.
     cols = [r[1] for r in con.execute("PRAGMA table_info(positions)").fetchall()]
     if "analyst" not in cols:
         con.execute("ALTER TABLE positions ADD COLUMN analyst TEXT DEFAULT ''")
+    if "tps" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN tps TEXT DEFAULT ''")
+    if "tps_hit" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN tps_hit INTEGER DEFAULT 0")
+    if "orig_size" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN orig_size REAL DEFAULT 0")
     con.execute("""
         CREATE TABLE IF NOT EXISTS seen_messages (
             msg_id TEXT PRIMARY KEY
@@ -63,16 +73,31 @@ def init_db():
 
 
 def open_position(pos: Position) -> int:
+    orig = pos.orig_size or pos.size
+    tps_json = json.dumps(pos.tps or [])
     con = sqlite3.connect(DB_PATH)
     cur = con.execute("""
-        INSERT INTO positions (symbol, side, entry, sl, tp, size, order_id, opened_at, status, analyst)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO positions (symbol, side, entry, sl, tp, size, order_id, opened_at,
+                               status, analyst, tps, tps_hit, orig_size)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (pos.symbol, pos.side, pos.entry, pos.sl, pos.tp,
-          pos.size, pos.order_id, pos.opened_at, pos.status, pos.analyst))
+          pos.size, pos.order_id, pos.opened_at, pos.status, pos.analyst,
+          tps_json, pos.tps_hit, orig))
     row_id = cur.lastrowid
     con.commit()
     con.close()
     return row_id
+
+
+def apply_partial(order_id: str, remaining_size: float, new_sl: float, tps_hit: int):
+    """Record a scale-out: update remaining size, ratcheted SL, and TPs-hit count."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE positions SET size=?, sl=?, tps_hit=? WHERE order_id=?",
+        (remaining_size, new_sl, tps_hit, order_id),
+    )
+    con.commit()
+    con.close()
 
 
 def close_position(order_id: str):
@@ -82,17 +107,29 @@ def close_position(order_id: str):
     con.close()
 
 
+def _parse_tps(raw) -> list:
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        return [float(x) for x in v] if isinstance(v, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
 def get_open_positions() -> list[Position]:
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT id, symbol, side, entry, sl, tp, size, order_id, opened_at, status, analyst "
+        "SELECT id, symbol, side, entry, sl, tp, size, order_id, opened_at, status, "
+        "analyst, tps, tps_hit, orig_size "
         "FROM positions WHERE status='open'"
     ).fetchall()
     con.close()
     return [
         Position(id=r[0], symbol=r[1], side=r[2], entry=r[3], sl=r[4],
                  tp=r[5], size=r[6], order_id=r[7], opened_at=r[8], status=r[9],
-                 analyst=r[10] or "")
+                 analyst=r[10] or "", tps=_parse_tps(r[11]),
+                 tps_hit=r[12] or 0, orig_size=r[13] or r[6])
         for r in rows
     ]
 

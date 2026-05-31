@@ -59,6 +59,62 @@ def validate(signal: Signal, open_positions: list[Position]) -> tuple[bool, str]
     return True, ""
 
 
+def chart_sl_tp(entry: float, side: str, levels: list, tol: float = 0.005):
+    """
+    Assign SL and TP candidates from a list of chart price levels using geometry,
+    given the trade side and (live) entry. The vision model reads the numbers
+    reliably but mislabels roles, so we derive them:
+      short (sell): SL is the nearest level ABOVE entry; TPs are levels BELOW.
+      long  (buy):  SL is the nearest level BELOW entry; TPs are levels ABOVE.
+    Levels within `tol` of entry (the entry marker itself) are ignored.
+    Returns (sl, tp_candidates_nearest_first).
+    """
+    if entry is None or not levels:
+        return None, []
+    above = sorted([float(l) for l in levels if float(l) > entry * (1 + tol)])
+    below = sorted([float(l) for l in levels if float(l) < entry * (1 - tol)], reverse=True)
+    if side == "sell":
+        sl = above[0] if above else None       # nearest above entry
+        tps = below                              # below entry, nearest first
+    else:
+        sl = below[0] if below else None         # nearest below entry
+        tps = above
+    return sl, tps
+
+
+def pick_tp(entry: float, sl: float, side: str, tps: list) -> Optional[float]:
+    """
+    Choose a take-profit from several chart targets: the NEAREST target on the
+    correct side that still gives at least _MIN_RISK_REWARD reward:risk. This
+    skips a too-tight TP1 (which would fail the R:R check) while preferring the
+    closest realistic target. Falls back to the furthest valid target.
+    """
+    if not tps or entry is None or sl is None:
+        return None
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+
+    valid = []
+    for tp in tps:
+        try:
+            tp = float(tp)
+        except (TypeError, ValueError):
+            continue
+        if side == "buy" and tp > entry:
+            valid.append(tp)
+        elif side == "sell" and tp < entry:
+            valid.append(tp)
+    if not valid:
+        return None
+
+    valid.sort(key=lambda t: abs(t - entry))  # nearest first
+    for tp in valid:
+        if abs(tp - entry) / risk >= _MIN_RISK_REWARD:
+            return tp
+    return valid[-1]  # none meet min R:R — furthest target (validate() may still reject)
+
+
 def calculate_size(balance: float, signal: Signal) -> Optional[float]:
     """
     Risk-based position sizing, returned in CONTRACTS (what BloFin's order API expects).

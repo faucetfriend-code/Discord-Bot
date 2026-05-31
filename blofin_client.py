@@ -295,6 +295,32 @@ def amend_order(inst_id: str, order_id: str,
         return {}
 
 
+def reduce_position(symbol: str, side: str, size: float) -> dict:
+    """
+    Partially close an open position with a reduce-only market order.
+    `side` is the ORIGINAL position side ("buy"/"sell"); we send the opposite.
+    """
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+    position_side = "long" if side == "buy" else "short"
+    close_side = "sell" if side == "buy" else "buy"
+    try:
+        client = _get_client()
+        resp = client.trading.place_order(
+            inst_id=inst_id,
+            margin_mode="cross",
+            position_side=position_side,
+            side=close_side,
+            order_type="market",
+            size=str(size),
+            reduce_only=True,
+        )
+        log.info(f"Reduce-only close {size} {inst_id} ({close_side}): {resp}")
+        return resp
+    except Exception as e:
+        log.error(f"reduce_position failed: {e}")
+        return {}
+
+
 def close_position_api(inst_id: str, position_side: str) -> dict:
     """Market-close an entire open position."""
     try:
