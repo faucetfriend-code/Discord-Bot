@@ -27,6 +27,8 @@ from logger import log
 
 
 class MessageType(Enum):
+    """What a parsed message asks the bot to do: open (NEW), amend (UPDATE),
+    exit (CLOSE), or nothing (NONE)."""
     NEW = "new"
     UPDATE = "update"
     CLOSE = "close"
@@ -37,6 +39,7 @@ _llm_client: Optional[OpenAI] = None
 
 
 def _get_llm() -> OpenAI:
+    """Lazily build the OpenAI-compatible client pointed at the local LM Studio server."""
     global _llm_client
     if _llm_client is None:
         base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -46,6 +49,9 @@ def _get_llm() -> OpenAI:
 
 @dataclass
 class Signal:
+    """The structured result of parsing one message. `source` distinguishes an
+    analyst follow-trade ("") from the RSI/OracleAlgo strategies; the vision_*
+    and signal_tf fields carry extra context those strategies need downstream."""
     message_type: MessageType
     symbol: str
     side: str           # "buy" or "sell" — may be empty string for UPDATE/CLOSE
@@ -213,15 +219,18 @@ _TRADE_HINT = re.compile(
 
 
 def _normalise_symbol(raw: str) -> str:
+    """Normalise a ticker to BloFin's `BASE-USDT` form (e.g. 'btc/usdt' → 'BTC-USDT')."""
     raw = raw.upper().replace("/", "-").replace("USDT", "").rstrip("-")
     return f"{raw}-USDT"
 
 
 def _to_float(s: str) -> float:
+    """Parse a price string, tolerating leading '$' and thousands commas."""
     return float(str(s).lstrip("$").replace(",", ""))
 
 
 def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
+    """Turn a matched entry-pattern regex into a NEW Signal (or None if it doesn't parse)."""
     try:
         gd = m.groupdict()
         side_raw = gd["side"].lower()

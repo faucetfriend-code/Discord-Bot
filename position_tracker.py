@@ -1,3 +1,26 @@
+"""
+position_tracker.py — all SQLite persistence for the bot (the only module that
+touches `bot.db` for state).
+
+Stores three things, each in its own table:
+  • positions      — open/closed trades (entry, SL, TP ladder, scale-out progress,
+                     mark-to-market PnL, the analyst it's attributed to)
+  • analyst_stats  — per-analyst/strategy adaptive leverage, win/loss tally, realised PnL
+  • seen_messages  — Discord message IDs already processed (dedupe across restarts)
+  • strategy_state — small key→value store (e.g. OracleAlgo's current BTC bias)
+
+Public interface (everything below is safe to call from anywhere):
+  init_db(), open_position(), close_position(), apply_partial(), get_open_positions(),
+  find_open_by_symbol(), update_position_sl_tp(), update_unrealized(),
+  get_analyst_leverage(), record_outcome(), add_realized_pnl(), get_all_analyst_stats(),
+  mark_seen(), get_seen_ids(), set_state(), get_state()
+
+Reusable standalone: yes. Only dependency is the stdlib `sqlite3` plus
+`logger.now_local` for timestamps. Drop this file into any project that needs
+simple trade/position persistence; swap the `now_local` import for `datetime.now`
+if you don't want the logger.
+"""
+
 import json
 import sqlite3
 from dataclasses import dataclass, asdict, field
@@ -9,8 +32,15 @@ from logger import now_local
 DB_PATH = Path(__file__).parent / "bot.db"
 
 
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Position:
+    """One trade the bot is tracking. `tps` is the take-profit ladder (nearest
+    target first); `tps_hit` counts how many rungs have been scaled out so far;
+    `analyst` is the canonical source key used for performance attribution."""
     symbol: str
     side: str
     entry: float
@@ -24,10 +54,18 @@ class Position:
     tps: list = field(default_factory=list)  # full TP ladder (nearest target first)
     tps_hit: int = 0         # how many ladder targets have been taken so far
     orig_size: float = 0.0   # original size at open (for computing scale-out chunks)
+    last_price: float = 0.0  # most recent market price seen (for unrealized PnL)
+    unrealized_pnl: float = 0.0  # mark-to-market PnL on the remaining size, in USDT
     id: Optional[int] = None
 
 
+# ---------------------------------------------------------------------------
+# Schema — create tables and run idempotent column migrations
+# ---------------------------------------------------------------------------
+
 def init_db():
+    """Create all tables if missing and add any columns introduced by later
+    versions (safe to call on every startup; never drops or clears data)."""
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS positions (
@@ -53,6 +91,10 @@ def init_db():
         con.execute("ALTER TABLE positions ADD COLUMN tps_hit INTEGER DEFAULT 0")
     if "orig_size" not in cols:
         con.execute("ALTER TABLE positions ADD COLUMN orig_size REAL DEFAULT 0")
+    if "last_price" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN last_price REAL DEFAULT 0")
+    if "unrealized_pnl" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN unrealized_pnl REAL DEFAULT 0")
     con.execute("""
         CREATE TABLE IF NOT EXISTS seen_messages (
             msg_id TEXT PRIMARY KEY
@@ -68,6 +110,10 @@ def init_db():
             updated_at TEXT
         )
     """)
+    # realized_pnl: cumulative closed PnL per analyst/strategy (USDT).
+    stat_cols = [r[1] for r in con.execute("PRAGMA table_info(analyst_stats)").fetchall()]
+    if stat_cols and "realized_pnl" not in stat_cols:
+        con.execute("ALTER TABLE analyst_stats ADD COLUMN realized_pnl REAL DEFAULT 0")
     # Persisted strategy state (e.g. OracleAlgo's current BTC 4H bias).
     con.execute("""
         CREATE TABLE IF NOT EXISTS strategy_state (
@@ -79,7 +125,12 @@ def init_db():
     con.close()
 
 
+# ---------------------------------------------------------------------------
+# Strategy state (small key→value store)
+# ---------------------------------------------------------------------------
+
 def set_state(key: str, value: str):
+    """Persist a strategy value (e.g. the OracleAlgo BTC bias), upserting by key."""
     con = sqlite3.connect(DB_PATH)
     con.execute(
         "INSERT INTO strategy_state (k, v) VALUES (?, ?) "
@@ -91,13 +142,19 @@ def set_state(key: str, value: str):
 
 
 def get_state(key: str, default=None):
+    """Return a persisted strategy value, or `default` if the key isn't set."""
     con = sqlite3.connect(DB_PATH)
     row = con.execute("SELECT v FROM strategy_state WHERE k=?", (key,)).fetchone()
     con.close()
     return row[0] if row else default
 
 
+# ---------------------------------------------------------------------------
+# Positions
+# ---------------------------------------------------------------------------
+
 def open_position(pos: Position) -> int:
+    """Insert a new open position; returns its row id."""
     orig = pos.orig_size or pos.size
     tps_json = json.dumps(pos.tps or [])
     con = sqlite3.connect(DB_PATH)
@@ -126,6 +183,7 @@ def apply_partial(order_id: str, remaining_size: float, new_sl: float, tps_hit: 
 
 
 def close_position(order_id: str):
+    """Mark a position closed (status='closed') by its order id."""
     con = sqlite3.connect(DB_PATH)
     con.execute("UPDATE positions SET status='closed' WHERE order_id=?", (order_id,))
     con.commit()
@@ -133,6 +191,7 @@ def close_position(order_id: str):
 
 
 def _parse_tps(raw) -> list:
+    """Decode the JSON-encoded TP ladder stored in the DB into a list of floats."""
     if not raw:
         return []
     try:
@@ -143,10 +202,11 @@ def _parse_tps(raw) -> list:
 
 
 def get_open_positions() -> list[Position]:
+    """Return every open position as a list of Position objects."""
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
         "SELECT id, symbol, side, entry, sl, tp, size, order_id, opened_at, status, "
-        "analyst, tps, tps_hit, orig_size "
+        "analyst, tps, tps_hit, orig_size, last_price, unrealized_pnl "
         "FROM positions WHERE status='open'"
     ).fetchall()
     con.close()
@@ -154,9 +214,39 @@ def get_open_positions() -> list[Position]:
         Position(id=r[0], symbol=r[1], side=r[2], entry=r[3], sl=r[4],
                  tp=r[5], size=r[6], order_id=r[7], opened_at=r[8], status=r[9],
                  analyst=r[10] or "", tps=_parse_tps(r[11]),
-                 tps_hit=r[12] or 0, orig_size=r[13] or r[6])
+                 tps_hit=r[12] or 0, orig_size=r[13] or r[6],
+                 last_price=r[14] or 0.0, unrealized_pnl=r[15] or 0.0)
         for r in rows
     ]
+
+
+def update_unrealized(order_id: str, last_price: float, unrealized_pnl: float):
+    """Store the latest mark-to-market price and unrealized PnL for an open position."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE positions SET last_price=?, unrealized_pnl=? WHERE order_id=?",
+        (last_price, unrealized_pnl, order_id),
+    )
+    con.commit()
+    con.close()
+
+
+def add_realized_pnl(analyst: str, amount: float):
+    """Accumulate realized (closed) PnL onto an analyst/strategy's running total."""
+    analyst = analyst or "unknown"
+    con = sqlite3.connect(DB_PATH)
+    # Ensure the row exists (a close can precede any leverage lookup in edge cases).
+    con.execute(
+        "INSERT INTO analyst_stats (analyst, leverage, wins, losses, realized_pnl, updated_at) "
+        "VALUES (?, 0, 0, 0, 0, ?) ON CONFLICT(analyst) DO NOTHING",
+        (analyst, now_local().isoformat()),
+    )
+    con.execute(
+        "UPDATE analyst_stats SET realized_pnl = COALESCE(realized_pnl, 0) + ? WHERE analyst=?",
+        (amount, analyst),
+    )
+    con.commit()
+    con.close()
 
 
 def update_position_sl_tp(order_id: str,
@@ -187,7 +277,12 @@ def find_open_by_symbol(symbol: str) -> Optional["Position"]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Seen-message dedupe (so a restart never re-processes old notifications)
+# ---------------------------------------------------------------------------
+
 def mark_seen(msg_id: str):
+    """Record a Discord message ID as processed (idempotent)."""
     con = sqlite3.connect(DB_PATH)
     con.execute("INSERT OR IGNORE INTO seen_messages (msg_id) VALUES (?)", (msg_id,))
     con.commit()
@@ -195,6 +290,7 @@ def mark_seen(msg_id: str):
 
 
 def get_seen_ids() -> set[str]:
+    """Return the set of all message IDs already processed."""
     con = sqlite3.connect(DB_PATH)
     rows = con.execute("SELECT msg_id FROM seen_messages").fetchall()
     con.close()
@@ -256,14 +352,16 @@ def record_outcome(analyst: str, won: bool, step: int, lo: int, hi: int) -> int:
 
 
 def get_all_analyst_stats() -> list[dict]:
-    """Return every analyst's leverage and win/loss record (for the dashboard)."""
+    """Return every analyst's leverage, win/loss record and realized PnL (dashboard)."""
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT analyst, leverage, wins, losses, updated_at FROM analyst_stats "
-        "ORDER BY leverage DESC, analyst"
+        "SELECT analyst, leverage, wins, losses, "
+        "COALESCE(realized_pnl, 0), updated_at FROM analyst_stats "
+        "ORDER BY realized_pnl DESC, leverage DESC, analyst"
     ).fetchall()
     con.close()
     return [
-        {"analyst": r[0], "leverage": r[1], "wins": r[2], "losses": r[3], "updated_at": r[4]}
+        {"analyst": r[0], "leverage": r[1], "wins": r[2], "losses": r[3],
+         "realized_pnl": r[4], "updated_at": r[5]}
         for r in rows
     ]

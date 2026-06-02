@@ -1,6 +1,20 @@
 """
-Thin wrapper around the blofin PyPI package for order placement and balance queries.
-Reads credentials from environment; base_url selects demo vs live.
+blofin_client.py — every BloFin exchange call the bot makes, in one place.
+
+A thin wrapper over the `blofin` PyPI SDK that papers over its quirks:
+  • the SDK hardcodes the LIVE URL and has no base_url arg → we patch it (demo vs live)
+  • demo and live use DIFFERENT API keys → we pick the right set from the endpoint
+  • order `size` is in CONTRACTS, not coins → specs come from get_contract_specs()
+Credentials and BLOFIN_BASE_URL are read from the environment (.env).
+
+Public interface:
+  Read:  get_balance(), get_market_price(), get_contract_specs(), set_price_stream()
+  Trade: place_order(), place_market_order(), amend_order(), reduce_position(),
+         close_position_api(), set_leverage(), cancel_all_orders()
+
+Reusable standalone: mostly — it depends on the `blofin` SDK, python-dotenv and the
+project logger. get_market_price() will use a registered PriceStream cache if present
+(set_price_stream) and otherwise falls back to a REST ticker call.
 """
 
 import os
@@ -16,6 +30,10 @@ load_dotenv()
 
 _client: Optional[_BloFinClient] = None
 
+
+# ---------------------------------------------------------------------------
+# Client setup (endpoint patching + demo/live credential selection)
+# ---------------------------------------------------------------------------
 
 def _patch_base_url(base_url: str) -> None:
     """
@@ -61,6 +79,8 @@ def _select_credentials(base_url: str) -> tuple[str, str, str]:
 
 
 def _get_client() -> _BloFinClient:
+    """Lazily build (and cache) the SDK client, patched to the configured endpoint
+    and credentials. Reset the module-level `_client` to force a rebuild."""
     global _client
     if _client is None:
         base_url = os.getenv("BLOFIN_BASE_URL", "https://demo-trading-openapi.blofin.com")
@@ -98,6 +118,10 @@ def _extract_usdt_available(resp: dict) -> Optional[float]:
             return float(asset.get("available", 0) or 0)
     return None
 
+
+# ---------------------------------------------------------------------------
+# Read-only market & account data
+# ---------------------------------------------------------------------------
 
 def get_balance() -> Optional[float]:
     """
@@ -206,10 +230,33 @@ def set_leverage(symbol: str, leverage: int, margin_mode: str = "cross") -> int:
     return lev
 
 
+_price_stream = None  # optional PriceStream, set by the bot at startup
+
+
+def set_price_stream(stream):
+    """Register a live PriceStream whose cache get_market_price() prefers."""
+    global _price_stream
+    _price_stream = stream
+
+
 def get_market_price(symbol: str) -> Optional[float]:
-    """Return the last traded price for a symbol (used for CMP / market-order sizing)."""
+    """
+    Last traded price for a symbol. Prefers the live WS price cache when it has a
+    fresh tick; otherwise falls back to a REST ticker lookup. (On demo the stream
+    is sparse, so REST does most of the work; on live the cache serves it instantly.)
+    """
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+
+    if _price_stream is not None:
+        try:
+            max_age = float(os.getenv("PRICE_MAX_AGE", "15"))
+            cached = _price_stream.get(inst_id, max_age=max_age)
+            if cached:
+                return cached
+        except Exception:
+            pass
+
     try:
-        inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
         client = _get_client()
         # SDK exposes market data on the `public` API, not `market`.
         resp = client.public.get_tickers(inst_id=inst_id)
@@ -221,6 +268,10 @@ def get_market_price(symbol: str) -> Optional[float]:
         log.warning(f"get_market_price({symbol}) failed: {e}")
         return None
 
+
+# ---------------------------------------------------------------------------
+# Order placement & management
+# ---------------------------------------------------------------------------
 
 def place_order(signal, size: float) -> dict:
     """
@@ -338,6 +389,7 @@ def close_position_api(inst_id: str, position_side: str) -> dict:
 
 
 def cancel_all_orders() -> dict:
+    """Cancel every open order on the account (emergency / cleanup helper)."""
     try:
         return _get_client().trading.cancel_all_orders()
     except Exception as e:

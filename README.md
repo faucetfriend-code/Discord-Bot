@@ -4,7 +4,17 @@ Reads trade calls posted by Unity Academy analysts in Discord's notification inb
 
 ## How it works
 
-The bot polls the Discord notification inbox on a configurable interval. Each notification from a whitelisted analyst is passed through a two-stage signal parser: regex patterns for speed, a local Qwen LLM (via LM Studio) as fallback. Parsed signals are classified as NEW, UPDATE, CLOSE, or NONE, then routed to the appropriate BloFin API call. A Flask dashboard at `http://localhost:5050` shows live poll stats, open positions, signal history, and a log tail.
+The bot watches Discord's notification inbox in **real time** (a MutationObserver injected over Chrome DevTools Protocol fires the instant a notification arrives), with a periodic inbox sweep as a safety net. Each message is parsed into a structured `Signal` by a layered parser — regex fast-paths, then a local Qwen LLM (via LM Studio), then a chart-vision read for image-only setups.
+
+It runs **three strategies**, each tracked separately:
+
+- **Analyst follow-trades** — copies the whitelisted Unity analysts' calls (text levels, or read off an attached chart).
+- **RSI Extreme** — OracleAlgo overbought/oversold alerts traded mean-reversion.
+- **OracleAlgo BTC** — 4H structure signals set a bias; 1H signals enter only when they agree with it.
+
+Every source has its own **adaptive leverage** (starts at 75x, ratchets up on wins / down on losses within a 50–125x band based on its own track record) and **scale-out management** (partial closes at each TP target with the stop ratcheting to break-even then behind each prior TP). Positions are marked to market continuously and all PnL is tracked per strategy.
+
+Orders execute on BloFin perpetual futures. A Flask dashboard at `http://localhost:5050` shows a per-source scoreboard, open positions with live PnL and scale-out progress, performance, and a log tail. **`DRY_RUN=true` (the default) simulates everything** — virtual positions, PnL, leverage — so you can validate each strategy before risking a cent.
 
 ## Prerequisites
 
@@ -135,19 +145,41 @@ The Flask dashboard at `http://localhost:5050` auto-refreshes every 15 seconds. 
 
 The `/api/status` endpoint returns the same data as JSON if you want to build additional tooling on top.
 
-## File overview
+## Module map (for contributors)
 
-| File | Role |
-|------|------|
-| `bot.py` | Main poll loop — orchestrates everything |
-| `discord_reader.py` | Connects to Chrome via CDP (port 9222), clicks the inbox button, scrapes notification cards with JS |
-| `signal_parser.py` | Two-stage parser: regex fast-path, then local Qwen LLM fallback. Returns a `Signal` dataclass. |
-| `blofin_client.py` | BloFin SDK wrapper: `get_balance`, `place_order`, `amend_order`, `close_position_api` |
-| `risk_manager.py` | Validates signals, calculates position size from `RISK_PCT`, rounds to BloFin lot sizes |
-| `position_tracker.py` | SQLite (`bot.db`): tracks open positions and seen message IDs |
-| `logger.py` | Rotating log to `bot.log`, appends to `signals_log.csv`, writes to the `signals` table in `bot.db` |
-| `dashboard.py` | Flask web dashboard at `http://localhost:5050` |
-| `run_bot.bat` | Kills existing Chrome, launches a fresh instance with CDP flags, waits 15s, starts `bot.py` |
+Each module has a header docstring stating its purpose, public interface, and
+whether it's reusable standalone. Start there. The "Lift it out?" column flags
+parts that drop cleanly into another project.
+
+| File | Role | Lift it out? |
+|------|------|--------------|
+| `bot.py` | The orchestrator. Event loop, signal routing, the three strategy state machines, scale-out management, startup health check + reconciliation. | No — this is the glue |
+| `signal_parser.py` | Turns a message dict into a `Signal`. Regex fast-paths → local LLM → chart vision. Owns the RSI/OracleAlgo/analyst format detection. | Partly (regex + `Signal` reusable) |
+| `risk_manager.py` | Pure functions: validate a signal, size a position (contracts, not coins), pick a TP, assign chart levels by geometry. No I/O. | **Yes** — pure, no deps |
+| `blofin_client.py` | Every BloFin exchange call, in one place. Balance, price, contract specs, leverage, all order types. Handles demo/live keys + endpoint. | Mostly (needs the `blofin` SDK) |
+| `position_tracker.py` | All SQLite persistence: positions, adaptive leverage/PnL stats, seen-message dedupe, strategy state. | **Yes** — stdlib `sqlite3` only |
+| `price_stream.py` | Live last-price cache from BloFin's public WebSocket, with a stale→None contract for REST fallback. | **Yes** — only needs `websocket-client` |
+| `discord_reader.py` | Reads Discord's notification inbox over Chrome CDP (port 9222): one-shot poll + a real-time MutationObserver listener. | Partly (Discord/Chrome specific) |
+| `dashboard.py` | Read-only Flask cockpit at `localhost:5050`. Reads `bot.db` + `bot.log`; never writes or trades. | Partly (schema-specific) |
+| `logger.py` | Shared logger (local-timezone), plus signal logging to `bot.log`, `signals_log.csv`, and the `signals` table. | **Yes** |
+| `preflight.py` | Standalone read-only go-live check: verifies live keys, balance, and which recent symbols are tradeable on live. Run `python preflight.py`. | n/a (a tool) |
+| `run_bot.bat` | Kills existing Chrome, launches a fresh instance with CDP flags, then starts `bot.py`. | n/a |
+
+### How the modules connect (data flow)
+
+```
+Discord inbox ──CDP──> discord_reader ──msg dict──> signal_parser ──Signal──> bot.py
+                                                                                 │
+                              ┌──────────────────────────────────────────────────┤
+                              ▼                         ▼                         ▼
+                        risk_manager            blofin_client            position_tracker
+                       (size / validate)        (place / price)          (persist + PnL)
+                              │                         ▲                         │
+                              └─────────► bot.py ◄───────┘                         │
+                                          │  price_stream feeds blofin_client      │
+                                          ▼                                        ▼
+                                     dashboard ◄────────── reads bot.db ───────────┘
+```
 
 ## Runtime files (not in the repo)
 

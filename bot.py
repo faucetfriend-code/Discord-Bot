@@ -29,6 +29,7 @@ from signal_parser import MessageType
 import risk_manager as rm
 import blofin_client as bf
 import dashboard
+from price_stream import PriceStream
 from logger import log, now_local
 
 _logger_mod.init_db()
@@ -36,6 +37,7 @@ pt.init_db()
 
 
 def _get_whitelist() -> list[str]:
+    """Parse ANALYST_WHITELIST into a list of analyst display names."""
     raw = os.getenv("ANALYST_WHITELIST", "")
     return [name.strip() for name in raw.split(",") if name.strip()]
 
@@ -111,8 +113,16 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         if live_price:
             signal.entry = live_price
             log.info(f"[{analyst}] CMP signal — fetched live price {live_price} for {signal.symbol}")
+        elif bf.get_contract_specs(signal.symbol) is None:
+            # Symbol isn't listed on this BloFin endpoint (demo has a limited set;
+            # live has many more). Nothing wrong — we just can't trade it here.
+            log.info(f"[{analyst}] {signal.symbol} not listed on BloFin — skipping")
+            _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                                   outcome="symbol_not_listed")
+            return
         else:
-            log.warning(f"[{analyst}] CMP signal but could not fetch live price — skipping")
+            log.warning(f"[{analyst}] {signal.symbol} is listed but live price fetch failed "
+                        f"(transient API error) — skipping")
             _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                    outcome="cmp_price_fetch_failed")
             return
@@ -212,6 +222,8 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     balance = bf.get_balance()
     if balance is None:
         log.error(f"[{analyst}] Balance unavailable (API/auth error) — cannot size {signal.symbol}, skipping")
+        _alert("BloFin balance unavailable (auth/API error) — trades are being skipped",
+               "error", key="balance_unavailable")
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome="balance_unavailable")
         return
@@ -318,17 +330,30 @@ def _process_update(signal: sp.Signal, position: pt.Position, dry_run: bool):
                                outcome=f"amend_error:{e}", order_id=position.order_id)
 
 
+def _pnl_usdt(entry: float, exit_price: float, contracts: float,
+             contract_value: float, side: str) -> float:
+    """Realized/unrealized PnL in USDT for `contracts` of a position."""
+    coins = contracts * contract_value
+    return (exit_price - entry) * coins if side == "buy" else (entry - exit_price) * coins
+
+
 def _settle_position(position: pt.Position, exit_price: float, reason: str,
                      won: bool = None):
     """
-    Close a position locally, decide win/loss, and adapt the analyst's leverage.
-    If `won` is not given, it's inferred from exit vs entry (long: exit >= entry).
-    For scale-outs the caller passes won explicitly (any banked TP = net win).
+    Close a position locally, decide win/loss, record realized PnL, and adapt
+    the analyst's leverage. If `won` is not given it's inferred from exit vs entry
+    (scale-outs pass won explicitly — any banked TP = net win).
     """
     start, lo, hi, step = _leverage_params()
     if won is None:
         won = exit_price >= position.entry if position.side == "buy" \
             else exit_price <= position.entry
+
+    # Realized PnL on the remaining size being closed here.
+    specs = bf.get_contract_specs(position.symbol)
+    cv = specs["contract_value"] if specs else 0.0
+    pnl = _pnl_usdt(position.entry, exit_price, position.size, cv, position.side)
+    pt.add_realized_pnl(position.analyst, pnl)
 
     new_lev = pt.record_outcome(position.analyst, won, step, lo, hi)
     pt.close_position(position.order_id)
@@ -337,9 +362,9 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
     arrow = f"+{step}" if won else f"-{step}"
     log.info(f"[{position.analyst}] {position.symbol} {verdict} ({reason}) "
              f"exit={exit_price} entry={position.entry} tps_hit={position.tps_hit} "
-             f"→ leverage {arrow} = {new_lev}x")
+             f"PnL ${pnl:+.2f} → leverage {arrow} = {new_lev}x")
     _logger_mod.log_signal(position.analyst, f"{position.symbol} {reason}",
-                           outcome=f"{'win' if won else 'loss'}:{reason} lev={new_lev}x",
+                           outcome=f"{'win' if won else 'loss'}:{reason} pnl=${pnl:+.2f} lev={new_lev}x",
                            order_id=position.order_id)
     return won, new_lev
 
@@ -391,6 +416,13 @@ def _resolve_open_positions(dry_run: bool = True):
         if price is None:
             continue
 
+        specs = bf.get_contract_specs(pos.symbol)
+        cv = specs["contract_value"] if specs else 0.0
+
+        # Mark-to-market: update unrealized PnL on the remaining size each sweep.
+        unreal = _pnl_usdt(pos.entry, price, pos.size, cv, pos.side)
+        pt.update_unrealized(pos.order_id, price, unreal)
+
         ladder = pos.tps or ([pos.tp] if pos.tp else [])
         n = len(ladder)
         if n == 0:
@@ -425,7 +457,6 @@ def _resolve_open_positions(dry_run: bool = True):
             continue
 
         # Intermediate target → partial close + ratchet SL.
-        specs = bf.get_contract_specs(pos.symbol)
         lot = specs["lot_size"] if specs and specs.get("lot_size") else 0
         chunk = pos.orig_size / n
         if lot:
@@ -450,11 +481,38 @@ def _resolve_open_positions(dry_run: bool = True):
             except Exception as e:
                 log.error(f"Scale-out order/amend failed for {pos.symbol}: {e}")
 
+        # Realized PnL on the slice we just took off.
+        slice_pnl = _pnl_usdt(pos.entry, price, chunk, cv, pos.side)
+        pt.add_realized_pnl(pos.analyst, slice_pnl)
         pt.apply_partial(pos.order_id, remaining, new_sl, new_hit)
-        log.info(f"[{pos.analyst}] {pos.symbol} TP{new_hit} hit @ {price} — closed {chunk}, "
-                 f"{remaining} left, SL → {new_sl} ({sl_label})")
+        log.info(f"[{pos.analyst}] {pos.symbol} TP{new_hit} hit @ {price} — closed {chunk} "
+                 f"(${slice_pnl:+.2f}), {remaining} left, SL → {new_sl} ({sl_label})")
         _logger_mod.log_signal(pos.analyst, f"{pos.symbol} TP{new_hit} scale-out",
-                               outcome=f"scaled_tp{new_hit} sl={new_sl}", order_id=pos.order_id)
+                               outcome=f"scaled_tp{new_hit} pnl=${slice_pnl:+.2f} sl={new_sl}",
+                               order_id=pos.order_id)
+
+
+def _reconcile_on_startup(dry_run: bool):
+    """
+    On boot, immediately settle/scale any open position that moved while the bot
+    was offline. Price may have crossed SEVERAL ladder levels during downtime, so
+    resolve repeatedly until the open-position state stops changing (each pass
+    advances a position by at most one level).
+    """
+    open_now = pt.get_open_positions()
+    if not open_now:
+        return
+    log.info(f"Reconciling {len(open_now)} open position(s) against current price "
+             f"(catching up on moves during downtime)…")
+    for _ in range(12):  # safety cap
+        snapshot = {(p.order_id, p.tps_hit) for p in pt.get_open_positions()}
+        if not snapshot:
+            break
+        _resolve_open_positions(dry_run)
+        if {(p.order_id, p.tps_hit) for p in pt.get_open_positions()} == snapshot:
+            break
+    still_open = len(pt.get_open_positions())
+    log.info(f"Startup reconciliation complete — {still_open} position(s) still open")
 
 
 def _live_close_remaining(pos: pt.Position):
@@ -565,6 +623,11 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
 
 
 def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
+    """
+    Parse one notification and route it. Order of handling:
+    RSI Extreme → OracleAlgo → (analyst whitelist gate) → NEW/UPDATE/CLOSE.
+    Strategy signals (RSI/OracleAlgo) have their own gates and bypass the whitelist.
+    """
     whitelist_lower = {name.lower() for name in whitelist}
     signal = sp.parse(msg)
     analyst = msg.get("author", "unknown")
@@ -657,11 +720,114 @@ def _handle_msg(msg: dict, dry_run: bool, whitelist: list[str], bot_state: dict,
     bot_state["last_signal_at"] = now_local().isoformat()
 
 
+_alert_times: dict = {}
+
+
+def _alert(message: str, level: str = "warning", key: str = None, cooldown: int = 1800):
+    """
+    Log an alert and, if ALERT_WEBHOOK_URL is set, post it to a Discord webhook.
+    De-duplicated per `key` within `cooldown` seconds so failures don't spam.
+    """
+    key = key or message
+    now = time.time()
+    if now - _alert_times.get(key, 0) < cooldown:
+        return
+    _alert_times[key] = now
+    getattr(log, level if level in ("info", "warning", "error") else "warning")(f"ALERT: {message}")
+    url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+    if not url:
+        return
+    try:
+        import requests
+        requests.post(url, json={"content": f"🚨 Discord Signal Bot: {message}"}, timeout=8)
+    except Exception as e:
+        log.debug(f"Alert webhook post failed: {e}")
+
+
+def _log_strategy_config():
+    """Print the active strategy configuration so settings are confirmed each run."""
+    def on(v):
+        return "ON " if os.getenv(v, "true").lower() == "true" else "off"
+    log.info("Strategy config:")
+    log.info(f"  Risk: {float(os.getenv('RISK_PCT','0.01'))*100:.1f}%/trade | "
+             f"max {os.getenv('MAX_OPEN_POSITIONS','3')} positions | "
+             f"leverage start {os.getenv('LEVERAGE_START','75')}x "
+             f"({os.getenv('LEVERAGE_MIN','50')}-{os.getenv('LEVERAGE_MAX','125')}x, "
+             f"±{os.getenv('LEVERAGE_STEP','10')} by performance)")
+    log.info(f"  RSI Extreme [{on('RSI_EXTREME_ENABLED')}]: "
+             f"SL {float(os.getenv('RSI_SL_PCT','0.05'))*100:.0f}% / "
+             f"TP {float(os.getenv('RSI_TP_PCT','0.10'))*100:.0f}%")
+    log.info(f"  OracleAlgo  [{on('ORACLEALGO_ENABLED')}]: 4H bias + 1H entry | "
+             f"SL {float(os.getenv('ORACLE_SL_PCT','0.015'))*100:.1f}% / "
+             f"TP ladder {os.getenv('ORACLE_TP_PCTS','0.02,0.04')}")
+    log.info(f"  Vision: model '{os.getenv('LOCAL_VISION_MODEL','(none)')}' | "
+             f"max level deviation {float(os.getenv('VISION_MAX_DEVIATION_PCT','0.5'))*100:.0f}%")
+
+
+def _startup_health_check(dry_run: bool) -> bool:
+    """Verify each subsystem is reachable; print a green/red checklist. Returns all-ok."""
+    log.info("-" * 60)
+    log.info("Startup health check:")
+    ok = True
+
+    # BloFin auth + instrument coverage
+    bal = bf.get_balance()
+    if bal is None:
+        log.error("  [FAIL] BloFin: auth/API error — check keys + BLOFIN_BASE_URL")
+        _alert("BloFin auth failed at startup", "error", key="health_blofin")
+        ok = False
+    else:
+        n_inst = len(bf._load_instruments())
+        log.info(f"  [ OK ] BloFin: balance ${bal:.2f}, {n_inst} instruments listed")
+        if bal <= 0 and not dry_run:
+            log.warning("  [WARN] Live balance is $0 — fund the account before trading")
+
+    # LM Studio + models
+    base = os.getenv("LOCAL_LLM_BASE_URL", "").strip()
+    if base:
+        try:
+            import requests
+            data = requests.get(base + "/models", timeout=6).json()
+            loaded = [d.get("id", "") for d in data.get("data", [])]
+            log.info(f"  [ OK ] LM Studio reachable — loaded: {loaded}")
+            for var, label in (("LOCAL_LLM_MODEL", "text"), ("LOCAL_VISION_MODEL", "vision")):
+                m = os.getenv(var, "").strip()
+                if m and not any(m in x for x in loaded):
+                    log.warning(f"  [WARN] {label} model '{m}' not loaded — that path is disabled")
+        except Exception as e:
+            log.warning(f"  [WARN] LM Studio not reachable at {base} ({e}) — LLM/vision fallback off")
+
+    # Chrome CDP + Discord tab
+    if dr.verify_connected():
+        tab = bool(dr._get_discord_ws_url())
+        if tab:
+            log.info("  [ OK ] Chrome CDP reachable, Discord tab present")
+        else:
+            log.error("  [FAIL] Chrome CDP up but no Discord tab — open Discord in the tab")
+            ok = False
+    else:
+        log.error("  [FAIL] Chrome CDP not reachable on port 9222")
+        ok = False
+
+    log.info(f"Health check: {'ALL GOOD' if ok else 'FAILURES above — fix before relying on the bot'}")
+    log.info("-" * 60)
+    return ok
+
+
 def main():
+    """
+    Entry point. Starts the dashboard + price stream, runs the health check,
+    reconciles positions that moved while offline, then enters the event loop:
+    real-time notifications drive trades, a fast timer manages open positions
+    (PnL + TP/SL/scale-out), and a slow timer re-scans the inbox as a safety net.
+    """
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     # SWEEP_INTERVAL: how often to re-inject the observer and do a full inbox scan.
     # This is the only remaining periodic operation; real-time delivery is via the listener.
     sweep_interval = int(os.getenv("POLL_INTERVAL", 300))
+    # RESOLVE_INTERVAL: how often to manage open positions (mark-to-market PnL +
+    # TP/SL/scale-out). Runs off cached stream prices so it's cheap to run often.
+    resolve_interval = int(os.getenv("RESOLVE_INTERVAL", 10))
     whitelist = _get_whitelist()
     server_filter = os.getenv("DISCORD_SERVER_FILTER", "")
 
@@ -685,6 +851,7 @@ def main():
     log.info(f"Server filter: '{server_filter or 'none'}'")
     log.info(f"Sweep interval: {sweep_interval}s")
     log.info("=" * 60)
+    _log_strategy_config()
 
     # Wait for Chrome CDP to be ready
     connected = False
@@ -700,11 +867,31 @@ def main():
             "Cannot reach Chrome on port 9222 after 30s.\n"
             "Make sure Chrome launched via run_bot.bat."
         )
+        _alert("Cannot reach Chrome on port 9222 — bot not started", "error", key="startup_cdp")
         return
 
     bot_state["chrome_connected"] = True
+
+    # Subsystem health check (BloFin, LM Studio, Chrome/Discord).
+    _startup_health_check(dry_run)
     seen_ids = pt.get_seen_ids()
     log.info(f"Loaded {len(seen_ids)} previously-seen message IDs")
+
+    # Live price stream (BloFin public WS). The resolver/dashboard peek at its
+    # cache; REST is the fallback when a tick is stale (e.g. quiet demo market).
+    price_stream = None
+    try:
+        price_stream = PriceStream(os.getenv("BLOFIN_BASE_URL", ""))
+        price_stream.start()
+        bf.set_price_stream(price_stream)
+        price_stream.ensure([p.symbol for p in pt.get_open_positions()])
+    except Exception as e:
+        log.warning(f"Price stream unavailable ({e}) — using REST prices only")
+        price_stream = None
+
+    # Reconcile open positions FIRST — settle/scale anything that moved while
+    # the bot was offline, before processing any new inbox signals.
+    _reconcile_on_startup(dry_run)
 
     # Startup sweep — catch any messages that arrived while the bot was offline
     log.info("Running startup inbox sweep…")
@@ -720,25 +907,39 @@ def main():
         listener = None
 
     last_sweep = time.time()
+    last_resolve = time.time()
 
     while True:
         try:
-            bot_state["discord_tab"] = bool(dr._get_discord_ws_url())
+            discord_tab = bool(dr._get_discord_ws_url())
+            bot_state["discord_tab"] = discord_tab
+            if not discord_tab:
+                _alert("Lost the Discord tab (Chrome/CDP issue) — signals not being received",
+                       "error", key="cdp_no_tab")
 
             if listener and listener.is_alive:
-                # Block until a notification arrives or timeout for maintenance
+                # Wake at least every resolve_interval to manage positions.
                 try:
-                    msg = listener.queue.get(timeout=30)
+                    msg = listener.queue.get(timeout=resolve_interval)
                     bot_state["last_poll_found"] = 1
                     log.info("--- Real-time notification ---")
                     _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
                 except _queue.Empty:
-                    pass  # no new message in 30s — proceed to maintenance check
+                    pass  # no new message — proceed to maintenance checks
             else:
                 # Listener dead or unavailable — fall back to periodic sweep
-                time.sleep(sweep_interval)
+                _alert("Real-time listener is down — running in sweep-only fallback mode",
+                       "warning", key="listener_down")
+                time.sleep(resolve_interval)
 
-            # Periodic sweep: re-inject observer + full inbox scan
+            # Fast cadence: mark-to-market PnL + TP/SL/scale-out off cached prices.
+            if time.time() - last_resolve >= resolve_interval:
+                if price_stream:
+                    price_stream.ensure([p.symbol for p in pt.get_open_positions()])
+                _resolve_open_positions(dry_run)
+                last_resolve = time.time()
+
+            # Periodic sweep: re-inject observer + full inbox scan.
             if time.time() - last_sweep >= sweep_interval:
                 log.info("Periodic sweep: re-injecting observer and scanning inbox")
                 if listener:
@@ -747,15 +948,14 @@ def main():
                 bot_state["last_poll_found"] = len(sweep_msgs)
                 for msg in sweep_msgs:
                     _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
-
-                # Manage open positions (scale-out TPs, SL ratchet) and adapt leverage.
-                _resolve_open_positions(dry_run)
                 last_sweep = time.time()
 
         except KeyboardInterrupt:
             log.info("Shutting down.")
             if listener:
                 listener.stop()
+            if price_stream:
+                price_stream.stop()
             break
         except Exception as e:
             log.error(f"Main loop error: {e}")

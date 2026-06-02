@@ -50,9 +50,24 @@ When new signal formats appear in dry-run logs, add regex patterns at the top of
 
 ## Switching to Live Trading
 
+**First run the preflight** (read-only — places no orders):
+
+```bat
+python preflight.py
+```
+
+It verifies your LIVE keys authenticate, shows the live balance, and lists which
+recent signal symbols are tradeable on live vs demo. Only flip to live once it
+reads `VERDICT: GO`.
+
+Then:
+
 1. Change `BLOFIN_BASE_URL` in `.env` to `https://openapi.blofin.com`
 2. Set `DRY_RUN=false`
 3. Restart bot
+
+The bot auto-selects LIVE keys on the live endpoint (the `Demo-*` keys are only
+used on the demo endpoint). The startup health check confirms auth + balance.
 
 ## Position Sizing & Contract Specs
 
