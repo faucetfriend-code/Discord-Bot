@@ -14,3 +14,4 @@ signals_log.csv
 # Chrome CDP isolated profile
 /chrome-cdp-profile/
 C:/chrome-cdp-profile/
+tunnel.bat

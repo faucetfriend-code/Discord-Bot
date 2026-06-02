@@ -220,6 +220,15 @@ def get_open_positions() -> list[Position]:
     ]
 
 
+def update_position_entry(order_id: str, new_entry: float):
+    """Shift a position's entry basis (used when a DCA/averaging analyst posts a
+    new average entry). PnL and win/loss attribution are measured from here on."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE positions SET entry=? WHERE order_id=?", (new_entry, order_id))
+    con.commit()
+    con.close()
+
+
 def update_unrealized(order_id: str, last_price: float, unrealized_pnl: float):
     """Store the latest mark-to-market price and unrealized PnL for an open position."""
     con = sqlite3.connect(DB_PATH)

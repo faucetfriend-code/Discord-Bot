@@ -295,26 +295,40 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
 
 
 def _process_update(signal: sp.Signal, position: pt.Position, dry_run: bool):
-    """Amend SL/TP on an existing open order."""
+    """
+    Apply an update to an open position: a new SL/TP (amended on the exchange when
+    live), and/or a new average entry from DCA/averaging (a local basis shift —
+    future PnL and win/loss are measured from the new entry). Messages with no
+    numeric changes (e.g. "Limit Entry Reached") are acknowledged as a clean no-op.
+    """
     analyst = signal.analyst
     changes = []
     if signal.new_sl is not None:
         changes.append(f"SL→{signal.new_sl}")
     if signal.new_tp is not None:
         changes.append(f"TP→{signal.new_tp}")
-    desc = ", ".join(changes) if changes else "no numeric changes extracted"
-
+    if signal.new_avg_entry is not None:
+        changes.append(f"avg entry→{signal.new_avg_entry}")
+    desc = ", ".join(changes) if changes else "info / acknowledgement (no numeric changes)"
     log.info(f"[{analyst}] UPDATE {signal.symbol} | {desc} | order={position.order_id}")
+
+    # Average-entry shift is a LOCAL state change (no exchange order), applied in
+    # both dry-run and live so PnL/attribution use the right basis.
+    if signal.new_avg_entry is not None:
+        pt.update_position_entry(position.order_id, signal.new_avg_entry)
+        log.info(f"[{analyst}] {position.symbol} entry basis updated "
+                 f"{position.entry} → {signal.new_avg_entry} (DCA/averaging)")
+
+    # Nothing to send to the exchange (info no-op, or avg-entry only)?
+    if signal.new_sl is None and signal.new_tp is None:
+        outcome = "avg_entry_updated" if signal.new_avg_entry is not None else "acknowledged"
+        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                               outcome=outcome, order_id=position.order_id)
+        return
 
     if dry_run:
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome="dry_run_update", order_id=position.order_id)
-        return
-
-    if signal.new_sl is None and signal.new_tp is None:
-        log.info("Update had no numeric SL/TP values — nothing to amend on BloFin")
-        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
-                               outcome="update_no_values", order_id=position.order_id)
         return
 
     inst_id = signal.symbol if "-USDT" in signal.symbol else f"{signal.symbol}-USDT"
@@ -808,6 +822,11 @@ def _startup_health_check(dry_run: bool) -> bool:
     else:
         log.error("  [FAIL] Chrome CDP not reachable on port 9222")
         ok = False
+
+    # Live + open dashboard = real balance/positions viewable by anyone with the URL.
+    if not dry_run and not os.getenv("DASHBOARD_PASSWORD", "").strip():
+        log.warning("  [WARN] LIVE trading with no DASHBOARD_PASSWORD set — if the dashboard "
+                    "is exposed (e.g. a Cloudflare tunnel) your real balance/positions are public")
 
     log.info(f"Health check: {'ALL GOOD' if ok else 'FAILURES above — fix before relying on the bot'}")
     log.info("-" * 60)

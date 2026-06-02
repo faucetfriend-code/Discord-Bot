@@ -145,6 +145,23 @@ The Flask dashboard at `http://localhost:5050` auto-refreshes every 15 seconds. 
 
 The `/api/status` endpoint returns the same data as JSON if you want to build additional tooling on top.
 
+### Sharing the dashboard remotely (Cloudflare tunnel)
+
+To let someone else (e.g. the Discord server owner) view your live dashboard,
+expose it with a Cloudflare tunnel. The dashboard is **read-only** — it never
+trades — but it does show your balance, positions and PnL, so **password-protect
+it first**:
+
+1. Set a password in `.env`: `DASHBOARD_PASSWORD=something_strong` (username is `DASHBOARD_USER`, default `viewer`). Restart the bot.
+2. Install cloudflared if needed: `winget install --id Cloudflare.cloudflared`
+3. Run `tunnel.bat` (with the bot already running). It prints a `https://<random>.trycloudflare.com` URL — share that and the username/password.
+
+The quick-tunnel URL changes each run. For a **permanent URL with email-gated
+access**, create a named tunnel under your own Cloudflare account and put
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+in front of it (free for small teams) — then only specific emails can open it,
+and you can skip the password.
+
 ## Module map (for contributors)
 
 Each module has a header docstring stating its purpose, public interface, and

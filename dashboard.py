@@ -14,15 +14,17 @@ The `_read_*` helpers are the only DB-reading code here; each returns plain dict
 so the rendering stays trivial. All DB access is read-only (uri=…?mode=ro).
 """
 
+import hmac
 import json
 import logging
 import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
-from flask import Flask, jsonify
+from flask import Flask, Response, jsonify, request
 
 DB_PATH   = Path(__file__).parent / "bot.db"
 LOG_PATH  = Path(__file__).parent / "bot.log"
@@ -33,6 +35,28 @@ _state: dict = {}
 
 # Suppress Flask/Werkzeug request logs from polluting bot.log
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Optional HTTP Basic Auth — gate the dashboard when it's exposed publicly
+# (e.g. behind a Cloudflare tunnel). Set DASHBOARD_PASSWORD in .env to enable;
+# leave it blank for no auth (local use only).
+# ---------------------------------------------------------------------------
+
+@app.before_request
+def _require_auth():
+    password = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    if not password:
+        return  # auth disabled
+    user = os.getenv("DASHBOARD_USER", "viewer").strip()
+    auth = request.authorization
+    ok = (auth and auth.username == user
+          and hmac.compare_digest(auth.password or "", password))
+    if not ok:
+        return Response(
+            "Authentication required", 401,
+            {"WWW-Authenticate": 'Basic realm="Discord Signal Bot"'},
+        )
 
 
 # ---------------------------------------------------------------------------

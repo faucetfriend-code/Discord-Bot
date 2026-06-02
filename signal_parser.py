@@ -62,6 +62,7 @@ class Signal:
     tp: Optional[float] = None       # new signal TP
     new_sl: Optional[float] = None   # update: new stop loss value
     new_tp: Optional[float] = None   # update: new take profit value
+    new_avg_entry: Optional[float] = None  # update: DCA/averaging shifted the entry basis
     is_market_order: bool = False    # True when analyst says "at CMP" / no limit price
     source: str = ""                 # "" = analyst follow-trade; "rsi_extreme"; "oraclealgo"
     vision_tps: Optional[list] = None    # multiple TP targets read off a chart, if any
@@ -132,6 +133,20 @@ _CLOSE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# DCA / averaging analysts (e.g. Ajmal) post position-management updates:
+#   "New average entry: $1.9895"  → shifts the entry basis (PnL/SL/TP measured from here)
+#   "DCA1 filled at $1.914"        → a DCA add (we track the basis, not the size)
+#   "Limit Entry Reached", "Limit order should be filling", "New Entry Added"
+#                                  → pure info — acknowledge as a no-op, never "incomplete"
+_AVG_ENTRY = re.compile(
+    r'(?:new\s+)?(?:avg|average)\s+entry[:\s]*(?:is\s*)?\$?([\d,.]+)', re.IGNORECASE)
+_DCA_FILL = re.compile(r'\bdca\w*\s+filled\s+at\s*\$?([\d,.]+)', re.IGNORECASE)
+_POSITION_INFO = re.compile(
+    r'limit\s+entry\s+reached|limit\s+order\s+should\s+be\s+filling|'
+    r'entry\s+(?:reached|filled)|new\s+entry\s+added|\bdca\w*\s+filled',
+    re.IGNORECASE,
+)
+
 # Extract a number after SL/stop keywords in an update message
 _UPDATE_SL_EXTRACT = re.compile(
     r'(?:s\.?l\.?|stop(?:\s+loss)?)(?:\s+to|\s*=|:)?\s*\$?([\d,.]+)',
@@ -154,6 +169,10 @@ _SYMBOL_BLOCKLIST = frozenset({
     'BUYS', 'HITS', 'BACK', 'NEXT', 'LAST', 'MOVE', 'DOWN', 'PUSH', 'PAIR',
     'SIZE', 'RISK', 'BIAS', 'JUST', 'ONLY', 'SOME', 'ALSO', 'VERY', 'HERE',
     'TOOK', 'VERY', 'GOLD', 'FORE', 'INFO', 'DATA', 'NOTE', 'IDEA', 'GOOD',
+    # words seen in DCA / limit-fill / update messages
+    'LIMIT', 'REACHED', 'PRICE', 'CURRENT', 'FILLED', 'FILLING', 'ORDER',
+    'AVERAGE', 'AVG', 'DCA', 'CMP', 'REQUIRED', 'LATER', 'PROFIT', 'PROFITS',
+    'NOTES', 'HARD', 'LEVERAGE', 'TAKEN', 'ENTRIES', 'BEING', 'WHITE',
 })
 
 # Detects "at CMP", "market long/short", "longing X at CMP" — no limit entry price.
@@ -175,7 +194,7 @@ _CLOSE_UNDER_SL = re.compile(
 #   "Took this HYPE short, .5R size ... TP's in gold"
 #   "shorted SOL here", "longing ME at CMP"
 _ENTRY_VERB = re.compile(
-    r'\b(?:took|taking|shorted|longed|shorting|longing|entered|'
+    r'\b(?:took|taken|tak(?:e|ing)|shorted|longed|shorting|longing|entered|'
     r'grabbed|sniped|scal(?:e|ed|ing)\s+in)\b',
     re.IGNORECASE,
 )
@@ -251,8 +270,19 @@ def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
         return None
 
 
+_SYM_USDT = re.compile(r'\b([A-Z0-9]{2,10})[/-]USDT?\b')  # case-sensitive: real tickers are upper
+
+
 def _extract_symbol(text: str) -> str:
-    """Find the first plausible ticker symbol in text, skipping common noise words."""
+    """
+    Find the ticker symbol in a message. Prefers an explicit `SYMBOL/USDT` pairing
+    (how update/info messages name the coin, e.g. "TON/USDT LONG") — matched
+    case-sensitively so prose words aren't mistaken for tickers. Falls back to the
+    first uppercase-ish token that isn't a common English/trading word.
+    """
+    m = _SYM_USDT.search(text)
+    if m and m.group(1) not in _SYMBOL_BLOCKLIST:
+        return _normalise_symbol(m.group(1))
     for m in _SYMBOL_EXTRACT.finditer(text.upper()):
         candidate = m.group(1)
         if candidate not in _SYMBOL_BLOCKLIST:
@@ -393,6 +423,27 @@ def _try_update_regex(text: str, msg: dict) -> Optional[Signal]:
         message_type=MessageType.UPDATE,
         symbol=symbol, side="", new_sl=new_sl, new_tp=new_tp,
         analyst=msg.get("author", ""), raw_text=text,
+    )
+
+
+def _try_position_update(text: str, msg: dict) -> Optional[Signal]:
+    """
+    Position-management updates from DCA/averaging analysts:
+      • "New average entry: $X" → UPDATE that shifts the entry basis (new_avg_entry).
+      • "Limit Entry Reached" / "DCA filled" / "New Entry Added" (no avg given)
+        → recognised INFO; returned as an UPDATE with no numeric changes so it's
+        acknowledged cleanly instead of failing as an incomplete NEW signal.
+    Returns None if the text isn't one of these management messages.
+    """
+    avg = _AVG_ENTRY.search(text)
+    info = _POSITION_INFO.search(text)
+    if not avg and not info:
+        return None
+    return Signal(
+        message_type=MessageType.UPDATE,
+        symbol=_extract_symbol(text), side="",
+        analyst=msg.get("author", ""), raw_text=text,
+        new_avg_entry=_to_float(avg.group(1)) if avg else None,
     )
 
 
@@ -712,6 +763,12 @@ def parse(msg: dict) -> Optional[Signal]:
     sig = _try_update_regex(text, msg)
     if sig:
         log.debug(f"Regex UPDATE: {sig.symbol} new_sl={sig.new_sl} new_tp={sig.new_tp}")
+        return sig
+
+    # Stage 1a2 — DCA/averaging position-management updates (avg entry, limit-filled info)
+    sig = _try_position_update(text, msg)
+    if sig:
+        log.debug(f"Position update: {sig.symbol} new_avg_entry={sig.new_avg_entry}")
         return sig
 
     # Stage 1b — close fast-path
