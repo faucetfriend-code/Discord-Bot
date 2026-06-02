@@ -135,6 +135,21 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         log.info(f"[RSI] {signal.symbol} {signal.side.upper()} reversion — entry {signal.entry} "
                  f"SL {signal.sl} ({sl_pct*100:.0f}%) TP {signal.tp} (+{tp_pct*100:.0f}%)")
 
+    # OracleAlgo: fixed % stop + a scale-out TP ladder around the live entry.
+    if signal.source == "oraclealgo" and signal.entry is not None:
+        sl_pct = float(os.getenv("ORACLE_SL_PCT", "0.015"))
+        tp_pcts = [float(p) for p in os.getenv("ORACLE_TP_PCTS", "0.02,0.04").split(",") if p.strip()]
+        if signal.side == "buy":
+            signal.sl = round(signal.entry * (1 - sl_pct), 8)
+            tp_ladder = [round(signal.entry * (1 + p), 8) for p in tp_pcts]
+        else:
+            signal.sl = round(signal.entry * (1 + sl_pct), 8)
+            tp_ladder = [round(signal.entry * (1 - p), 8) for p in tp_pcts]
+        signal.tp = tp_ladder[-1]
+        log.info(f"[OracleAlgo] {signal.symbol} {signal.side.upper()} — entry {signal.entry} "
+                 f"SL {signal.sl} ({sl_pct*100:.1f}%) TP ladder {tp_ladder} "
+                 f"({'/'.join(f'{p*100:.0f}%' for p in tp_pcts)})")
+
     # Assign SL + the full TP ladder from chart levels by geometry now that the
     # entry (live price for market orders) is known. The vision model reads the
     # numbers reliably but mislabels roles, so derive them from the side:
@@ -490,6 +505,65 @@ def _is_whitelisted(msg: dict, whitelist_lower: set[str]) -> bool:
     return False
 
 
+_ORACLE_BIAS_KEY = "btc_oracle_bias"
+
+
+def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
+    """
+    OracleAlgo BTC state machine:
+      • 4H signal → set/refresh the BTC bias (bull/bear). On a bias FLIP, close
+        any open OracleAlgo position that now runs counter to it. No entry.
+      • 1H signal → enter ONLY if it agrees with the current 4H bias and there's
+        no BTC position open. SL/TP (1.5% stop + 2%/4% scale-out) set in _process_new.
+    """
+    content = msg.get("content", "")
+    if os.getenv("ORACLEALGO_ENABLED", "true").lower() != "true":
+        log.info(f"[OracleAlgo] {signal.side.upper()} {signal.symbol} {signal.signal_tf} — disabled, skipping")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_disabled")
+        return
+
+    want_bias = "bull" if signal.side == "buy" else "bear"
+
+    # --- 4H signal: set bias (and flatten an opposing position) ---
+    if signal.signal_tf == "4h":
+        prev = pt.get_state(_ORACLE_BIAS_KEY)
+        pt.set_state(_ORACLE_BIAS_KEY, want_bias)
+        if prev != want_bias:
+            log.info(f"[OracleAlgo] 4H bias flip {prev or 'none'} → {want_bias.upper()}")
+            existing = pt.find_open_by_symbol(signal.symbol)
+            if existing and existing.analyst == "OracleAlgo":
+                counter = (want_bias == "bull" and existing.side == "sell") or \
+                          (want_bias == "bear" and existing.side == "buy")
+                if counter:
+                    log.info(f"[OracleAlgo] bias flipped against open {existing.side} — closing")
+                    _process_close(signal, existing, dry_run)
+        else:
+            log.info(f"[OracleAlgo] 4H bias reaffirmed {want_bias.upper()}")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal,
+                               outcome=f"bias_{want_bias}")
+        return
+
+    # --- 1H signal: entry if aligned with bias ---
+    bias = pt.get_state(_ORACLE_BIAS_KEY)
+    if not bias:
+        log.info(f"[OracleAlgo] 1H {signal.side} but no 4H bias yet — waiting for a 4H signal")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_no_bias")
+        return
+    if bias != want_bias:
+        log.info(f"[OracleAlgo] 1H {signal.side} counter to {bias.upper()} bias — skipping")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_counter_bias")
+        return
+    if pt.find_open_by_symbol(signal.symbol):
+        log.info(f"[OracleAlgo] {signal.symbol} already open — skipping")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_already_open")
+        return
+
+    start, lo, hi, _step = _leverage_params()
+    leverage = pt.get_analyst_leverage("OracleAlgo", start, lo, hi)
+    log.info(f"[OracleAlgo] 1H {signal.side.upper()} aligned with {bias.upper()} bias — entering")
+    _process_new(signal, pt.get_open_positions(), dry_run, leverage, "OracleAlgo")
+
+
 def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
     whitelist_lower = {name.lower() for name in whitelist}
     signal = sp.parse(msg)
@@ -520,6 +594,12 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         start, lo, hi, _step = _leverage_params()
         leverage = pt.get_analyst_leverage("RSI Extreme", start, lo, hi)
         _process_new(signal, pt.get_open_positions(), dry_run, leverage, "RSI Extreme")
+        return
+
+    # OracleAlgo BTC strategy — 4H signals set the bias; 1H signals enter only
+    # when they agree with the current bias. Own gate + adaptive-leverage key.
+    if signal.source == "oraclealgo":
+        _process_oraclealgo(signal, msg, dry_run)
         return
 
     # Whitelist gate — log the signal but don't execute if analyst isn't whitelisted.

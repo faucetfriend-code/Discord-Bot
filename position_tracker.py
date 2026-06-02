@@ -68,8 +68,33 @@ def init_db():
             updated_at TEXT
         )
     """)
+    # Persisted strategy state (e.g. OracleAlgo's current BTC 4H bias).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_state (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        )
+    """)
     con.commit()
     con.close()
+
+
+def set_state(key: str, value: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT INTO strategy_state (k, v) VALUES (?, ?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (key, str(value)),
+    )
+    con.commit()
+    con.close()
+
+
+def get_state(key: str, default=None):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT v FROM strategy_state WHERE k=?", (key,)).fetchone()
+    con.close()
+    return row[0] if row else default
 
 
 def open_position(pos: Position) -> int:

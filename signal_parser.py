@@ -57,9 +57,10 @@ class Signal:
     new_sl: Optional[float] = None   # update: new stop loss value
     new_tp: Optional[float] = None   # update: new take profit value
     is_market_order: bool = False    # True when analyst says "at CMP" / no limit price
-    source: str = ""                 # "" = analyst follow-trade; "rsi_extreme" = RSI strategy
+    source: str = ""                 # "" = analyst follow-trade; "rsi_extreme"; "oraclealgo"
     vision_tps: Optional[list] = None    # multiple TP targets read off a chart, if any
     vision_levels: Optional[list] = None # ALL price levels read off a chart (roles assigned by geometry)
+    signal_tf: str = ""              # OracleAlgo signal timeframe: "4h" (bias) or "1h" (entry)
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +191,23 @@ _RSI_EXTREME = re.compile(
     re.IGNORECASE,
 )
 
+# OracleAlgo BTC structure/momentum alerts (MSS / BOS / Supertrend / Delta), e.g.:
+#   "Bearish 1H MSS  BTCUSDT 1H bearish market structure shift confirmed
+#    LTF Bias: Shorts > Longs ... Timeframe 1H  Price 73602.17  Signal Bearish MSS"
+# Direction from the "Signal" field (or LTF Bias); timeframe = bias (4H) vs entry (1H).
+_ORACLE_HINT = re.compile(r'LTF\s*Bias', re.IGNORECASE)
+_ORACLE_DIR_SIGNAL = re.compile(r'Signal\s*(Bullish|Bearish)', re.IGNORECASE)
+_ORACLE_DIR_BIAS = re.compile(
+    r'LTF\s*Bias[:\s]*(Longs|Shorts)\s*>\s*(Longs|Shorts)', re.IGNORECASE)
+_ORACLE_TICKER = re.compile(r'Ticker[:\s]*([A-Z]{2,10})USDT', re.IGNORECASE)
+_ORACLE_TF = re.compile(r'Timeframe[:\s]*([0-9]{1,3}H?)', re.IGNORECASE)
+
 # Pre-filter: if NONE of these appear in a message it cannot be a trade signal.
 # Avoids sending pure chatter / memes / announcements through the LLM.
 _TRADE_HINT = re.compile(
     r'\b(?:long(?:ed|ing)?|short(?:ed|ing)?|buy|sell|entry|cmp|sl|tp|stop|target|'
     r'lev(?:erage)?|usdt|futures|perp|trade|signal|alert|close|exit|scalp|swing|'
-    r'position|took|grabbed|sniped)\b',
+    r'position|took|grabbed|sniped|bullish|bearish|bias)\b',
     re.IGNORECASE,
 )
 
@@ -271,6 +283,63 @@ def _try_directional_market(text: str, msg: dict) -> Optional[Signal]:
         raw_text=text,
         entry=None,                 # entered at market — entry fetched live
         is_market_order=True,
+    )
+
+
+def _oracle_timeframe(raw: str) -> str:
+    """Map an OracleAlgo timeframe token ("1H", "4H", "240") to "1h" / "4h"."""
+    v = raw.upper().strip()
+    try:
+        if v.endswith("H"):
+            hours = int(v[:-1])
+        else:
+            mins = int(v)
+            hours = mins // 60 if mins >= 60 else mins
+    except ValueError:
+        return "1h"
+    return "4h" if hours >= 4 else "1h"
+
+
+def _try_oraclealgo(text: str, msg: dict) -> Optional[Signal]:
+    """
+    Detect an OracleAlgo BTC structure/momentum alert. Returns a market-order
+    NEW signal tagged source="oraclealgo" with signal_tf "4h" (bias) or "1h"
+    (entry). The 4H/1H state machine + SL/TP are applied in bot.py.
+    """
+    if not _ORACLE_HINT.search(text):
+        return None
+
+    side = None
+    m = _ORACLE_DIR_SIGNAL.search(text)
+    if m:
+        side = "buy" if m.group(1).lower() == "bullish" else "sell"
+    if side is None:
+        m = _ORACLE_DIR_BIAS.search(text)
+        if m:  # "Longs > Shorts" = bullish; "Shorts > Longs" = bearish
+            side = "buy" if m.group(1).lower() == "longs" else "sell"
+    if side is None:
+        return None
+
+    sym = "BTC-USDT"
+    mt = _ORACLE_TICKER.search(text)
+    if mt:
+        sym = _normalise_symbol(mt.group(1))
+
+    tf = "1h"
+    mtf = _ORACLE_TF.search(text)
+    if mtf:
+        tf = _oracle_timeframe(mtf.group(1))
+
+    return Signal(
+        message_type=MessageType.NEW,
+        symbol=sym,
+        side=side,
+        analyst=msg.get("author", ""),
+        raw_text=text,
+        entry=None,                 # market entry — live price
+        is_market_order=True,
+        source="oraclealgo",
+        signal_tf=tf,
     )
 
 
@@ -622,6 +691,12 @@ def parse(msg: dict) -> Optional[Signal]:
     sig = _try_rsi_extreme(text, msg)
     if sig:
         log.debug(f"RSI Extreme: {sig.side} {sig.symbol} (market)")
+        return sig
+
+    # Stage 0b — OracleAlgo BTC structure/momentum alerts (MSS/BOS/Supertrend/Delta).
+    sig = _try_oraclealgo(text, msg)
+    if sig:
+        log.debug(f"OracleAlgo: {sig.side} {sig.symbol} tf={sig.signal_tf}")
         return sig
 
     # Stage 1a — update fast-path
