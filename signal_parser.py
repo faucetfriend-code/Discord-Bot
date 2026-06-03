@@ -173,6 +173,8 @@ _SYMBOL_BLOCKLIST = frozenset({
     'LIMIT', 'REACHED', 'PRICE', 'CURRENT', 'FILLED', 'FILLING', 'ORDER',
     'AVERAGE', 'AVG', 'DCA', 'CMP', 'REQUIRED', 'LATER', 'PROFIT', 'PROFITS',
     'NOTES', 'HARD', 'LEVERAGE', 'TAKEN', 'ENTRIES', 'BEING', 'WHITE',
+    # quote currencies — never the traded symbol itself (e.g. "H/USDT" -> "USDT")
+    'USDT', 'USDC', 'USD',
 })
 
 # Detects "at CMP", "market long/short", "longing X at CMP" — no limit entry price.
@@ -238,9 +240,10 @@ _TRADE_HINT = re.compile(
 
 
 def _normalise_symbol(raw: str) -> str:
-    """Normalise a ticker to BloFin's `BASE-USDT` form (e.g. 'btc/usdt' → 'BTC-USDT')."""
+    """Normalise a ticker to BloFin's `BASE-USDT` form (e.g. 'btc/usdt' → 'BTC-USDT').
+    Returns 'UNKNOWN-USDT' if nothing's left after stripping the quote (e.g. 'USDT')."""
     raw = raw.upper().replace("/", "-").replace("USDT", "").rstrip("-")
-    return f"{raw}-USDT"
+    return f"{raw}-USDT" if raw else "UNKNOWN-USDT"
 
 
 def _to_float(s: str) -> float:

@@ -54,9 +54,14 @@ class PriceStream:
     # Public API
     # ------------------------------------------------------------------
 
+    # recv timeout = idle keepalive interval. BloFin drops idle connections after
+    # ~30s, so we must ping WELL inside that window — pinging at 30s flaps the
+    # connection every ~35s. 15s gives a safe 2x margin.
+    _RECV_TIMEOUT = 15
+
     def start(self):
         """Open the WebSocket and start the background receive thread."""
-        self._ws = websocket.create_connection(self._ws_url, timeout=30)
+        self._ws = websocket.create_connection(self._ws_url, timeout=self._RECV_TIMEOUT)
         self._thread = threading.Thread(target=self._recv_loop, daemon=True, name="price-stream")
         self._thread.start()
         log.info(f"Price stream connected: {self._ws_url}")
@@ -132,9 +137,10 @@ class PriceStream:
                 except Exception:
                     pass
                 continue
-            except websocket.WebSocketConnectionClosedException:
+            except (websocket.WebSocketConnectionClosedException,
+                    ConnectionResetError, ConnectionAbortedError, OSError) as e:
                 if not self._stopped:
-                    log.warning("Price stream closed — reconnecting")
+                    log.warning(f"Price stream closed ({e}) — reconnecting")
                     self._reconnect()
                 return
             except Exception as e:
@@ -148,7 +154,7 @@ class PriceStream:
             wait = 5 * attempt
             time.sleep(wait)
             try:
-                self._ws = websocket.create_connection(self._ws_url, timeout=30)
+                self._ws = websocket.create_connection(self._ws_url, timeout=self._RECV_TIMEOUT)
                 resubscribe = list(self._subscribed)
                 self._subscribed.clear()
                 self.ensure(resubscribe)

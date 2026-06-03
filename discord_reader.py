@@ -584,9 +584,13 @@ class NotificationListener:
                 except Exception:
                     pass
                 continue
-            except websocket.WebSocketConnectionClosedException:
+            except (websocket.WebSocketConnectionClosedException,
+                    ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                # The socket is gone (Chrome closed the tab, network reset, WinError
+                # 10054, etc.). recv() would keep raising forever — so RECONNECT,
+                # don't just sleep-and-retry on a dead socket.
                 if not self._stopped:
-                    log.warning("CDP listener WebSocket closed — attempting reconnect")
+                    log.warning(f"CDP listener connection lost ({e}) — reconnecting")
                     self._reconnect()
                 return
             except Exception as e:
