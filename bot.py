@@ -42,6 +42,19 @@ def _get_whitelist() -> list[str]:
     return [name.strip() for name in raw.split(",") if name.strip()]
 
 
+def _hedge_mode() -> bool:
+    """HEDGE_MODE allows each source to hold its own position per symbol (and
+    opposing long/short positions to coexist). When off, it's one position per
+    symbol globally — a second source's signal on an open symbol is skipped."""
+    return os.getenv("HEDGE_MODE", "false").lower() == "true"
+
+
+def _find_existing(symbol: str, source_key: str):
+    """The open position that would block/own a new signal: in hedge mode only the
+    SAME source counts; otherwise any open position on the symbol does."""
+    return pt.find_open_by_symbol(symbol, source_key if _hedge_mode() else None)
+
+
 def _leverage_params() -> tuple[int, int, int, int]:
     """Return (start, lo, hi, step) for the adaptive per-analyst leverage system."""
     start = int(os.getenv("LEVERAGE_START", "75"))
@@ -212,7 +225,7 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     log.info(f"[{analyst}] NEW {order_label} {signal.side.upper()} {signal.symbol} "
              f"entry={signal.entry} sl={signal.sl} tp={signal.tp}")
 
-    ok, reason = rm.validate(signal, open_positions)
+    ok, reason = rm.validate(signal, open_positions, hedge_mode=_hedge_mode())
     if not ok:
         log.warning(f"Signal rejected: {reason}")
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
@@ -602,8 +615,8 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         pt.set_state(_ORACLE_BIAS_KEY, want_bias)
         if prev != want_bias:
             log.info(f"[OracleAlgo] 4H bias flip {prev or 'none'} → {want_bias.upper()}")
-            existing = pt.find_open_by_symbol(signal.symbol)
-            if existing and existing.analyst == "OracleAlgo":
+            existing = pt.find_open_by_symbol(signal.symbol, "OracleAlgo")
+            if existing:
                 counter = (want_bias == "bull" and existing.side == "sell") or \
                           (want_bias == "bear" and existing.side == "buy")
                 if counter:
@@ -625,7 +638,7 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         log.info(f"[OracleAlgo] 1H {signal.side} counter to {bias.upper()} bias — skipping")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_counter_bias")
         return
-    if pt.find_open_by_symbol(signal.symbol):
+    if _find_existing(signal.symbol, "OracleAlgo"):
         log.info(f"[OracleAlgo] {signal.symbol} already open — skipping")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_already_open")
         return
@@ -662,7 +675,7 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
                                    outcome="rsi_disabled")
             return
-        existing = pt.find_open_by_symbol(signal.symbol)
+        existing = _find_existing(signal.symbol, "RSI Extreme")
         if existing:
             log.info(f"[RSI] {signal.symbol} already open — skipping duplicate RSI entry")
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
@@ -686,20 +699,21 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
                                outcome="not_whitelisted")
         return
 
+    # Per-source position: in hedge mode this analyst's own position; otherwise any.
+    analyst_key = _canonical_analyst(msg, whitelist)
+    existing = _find_existing(signal.symbol, analyst_key)
+
     if signal.message_type == MessageType.NEW:
         open_positions = pt.get_open_positions()
-        existing = pt.find_open_by_symbol(signal.symbol)
         if existing:
-            log.info(f"{signal.symbol} already open — routing NEW as UPDATE (safety net)")
+            log.info(f"{signal.symbol} already open for {analyst_key} — routing NEW as UPDATE (safety net)")
             _process_update(signal, existing, dry_run)
         else:
             start, lo, hi, _step = _leverage_params()
-            analyst_key = _canonical_analyst(msg, whitelist)
             leverage = pt.get_analyst_leverage(analyst_key, start, lo, hi)
             _process_new(signal, open_positions, dry_run, leverage, analyst_key)
 
     elif signal.message_type == MessageType.UPDATE:
-        existing = pt.find_open_by_symbol(signal.symbol)
         if existing:
             _process_update(signal, existing, dry_run)
         else:
@@ -708,7 +722,6 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
                                    outcome="update_no_position")
 
     elif signal.message_type == MessageType.CLOSE:
-        existing = pt.find_open_by_symbol(signal.symbol)
         if existing:
             _process_close(signal, existing, dry_run)
         else:

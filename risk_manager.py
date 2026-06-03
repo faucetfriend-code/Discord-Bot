@@ -20,8 +20,14 @@ _MAX_RISK_REWARD = 20.0  # reject signals with RR > 20x (likely bad parse)
 _MIN_RISK_REWARD = 1.0   # reject signals with RR < 1x
 
 
-def validate(signal: Signal, open_positions: list[Position]) -> tuple[bool, str]:
-    """Returns (ok, reason). reason is empty string when ok=True."""
+def validate(signal: Signal, open_positions: list[Position],
+             hedge_mode: bool = False) -> tuple[bool, str]:
+    """
+    Returns (ok, reason); reason is empty when ok=True.
+    Price/RR sanity always applies. In hedge mode the global one-position-per-symbol
+    and MAX_OPEN_POSITIONS caps are relaxed (each source manages its own position),
+    so testing every strategy doesn't skip signals.
+    """
     side = signal.side
 
     # Price level sanity
@@ -47,14 +53,15 @@ def validate(signal: Signal, open_positions: list[Position]) -> tuple[bool, str]
     if rr > _MAX_RISK_REWARD:
         return False, f"RR {rr:.2f} implausibly high — likely parse error"
 
-    # Exposure limits
-    max_pos = int(os.getenv("MAX_OPEN_POSITIONS", 3))
-    if len(open_positions) >= max_pos:
-        return False, f"Max open positions ({max_pos}) reached"
+    # Exposure limits — relaxed in hedge mode (per-source dedup handles duplicates).
+    if not hedge_mode:
+        max_pos = int(os.getenv("MAX_OPEN_POSITIONS", 3))
+        if len(open_positions) >= max_pos:
+            return False, f"Max open positions ({max_pos}) reached"
 
-    open_symbols = {p.symbol.upper() for p in open_positions}
-    if signal.symbol.upper() in open_symbols:
-        return False, f"Already have an open position in {signal.symbol}"
+        open_symbols = {p.symbol.upper() for p in open_positions}
+        if signal.symbol.upper() in open_symbols:
+            return False, f"Already have an open position in {signal.symbol}"
 
     return True, ""
 

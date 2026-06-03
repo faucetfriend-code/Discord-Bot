@@ -278,10 +278,12 @@ def update_position_sl_tp(order_id: str,
     con.close()
 
 
-def find_open_by_symbol(symbol: str) -> Optional["Position"]:
-    """Return the first open position matching the symbol, or None."""
+def find_open_by_symbol(symbol: str, analyst: Optional[str] = None) -> Optional["Position"]:
+    """Return the first open position for `symbol`, or None. If `analyst` is given,
+    only a position from that source/analyst matches (used by hedge mode so each
+    source manages its own position on a symbol independently)."""
     for pos in get_open_positions():
-        if pos.symbol == symbol:
+        if pos.symbol == symbol and (analyst is None or pos.analyst == analyst):
             return pos
     return None
 
