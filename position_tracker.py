@@ -121,6 +121,22 @@ def init_db():
             v TEXT
         )
     """)
+    # POI watchlist: an analyst flags a future area of interest. We monitor price
+    # to the level, "arm" when it's reached, then take the analyst's confirming
+    # entry. status: watching → armed → triggered/expired.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS watches (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol     TEXT,
+            analyst    TEXT,
+            direction  TEXT,
+            level      REAL,
+            status     TEXT DEFAULT 'watching',
+            note       TEXT,
+            created_at TEXT,
+            armed_at   TEXT
+        )
+    """)
     con.commit()
     con.close()
 
@@ -376,3 +392,65 @@ def get_all_analyst_stats() -> list[dict]:
          "realized_pnl": r[4], "updated_at": r[5]}
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# POI watchlist
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Watch:
+    symbol: str
+    analyst: str
+    direction: str       # "buy" / "sell" / "" (lean)
+    level: float         # POI trigger price (0 = unknown / chart not read)
+    status: str = "watching"
+    note: str = ""
+    created_at: str = ""
+    armed_at: str = ""
+    id: Optional[int] = None
+
+
+def add_watch(w: Watch) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "INSERT INTO watches (symbol, analyst, direction, level, status, note, created_at) "
+        "VALUES (?, ?, ?, ?, 'watching', ?, ?)",
+        (w.symbol, w.analyst, w.direction, w.level, w.note, now_local().isoformat()),
+    )
+    row_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return row_id
+
+
+def get_active_watches() -> list[Watch]:
+    """Watches still in play (watching or armed)."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT id, symbol, analyst, direction, level, status, note, created_at, armed_at "
+        "FROM watches WHERE status IN ('watching','armed') ORDER BY id DESC"
+    ).fetchall()
+    con.close()
+    return [Watch(id=r[0], symbol=r[1], analyst=r[2], direction=r[3], level=r[4],
+                  status=r[5], note=r[6] or "", created_at=r[7] or "", armed_at=r[8] or "")
+            for r in rows]
+
+
+def set_watch_status(watch_id: int, status: str):
+    con = sqlite3.connect(DB_PATH)
+    armed = now_local().isoformat() if status == "armed" else None
+    if armed:
+        con.execute("UPDATE watches SET status=?, armed_at=? WHERE id=?", (status, armed, watch_id))
+    else:
+        con.execute("UPDATE watches SET status=? WHERE id=?", (status, watch_id))
+    con.commit()
+    con.close()
+
+
+def find_armed_watch(symbol: str, analyst: str) -> Optional[Watch]:
+    """An armed watch for this symbol+analyst whose entry can now be taken."""
+    for w in get_active_watches():
+        if w.status == "armed" and w.symbol == symbol and w.analyst == analyst:
+            return w
+    return None

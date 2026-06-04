@@ -239,6 +239,45 @@ _TRADE_HINT = re.compile(
 )
 
 
+# POI / "future area of interest" detection — an analyst flags a level to watch
+# but hasn't entered yet. Future-intent phrasing (not "I took the long").
+_POI_HINT = re.compile(
+    r'point[s]?\s+of\s+interest|\bpoi[s]?\b|area[s]?\s+of\s+interest|'
+    r'looking\s+to\s+(?:enter|long|short|buy|sell|get\s+in|very\s+soon|take)|'
+    r'haven.?t\s+(?:entered|taken)|\beyeing\b|keep\s+(?:a\s+)?(?:close\s+)?eye|'
+    r'htf\s+zone|watching\s+(?:for|this|these|it)|close\s+eye',
+    re.IGNORECASE,
+)
+_POI_BULL = re.compile(
+    r'\b(?:bounce|long|buy|support|reclaim|accumulat|demand|dip|bullish|bid)\b', re.IGNORECASE)
+_POI_BEAR = re.compile(
+    r'\b(?:short|reject|resistance|sell|supply|breakdown|bearish)\b', re.IGNORECASE)
+
+
+def detect_poi(msg: dict) -> Optional[dict]:
+    """
+    Detect a 'future area of interest' / POI watch message (analyst is eyeing a
+    level but hasn't entered). Returns {symbol, direction, note} or None.
+
+    Direction is a lean from bull/bear vocabulary ('' if ambiguous). The trigger
+    LEVEL is resolved separately in bot.py (vision off the attached chart, since
+    these zones usually live on a chart, not in the text). Called only when the
+    message isn't already a tradeable signal, so real entries take precedence.
+    """
+    text = msg.get("content", "")
+    if not _POI_HINT.search(text):
+        return None
+    # Skip if it reads like an entry already taken (that's a trade, not a watch).
+    if _ENTRY_VERB.search(text) and (_TICKER_DIR.search(text) or _DIR_TICKER.search(text)):
+        return None
+    symbol = _extract_symbol(text)
+    if symbol == "UNKNOWN-USDT":
+        return None
+    bull, bear = bool(_POI_BULL.search(text)), bool(_POI_BEAR.search(text))
+    direction = "buy" if (bull and not bear) else "sell" if (bear and not bull) else ""
+    return {"symbol": symbol, "direction": direction, "note": text[:200]}
+
+
 def _normalise_symbol(raw: str) -> str:
     """Normalise a ticker to BloFin's `BASE-USDT` form (e.g. 'btc/usdt' → 'BTC-USDT').
     Returns 'UNKNOWN-USDT' if nothing's left after stripping the quote (e.g. 'USDT')."""
@@ -539,13 +578,49 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
         return None
 
 
-def _vision_parse(image_url: str) -> dict:
+_VISION_PROMPTS = {
+    # Trade setup: the colored entry/SL/TP price tags on the right axis.
+    "trade": (
+        "This is a TradingView trade-setup chart. Read the EXACT price "
+        "numbers from the COLORED PRICE TAGS on the right-hand price axis "
+        "(not the grey axis gridline numbers, and not the candles).\n"
+        "The tags are colour-coded:\n"
+        "- A RED tag is the STOP LOSS (sl).\n"
+        "- The highlighted current-price tag (often boxed and showing a "
+        "time like 12:33:10) is the ENTRY / CMP (entry).\n"
+        "- ORANGE/yellow tags are TAKE-PROFIT targets (tps). There are "
+        "usually several — list ALL of them.\n"
+        "Read each number digit-for-digit from its tag (e.g. 71.594, "
+        "67.761, 64.931, 59.412, 45.773).\n"
+        "Output ONLY this JSON, numbers only, no labels:\n"
+        '{"entry": 0.0, "sl": 0.0, "tps": [0.0, 0.0, 0.0]}\n'
+        "Use null for entry/sl if you cannot read them, and [] for tps "
+        "if there are none."
+    ),
+    # POI: the marked level/zone the trader is watching (no entry/SL/TP needed).
+    "poi": (
+        "This chart marks one or more price LEVELS or ZONES the trader is watching "
+        "as a future area of interest — drawn as a horizontal line, a shaded "
+        "box/zone, or a labeled level (support, resistance, POC, liquidity, order "
+        "block). Read the EXACT price of each marked level, digit-for-digit, from "
+        "its price tag on the right-hand axis or its on-chart label. Ignore the "
+        "grey axis gridline numbers and the candles.\n"
+        "Output ONLY this JSON, numbers only, most prominent level first:\n"
+        '{"levels": [0.0, 0.0]}\n'
+        "Use [] if there are no marked levels."
+    ),
+}
+
+
+def _vision_parse(image_url: str, task: str = "trade") -> dict:
     """
-    Download a chart screenshot from Discord and read its price levels with the
-    vision LLM. Returns {"entry", "sl", "tps":[...], "levels":[...]} where
-    "levels" is every distinct price number read off the chart; roles (entry/
-    SL/TP) are assigned later by geometry in the bot, since the model reliably
-    reads the NUMBERS but often mislabels which is entry vs SL.
+    Download a chart screenshot from Discord (FULL-resolution via the cdn host —
+    thumbnails are unreadable) and read its price levels with the vision LLM.
+
+    task="trade" → returns {"entry","sl","tps":[...],"levels":[...]} for a setup.
+    task="poi"   → returns {"levels":[...]} for a marked area-of-interest zone.
+    "levels" is every distinct price number read; roles are assigned by geometry
+    in the bot (the model reads NUMBERS reliably but mislabels entry vs SL).
 
     Returns {} if LOCAL_VISION_MODEL is not configured or on any error.
     """
@@ -603,23 +678,7 @@ def _vision_parse(image_url: str) -> dict:
                         },
                         {
                             "type": "text",
-                            "text": (
-                                "This is a TradingView trade-setup chart. Read the EXACT price "
-                                "numbers from the COLORED PRICE TAGS on the right-hand price axis "
-                                "(not the grey axis gridline numbers, and not the candles).\n"
-                                "The tags are colour-coded:\n"
-                                "- A RED tag is the STOP LOSS (sl).\n"
-                                "- The highlighted current-price tag (often boxed and showing a "
-                                "time like 12:33:10) is the ENTRY / CMP (entry).\n"
-                                "- ORANGE/yellow tags are TAKE-PROFIT targets (tps). There are "
-                                "usually several — list ALL of them.\n"
-                                "Read each number digit-for-digit from its tag (e.g. 71.594, "
-                                "67.761, 64.931, 59.412, 45.773).\n"
-                                "Output ONLY this JSON, numbers only, no labels:\n"
-                                '{"entry": 0.0, "sl": 0.0, "tps": [0.0, 0.0, 0.0]}\n'
-                                "Use null for entry/sl if you cannot read them, and [] for tps "
-                                "if there are none."
-                            ),
+                            "text": _VISION_PROMPTS.get(task, _VISION_PROMPTS["trade"]),
                         },
                     ],
                 },

@@ -17,6 +17,7 @@ import os
 import queue as _queue
 import re
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -119,6 +120,9 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     """Validate and place a new order (limit or market)."""
     analyst = signal.analyst
     analyst_key = analyst_key or analyst or "unknown"
+
+    # If this analyst flagged a POI that's now armed, use it to fill a vague entry.
+    _apply_armed_watch(signal, analyst_key)
 
     # For market/CMP orders: fetch live price so we can size and auto-TP correctly.
     if signal.is_market_order and signal.entry is None:
@@ -553,6 +557,94 @@ def _live_close_remaining(pos: pt.Position):
 
 
 # ---------------------------------------------------------------------------
+# POI watchlist — "future area of interest": flag → monitor → arm → take entry
+# ---------------------------------------------------------------------------
+
+def _poi_level_from_chart(msg: dict, symbol: str) -> float:
+    """Read a POI trigger level off the attached chart via vision: the read level
+    NEAREST the current price (the zone price is approaching). 0.0 if unreadable."""
+    image_url = msg.get("image_url", "") or ""
+    if not image_url:
+        return 0.0
+    vision = sp._vision_parse(image_url, task="poi")
+    levels = vision.get("levels") or []
+    if not levels:
+        return 0.0
+    price = bf.get_market_price(symbol)
+    if not price:
+        return float(levels[0])
+    return float(min(levels, key=lambda l: abs(l - price)))
+
+
+def _try_create_watch(msg: dict, whitelist: list[str], whitelist_lower: set[str]) -> bool:
+    """If this non-trade message is a POI 'area of interest' from a whitelisted
+    analyst on a TRADEABLE symbol, create a watch. Returns True if one was made."""
+    if os.getenv("POI_ENABLED", "true").lower() != "true":
+        return False
+    if not _is_whitelisted(msg, whitelist_lower):
+        return False
+    poi = sp.detect_poi(msg)
+    if not poi:
+        return False
+    symbol = poi["symbol"]
+    if bf.get_contract_specs(symbol) is None:
+        return False  # mis-extracted word or unlisted — let it fall through to no_signal
+    analyst_key = _canonical_analyst(msg, whitelist)
+    for w in pt.get_active_watches():            # one active watch per symbol+analyst
+        if w.symbol == symbol and w.analyst == analyst_key:
+            return False
+    level = _poi_level_from_chart(msg, symbol)
+    pt.add_watch(pt.Watch(symbol=symbol, analyst=analyst_key,
+                          direction=poi["direction"], level=level, note=poi["note"]))
+    log.info(f"[{analyst_key}] POI watch created: {symbol} "
+             f"{poi['direction'] or 'lean?'} level={level or 'chart/none'}")
+    _logger_mod.log_signal(msg.get("author", ""), msg.get("content", ""),
+                           outcome=f"poi_watch {symbol} @{level or '—'}")
+    return True
+
+
+def _check_watches():
+    """Each sweep: arm a watch when price reaches its level (alert), expire stale ones."""
+    tol = float(os.getenv("POI_TOLERANCE_PCT", "0.005"))
+    expiry_h = float(os.getenv("WATCH_EXPIRY_HOURS", "72"))
+    for w in pt.get_active_watches():
+        try:
+            age_h = (now_local() - datetime.fromisoformat(w.created_at)).total_seconds() / 3600
+        except Exception:
+            age_h = 0
+        if age_h > expiry_h:
+            pt.set_watch_status(w.id, "expired")
+            log.info(f"[{w.analyst}] POI watch on {w.symbol} expired (>{expiry_h:.0f}h)")
+            continue
+        if w.status != "watching" or not w.level:
+            continue
+        price = bf.get_market_price(w.symbol)
+        if price is None:
+            continue
+        if abs(price - w.level) / w.level <= tol:
+            pt.set_watch_status(w.id, "armed")
+            log.info(f"[{w.analyst}] POI ARMED: {w.symbol} reached {w.level} (now {price}) — "
+                     f"waiting for the entry confirmation")
+            _alert(f"{w.analyst}'s {w.symbol} POI hit {w.level} — armed for their entry",
+                   "info", key=f"poi_armed_{w.id}")
+
+
+def _apply_armed_watch(signal: sp.Signal, analyst_key: str):
+    """If this analyst has an armed POI watch on the symbol, use it to fill a vague
+    entry (direction / entry level) and mark the watch triggered."""
+    w = pt.find_armed_watch(signal.symbol, analyst_key)
+    if not w:
+        return
+    if not signal.side and w.direction:
+        signal.side = w.direction
+    if signal.entry is None and w.level:
+        signal.entry = w.level
+    log.info(f"[{analyst_key}] {signal.symbol} entry confirms armed POI watch "
+             f"(dir={signal.side or w.direction}, level={w.level}) — taking it")
+    pt.set_watch_status(w.id, "triggered")
+
+
+# ---------------------------------------------------------------------------
 # Message router
 # ---------------------------------------------------------------------------
 
@@ -660,6 +752,9 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
     analyst = msg.get("author", "unknown")
 
     if signal is None:
+        # Not a tradeable signal — see if it's a POI "future area of interest" watch.
+        if _try_create_watch(msg, whitelist, whitelist_lower):
+            return
         log.debug(f"[{analyst}] No trade signal detected")
         _logger_mod.log_signal(analyst, msg.get("content", ""), outcome="no_signal")
         return
@@ -964,11 +1059,14 @@ def main():
                        "warning", key="listener_down")
                 time.sleep(resolve_interval)
 
-            # Fast cadence: mark-to-market PnL + TP/SL/scale-out off cached prices.
+            # Fast cadence: mark-to-market PnL + TP/SL/scale-out off cached prices,
+            # plus arm any POI watch whose level price has reached.
             if time.time() - last_resolve >= resolve_interval:
                 if price_stream:
-                    price_stream.ensure([p.symbol for p in pt.get_open_positions()])
+                    watched = [w.symbol for w in pt.get_active_watches()]
+                    price_stream.ensure([p.symbol for p in pt.get_open_positions()] + watched)
                 _resolve_open_positions(dry_run)
+                _check_watches()
                 last_resolve = time.time()
 
             # Periodic sweep: re-inject observer + full inbox scan.

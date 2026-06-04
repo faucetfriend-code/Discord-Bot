@@ -99,6 +99,22 @@ def _read_positions() -> list[dict]:
         return []
 
 
+def _read_watches() -> list[dict]:
+    """Active POI watches (areas of interest being monitored / armed)."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT symbol, analyst, direction, level, status, note, created_at "
+            "FROM watches WHERE status IN ('watching','armed') ORDER BY id DESC"
+        ).fetchall()
+        con.close()
+        return [{"symbol": r[0], "analyst": r[1], "direction": r[2], "level": r[3],
+                 "status": r[4], "note": (r[5] or "")[:80], "created_at": r[6]}
+                for r in rows]
+    except Exception:
+        return []
+
+
 def _read_strategy_state() -> dict:
     """Return the persisted strategy key→value store (e.g. the OracleAlgo BTC bias)."""
     try:
@@ -225,6 +241,7 @@ def index():
     signals  = _read_signals(40)
     analysts = _read_analyst_stats()
     roster   = _read_roster()
+    watches  = _read_watches()
     state    = _read_strategy_state()
     log_tail = _read_log_tail()
 
@@ -298,6 +315,25 @@ def index():
               <td>{p['last_price'] or '—'}</td>
               <td>{_pnl_html(p['unrealized_pnl'])}</td>
               <td class="small">{prog}</td>
+            </tr>"""
+        return html
+
+    def watch_rows():
+        if not watches:
+            return '<tr><td colspan="5" class="empty">No active areas of interest</td></tr>'
+        html = ""
+        for w in watches:
+            dir_cls = "buy" if w["direction"] == "buy" else "sell" if w["direction"] == "sell" else "small"
+            dir_txt = (w["direction"] or "?").upper()
+            armed = w["status"] == "armed"
+            status = ('<span class="buy">● ARMED</span>' if armed
+                      else '<span class="small">watching</span>')
+            html += f"""<tr>
+              <td><b>{w['symbol']}</b><div class="small">{w['analyst']}</div></td>
+              <td class="{dir_cls}">{dir_txt}</td>
+              <td>{w['level'] or '<span class="small">chart</span>'}</td>
+              <td>{status}</td>
+              <td class="small mono">{w['note']}</td>
             </tr>"""
         return html
 
@@ -436,6 +472,14 @@ def index():
       <table>
         <thead><tr><th>Symbol / Strategy</th><th>Side</th><th>Entry</th><th>SL</th><th>TPs</th><th>Size</th><th>Last</th><th>Unreal. PnL</th><th>Progress</th></tr></thead>
         <tbody>{pos_rows()}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Areas of Interest — Watchlist ({len(watches)})</div>
+      <table>
+        <thead><tr><th>Symbol / Analyst</th><th>Lean</th><th>Level</th><th>Status</th><th>Note</th></tr></thead>
+        <tbody>{watch_rows()}</tbody>
       </table>
     </div>
 
