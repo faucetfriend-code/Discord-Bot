@@ -15,3 +15,5 @@ signals_log.csv
 /chrome-cdp-profile/
 C:/chrome-cdp-profile/
 tunnel.bat
+.tunnel.bat.un~
+tunnel.bat~

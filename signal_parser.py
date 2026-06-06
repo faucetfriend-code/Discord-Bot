@@ -68,6 +68,10 @@ class Signal:
     vision_tps: Optional[list] = None    # multiple TP targets read off a chart, if any
     vision_levels: Optional[list] = None # ALL price levels read off a chart (roles assigned by geometry)
     signal_tf: str = ""              # OracleAlgo signal timeframe: "4h" (bias) or "1h" (entry)
+    rsi_value: Optional[float] = None      # RSI Extreme: the RSI reading from the alert (e.g. 90.3)
+    change_24h: Optional[float] = None     # RSI Extreme: 24h % change from the alert (e.g. +14.84)
+    oracle_signal_type: str = ""           # OracleAlgo: alert type token (MSS / BOS / Supertrend / Delta)
+    soft_stop: bool = False                # SL only triggers on a candle CLOSE beyond it, not a wick
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +221,11 @@ _RSI_EXTREME = re.compile(
     r'(?P<sym>[A-Z0-9]{2,12})/USDT',
     re.IGNORECASE,
 )
+# The RSI reading and 24h change ride along in the same alert. Captured
+# separately (the symbol/RSI/price text runs together with no delimiters) so the
+# strategy can filter on extremity + momentum instead of discarding the numbers.
+_RSI_VALUE = re.compile(r'RSI\s*(?P<rsi>[0-9]{1,3}(?:\.[0-9]+)?)', re.IGNORECASE)
+_RSI_CHANGE = re.compile(r'24h\s*Change\s*(?P<chg>[+\-]?[0-9.]+)\s*%', re.IGNORECASE)
 
 # OracleAlgo BTC structure/momentum alerts (MSS / BOS / Supertrend / Delta), e.g.:
 #   "Bearish 1H MSS  BTCUSDT 1H bearish market structure shift confirmed
@@ -224,6 +233,9 @@ _RSI_EXTREME = re.compile(
 # Direction from the "Signal" field (or LTF Bias); timeframe = bias (4H) vs entry (1H).
 _ORACLE_HINT = re.compile(r'LTF\s*Bias', re.IGNORECASE)
 _ORACLE_DIR_SIGNAL = re.compile(r'Signal\s*(Bullish|Bearish)', re.IGNORECASE)
+# The alert *type* token after the direction, e.g. "Signal Bullish MSS" → "MSS".
+# Used for the confluence filter (require N distinct aligned types before entry).
+_ORACLE_TYPE = re.compile(r'Signal\s+(?:Bullish|Bearish)\s+([A-Za-z]+)', re.IGNORECASE)
 _ORACLE_DIR_BIAS = re.compile(
     r'LTF\s*Bias[:\s]*(Longs|Shorts)\s*>\s*(Longs|Shorts)', re.IGNORECASE)
 _ORACLE_TICKER = re.compile(r'Ticker[:\s]*([A-Z]{2,10})USDT', re.IGNORECASE)
@@ -290,6 +302,34 @@ def _to_float(s: str) -> float:
     return float(str(s).lstrip("$").replace(",", ""))
 
 
+# A "soft" stop is one the analyst only honours on a candle CLOSE beyond the level
+# (e.g. Sveezy's "Stop Loss $X … Soft (1h close close)"), not an intrabar wick.
+# Detected from the word "soft" or an explicit candle-close timeframe phrasing.
+_SOFT_STOP = re.compile(
+    r'\bsoft\b|(?:\d+\s*[hmdHMD]|candle|hourly|daily|weekly)\s+close', re.IGNORECASE)
+
+
+def _enrich_new(sig: Optional[Signal], text: str) -> Optional[Signal]:
+    """Post-process a freshly built NEW signal:
+      • mark it a soft (candle-close) stop when the analyst said so, so the
+        resolver waits for a 1h close beyond SL instead of stopping on a wick;
+      • for a multi-entry scale-in ("Entry 1 … Entry 2 … Avg Entry $Z"), use the
+        analyst's stated AVERAGE entry as the position basis, so SL/TP/PnL match
+        the plan the analyst is actually trading."""
+    if sig is None:
+        return sig
+    if _SOFT_STOP.search(text):
+        sig.soft_stop = True
+    if _ENTRY_LADDER.search(text):
+        avg = _AVG_ENTRY.search(text)
+        if avg:
+            try:
+                sig.entry = _to_float(avg.group(1))
+            except (TypeError, ValueError):
+                pass
+    return sig
+
+
 def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
     """Turn a matched entry-pattern regex into a NEW Signal (or None if it doesn't parse)."""
     try:
@@ -302,11 +342,12 @@ def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
         # tp group is optional in the 4th pattern — may be None
         tp_raw = gd.get("tp")
         tp = _to_float(tp_raw) if tp_raw is not None else None
-        return Signal(
+        sig = Signal(
             message_type=MessageType.NEW,
             symbol=symbol, side=side, entry=entry, sl=sl, tp=tp,
             analyst=msg.get("author", ""), raw_text=msg.get("content", ""),
         )
+        return _enrich_new(sig, msg.get("content", ""))
     except Exception as e:
         log.debug(f"Could not build new signal from regex match: {e}")
         return None
@@ -325,7 +366,11 @@ def _extract_symbol(text: str) -> str:
     m = _SYM_USDT.search(text)
     if m and m.group(1) not in _SYMBOL_BLOCKLIST:
         return _normalise_symbol(m.group(1))
-    for m in _SYMBOL_EXTRACT.finditer(text.upper()):
+    # Fallback: the first bare ALL-CAPS token. Matched case-sensitively against the
+    # ORIGINAL text (not .upper()) because tickers are always posted in all-caps to
+    # set them apart — so mixed-case prose and names ("Sveezy", "Caleb", "Entries")
+    # can never be mistaken for a symbol. The blocklist still filters all-caps words.
+    for m in _SYMBOL_EXTRACT.finditer(text):
         candidate = m.group(1)
         if candidate not in _SYMBOL_BLOCKLIST:
             return _normalise_symbol(candidate)
@@ -411,6 +456,11 @@ def _try_oraclealgo(text: str, msg: dict) -> Optional[Signal]:
     if mtf:
         tf = _oracle_timeframe(mtf.group(1))
 
+    sig_type = ""
+    mtype = _ORACLE_TYPE.search(text)
+    if mtype:
+        sig_type = mtype.group(1).upper()
+
     return Signal(
         message_type=MessageType.NEW,
         symbol=sym,
@@ -421,6 +471,7 @@ def _try_oraclealgo(text: str, msg: dict) -> Optional[Signal]:
         is_market_order=True,
         source="oraclealgo",
         signal_tf=tf,
+        oracle_signal_type=sig_type,
     )
 
 
@@ -437,6 +488,21 @@ def _try_rsi_extreme(text: str, msg: dict) -> Optional[Signal]:
     direction = m.group("dir").lower()
     side = "buy" if direction == "oversold" else "sell"
     symbol = _normalise_symbol(m.group("sym"))
+
+    # Pull the RSI reading + 24h change so the strategy can filter on extremity
+    # and momentum (e.g. skip a "fade" against a coin already trending hard).
+    rsi_m = _RSI_VALUE.search(text)
+    chg_m = _RSI_CHANGE.search(text)
+    rsi_value = None
+    change_24h = None
+    try:
+        if rsi_m:
+            rsi_value = float(rsi_m.group("rsi"))
+        if chg_m:
+            change_24h = float(chg_m.group("chg"))
+    except (TypeError, ValueError):
+        pass
+
     return Signal(
         message_type=MessageType.NEW,
         symbol=symbol,
@@ -446,6 +512,8 @@ def _try_rsi_extreme(text: str, msg: dict) -> Optional[Signal]:
         entry=None,                 # market order — entry fetched live
         is_market_order=True,
         source="rsi_extreme",
+        rsi_value=rsi_value,
+        change_24h=change_24h,
     )
 
 
@@ -468,6 +536,26 @@ def _try_update_regex(text: str, msg: dict) -> Optional[Signal]:
     )
 
 
+# A fresh multi-entry / DCA NEW signal (e.g. Sveezy) restates an "Avg Entry" as
+# part of its INITIAL setup — "Entry 1: $X (50%)  Entry 2: $Y (50%)  Avg Entry $Z".
+# That must not be mistaken for an averaging UPDATE on an existing position. A real
+# new setup carries the full anatomy: a direction + an entry price + a stop loss, OR
+# an explicit numbered-entry ladder. (A genuine averaging note — "new average entry
+# $X" — has none of that ladder/SL scaffolding.)
+_DIR_WORD = re.compile(r'\b(?:long|short|buy|sell)\b', re.IGNORECASE)
+_HAS_STOP = re.compile(r'stop\s*loss|\bs\.?l\.?\b', re.IGNORECASE)
+_ENTRY_PRICE = re.compile(r'entr\w*[\s:$]*[\d.,]+|\$[\d.,]+\s*\(limit\)', re.IGNORECASE)
+_ENTRY_LADDER = re.compile(r'entry\s*[12]\s*[:\-]|\bentries\b', re.IGNORECASE)
+
+
+def _looks_like_new_setup(text: str) -> bool:
+    """True when the message is a fresh entry setup (so the averaging-update
+    detector should defer to the NEW parser instead of hijacking it)."""
+    if _ENTRY_LADDER.search(text):
+        return True
+    return bool(_DIR_WORD.search(text) and _ENTRY_PRICE.search(text) and _HAS_STOP.search(text))
+
+
 def _try_position_update(text: str, msg: dict) -> Optional[Signal]:
     """
     Position-management updates from DCA/averaging analysts:
@@ -475,11 +563,16 @@ def _try_position_update(text: str, msg: dict) -> Optional[Signal]:
       • "Limit Entry Reached" / "DCA filled" / "New Entry Added" (no avg given)
         → recognised INFO; returned as an UPDATE with no numeric changes so it's
         acknowledged cleanly instead of failing as an incomplete NEW signal.
-    Returns None if the text isn't one of these management messages.
+    Returns None if the text isn't one of these management messages, OR if it's
+    actually a fresh entry setup that merely quotes an avg entry (let NEW handle it).
     """
     avg = _AVG_ENTRY.search(text)
     info = _POSITION_INFO.search(text)
     if not avg and not info:
+        return None
+    # A new multi-entry setup quotes "Avg Entry" too — don't classify it as an
+    # averaging UPDATE. Defer to the NEW entry parser / LLM.
+    if _looks_like_new_setup(text):
         return None
     return Signal(
         message_type=MessageType.UPDATE,
@@ -561,7 +654,7 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
         symbol = _normalise_symbol(str(symbol_raw).replace("-USDT", "").replace("/USDT", ""))
         side = str(data.get("side") or "").lower()
 
-        return Signal(
+        sig = Signal(
             message_type=msg_type,
             symbol=symbol,
             side=side,
@@ -573,6 +666,7 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
             analyst=msg.get("author", ""),
             raw_text=text,
         )
+        return _enrich_new(sig, text) if msg_type == MessageType.NEW else sig
     except Exception as e:
         log.debug(f"LLM parse failed: {e}")
         return None
@@ -804,22 +898,27 @@ def parse(msg: dict) -> Optional[Signal]:
     """
     text = msg.get("content", "")
 
-    # Quick pre-filter: skip pure chatter with no trading vocabulary at all.
-    if not _TRADE_HINT.search(text):
-        return None
-
-    # Stage 0 — RSI Extreme alerts (OracleAlgo). Checked first: very specific,
-    # and it's a market-order strategy distinct from analyst follow-trades.
+    # Stage 0 — RSI Extreme alerts (OracleAlgo). Checked FIRST, before the chatter
+    # pre-filter: these alerts have a very specific anchor ("RSI Extreme") and the
+    # ticker can run together with adjacent text ("…USDTRSI90.3"), which would defeat
+    # the word-boundary trade-hint gate. It's a market-order strategy distinct from
+    # analyst follow-trades.
     sig = _try_rsi_extreme(text, msg)
     if sig:
         log.debug(f"RSI Extreme: {sig.side} {sig.symbol} (market)")
         return sig
 
     # Stage 0b — OracleAlgo BTC structure/momentum alerts (MSS/BOS/Supertrend/Delta).
+    # Also anchored ("LTF Bias") and exempt from the pre-filter for the same reason.
     sig = _try_oraclealgo(text, msg)
     if sig:
         log.debug(f"OracleAlgo: {sig.side} {sig.symbol} tf={sig.signal_tf}")
         return sig
+
+    # Quick pre-filter: skip pure chatter with no trading vocabulary at all. Runs
+    # after the strongly-anchored strategy parsers above so it can't drop them.
+    if not _TRADE_HINT.search(text):
+        return None
 
     # Stage 1a — update fast-path
     sig = _try_update_regex(text, msg)

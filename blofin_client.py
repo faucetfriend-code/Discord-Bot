@@ -269,6 +269,116 @@ def get_market_price(symbol: str) -> Optional[float]:
         return None
 
 
+def get_recent_close(symbol: str, bar: str = "1H") -> Optional[float]:
+    """
+    Close price of the most recently CLOSED candle on the `bar` timeframe,
+    skipping the still-forming candle. Used by 'soft' stops, which only trigger
+    when a candle CLOSES beyond the level (not on an intrabar wick).
+
+    BloFin returns candles newest-first as [ts, open, high, low, close, vol, …,
+    confirm] where the trailing flag is "1" for a closed candle and "0" for the
+    one currently forming. Returns None on any failure.
+    """
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+    try:
+        resp = _get_client().public.get_candlesticks(inst_id=inst_id, bar=bar, limit=2)
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        for row in data:                      # newest first → first confirmed = last close
+            if len(row) >= 5 and str(row[-1]) == "1":
+                return float(row[4]) or None
+        if len(data) >= 2 and len(data[1]) >= 5:   # fallback: candle before the forming one
+            return float(data[1][4]) or None
+        return None
+    except Exception as e:
+        log.warning(f"get_recent_close({symbol}) failed: {e}")
+        return None
+
+
+def get_funding_rate(symbol: str) -> Optional[float]:
+    """Current perpetual funding rate for a symbol (e.g. -0.0000529), or None.
+    BloFin charges/credits funding every 8h; used to model holding cost."""
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+    try:
+        resp = _get_client().public.get_funding_rate(inst_id=inst_id)
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        if isinstance(data, list) and data:
+            return float(data[0].get("fundingRate", 0) or 0)
+        return None
+    except Exception as e:
+        log.warning(f"get_funding_rate({symbol}) failed: {e}")
+        return None
+
+
+def get_recent_fills(symbol: str) -> list[dict]:
+    """Recent fills for a symbol from the exchange trade history, newest first.
+    Each dict carries at least {price, size, fee, side, ts}. Used on LIVE to read
+    the exchange's real fees and the exit price of an externally-closed position."""
+    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
+    try:
+        resp = _get_client().trading.get_trade_history(inst_id=inst_id)
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        out = []
+        for f in data if isinstance(data, list) else []:
+            out.append({
+                "price": float(f.get("fillPrice", f.get("price", 0)) or 0),
+                "size": float(f.get("fillSize", f.get("size", 0)) or 0),
+                "fee": abs(float(f.get("fee", 0) or 0)),
+                "side": f.get("side", ""),
+                "ts": f.get("ts", ""),
+            })
+        return out
+    except Exception as e:
+        log.warning(f"get_recent_fills({symbol}) failed: {e}")
+        return []
+
+
+def get_live_positions() -> list[dict]:
+    """Open positions as the EXCHANGE sees them, normalized to
+    {symbol, side, size, avg_price, liq_price}. Empty list on failure or no
+    positions. Used by live reconciliation to detect external closes/liquidations."""
+    try:
+        resp = _get_client().trading.get_positions()
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        out = []
+        for p in data if isinstance(data, list) else []:
+            size = float(p.get("positions", p.get("pos", 0)) or 0)
+            if size == 0:
+                continue
+            ps = (p.get("positionSide") or "").lower()
+            side = "buy" if ps == "long" else "sell" if ps == "short" else \
+                   ("buy" if size > 0 else "sell")
+            out.append({
+                "symbol": p.get("instId", ""),
+                "side": side,
+                "size": abs(size),
+                "avg_price": float(p.get("averagePrice", p.get("avgPx", 0)) or 0),
+                "liq_price": float(p.get("liquidationPrice", p.get("liqPx", 0)) or 0),
+            })
+        return out
+    except Exception as e:
+        log.warning(f"get_live_positions failed: {e}")
+        return []
+
+
+def get_account_summary() -> Optional[dict]:
+    """{balance, equity, free_margin} from the futures account, or None on failure.
+    `free_margin` is the available (non-frozen) USDT; `equity` includes unrealized PnL."""
+    try:
+        resp = _get_client().trading.get_futures_account_balance()
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        equity = float(data.get("totalEquity", 0) or 0)
+        bal = free = None
+        for d in data.get("details", []) or []:
+            if d.get("currency") == "USDT":
+                bal = float(d.get("balance", 0) or 0)
+                free = float(d.get("available", d.get("availableEquity", 0)) or 0)
+                break
+        return {"balance": bal, "equity": equity, "free_margin": free}
+    except Exception as e:
+        log.warning(f"get_account_summary failed: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Order placement & management
 # ---------------------------------------------------------------------------

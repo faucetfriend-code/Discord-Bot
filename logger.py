@@ -2,8 +2,19 @@ import csv
 import logging
 import os
 import sqlite3
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Force UTF-8 on the console streams so log lines containing em-dashes / arrows
+# ("→", "—") don't garble (or raise UnicodeEncodeError) on a Windows cp1252
+# console. The file handler is already opened utf-8. errors="replace" guarantees
+# logging never crashes on an unencodable glyph.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 DB_PATH = Path(__file__).parent / "bot.db"
 CSV_PATH = Path(__file__).parent / "signals_log.csv"
@@ -100,6 +111,43 @@ def log_signal(analyst, raw_text, signal=None, outcome="seen", order_id=None):
     write_header = not CSV_PATH.exists()
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+# ---------------------------------------------------------------------------
+# Strategy shadow log — the "measure-then-tune" record for RSI / OracleAlgo.
+# Every RSI/Oracle signal writes one row capturing the data the alert carried
+# (RSI value, 24h change, signal type) plus what each *proposed* filter WOULD
+# have decided — even while the filters are disabled. Run dry-run for a while,
+# then tune thresholds from the real distribution before flipping the flags on.
+# ---------------------------------------------------------------------------
+SHADOW_CSV_PATH = Path(__file__).parent / "strategy_shadow.csv"
+
+_SHADOW_FIELDS = [
+    "ts", "source", "symbol", "side",
+    "rsi_value", "change_24h", "oracle_type", "btc_bias", "entry_price",
+    "f_strength", "f_chase", "f_regime", "confirm_would_fire",
+    "confluence_count", "decision",
+]
+
+
+def log_shadow(source, symbol, side, fields: dict):
+    """Append one strategy-signal row to strategy_shadow.csv. `fields` may carry
+    any subset of the shadow columns; missing keys are written blank."""
+    row = {k: "" for k in _SHADOW_FIELDS}
+    row["ts"] = now_local().isoformat()
+    row["source"] = source
+    row["symbol"] = symbol
+    row["side"] = side
+    for k, v in fields.items():
+        if k in row and v is not None:
+            row[k] = v
+
+    write_header = not SHADOW_CSV_PATH.exists()
+    with open(SHADOW_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_SHADOW_FIELDS)
         if write_header:
             writer.writeheader()
         writer.writerow(row)

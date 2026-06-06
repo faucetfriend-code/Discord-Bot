@@ -12,6 +12,7 @@ Signal routing:
   CLOSE  → market-close existing BloFin position
 """
 
+import json
 import math
 import os
 import queue as _queue
@@ -86,6 +87,188 @@ def _canonical_analyst(msg: dict, whitelist: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Strategy shadow log + pending-entry queue (measure-then-tune infrastructure)
+# ---------------------------------------------------------------------------
+
+def _shadow_strategy(signal: sp.Signal, entry_price, decisions: dict):
+    """Record one RSI/Oracle signal to strategy_shadow.csv: the data the alert
+    carried (RSI value, 24h change, signal type), the current BTC regime, and
+    what each PROPOSED filter would decide — logged even while the filters are
+    disabled. This is the evidence trail for tuning thresholds before enabling
+    them. No-op when STRATEGY_SHADOW_LOG is off."""
+    if os.getenv("STRATEGY_SHADOW_LOG", "true").lower() != "true":
+        return
+    fields = {
+        "rsi_value": signal.rsi_value,
+        "change_24h": signal.change_24h,
+        "oracle_type": signal.oracle_signal_type,
+        "btc_bias": _get_oracle_bias() or "",
+        "entry_price": entry_price,
+    }
+    fields.update(decisions)
+    try:
+        _logger_mod.log_shadow(signal.source, signal.symbol, signal.side, fields)
+    except Exception as e:
+        log.debug(f"shadow log failed: {e}")
+
+
+def _rsi_filter_verdicts(signal: sp.Signal) -> tuple:
+    """Evaluate the three RSI quality filters WITHOUT enforcing them. Returns
+    (f_strength, f_chase, f_regime) — each True (pass) / False (block) / None
+    (no data to decide, never blocks).
+
+      strength — the reading must be genuinely extreme (overbought >= RSI_MIN_STRENGTH,
+                 oversold <= 100-RSI_MIN_STRENGTH); a borderline 70/30 is not fade-worthy.
+      chase    — don't fade INTO a strong move: skip an oversold-long when 24h change is
+                 already below -RSI_MAX_CHASE_PCT (knife), or an overbought-short when it's
+                 already above +RSI_MAX_CHASE_PCT.
+      regime   — the BTC bias must not oppose the fade (no oversold-long while bias=bear)."""
+    min_strength = float(os.getenv("RSI_MIN_STRENGTH", "80"))
+    max_chase = float(os.getenv("RSI_MAX_CHASE_PCT", "0.12"))
+
+    f_strength = None
+    if signal.rsi_value is not None:
+        f_strength = (signal.rsi_value >= min_strength) if signal.side == "sell" \
+            else (signal.rsi_value <= (100 - min_strength))
+
+    f_chase = None
+    if signal.change_24h is not None:
+        chg = signal.change_24h / 100.0          # alert reports a percentage
+        f_chase = (chg >= -max_chase) if signal.side == "buy" else (chg <= max_chase)
+
+    f_regime = None
+    bias = _get_oracle_bias()
+    if bias:
+        f_regime = (bias != "bear") if signal.side == "buy" else (bias != "bull")
+
+    return f_strength, f_chase, f_regime
+
+
+# Both "wait then enter" features (RSI confirmation-on-turn, Oracle pullback
+# limit) are the same shape, so they share ONE queue persisted in strategy_state
+# (survives restarts) and one checker that runs each fast tick beside the
+# watch/resolve loop.
+_PENDING_KEY = "pending_entries"
+
+
+def _load_pending() -> list:
+    raw = pt.get_state(_PENDING_KEY)
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+
+
+def _has_pending(symbol: str, source: str) -> bool:
+    return any(it["symbol"] == symbol and it["source"] == source for it in _load_pending())
+
+
+def _enqueue_pending(signal: sp.Signal, condition: str, threshold_pct: float,
+                     leverage: int, analyst_key: str, window_min: float, ref_price: float):
+    """Queue a 'enter later when price does X' candidate.
+      condition "revert"     → enter once price moves threshold_pct back in the
+                               trade's favour from ref_price (RSI confirmation).
+      condition "pullback"   → enter once price retraces threshold_pct to a better
+                               fill than ref_price (Oracle pullback limit).
+      condition "limit_fill" → enter once price trades through ref_price (the
+                               analyst's limit). window_min<=0 = rests indefinitely.
+    For limit_fill the analyst's own sl/tp/soft_stop ride along so the position
+    opens with the original setup intact."""
+    items = _load_pending()
+    items.append({
+        "source": signal.source,
+        "symbol": signal.symbol,
+        "side": signal.side,
+        "ref_price": ref_price,
+        "condition": condition,
+        "threshold_pct": threshold_pct,
+        "leverage": leverage,
+        "analyst_key": analyst_key,
+        "created_at": now_local().isoformat(),
+        "window_min": window_min,
+        "raw_text": signal.raw_text,
+        "rsi_value": signal.rsi_value,
+        "change_24h": signal.change_24h,
+        "oracle_signal_type": signal.oracle_signal_type,
+        "signal_tf": signal.signal_tf,
+        "sl": signal.sl,
+        "tp": signal.tp,
+        "soft_stop": signal.soft_stop,
+    })
+    pt.set_state(_PENDING_KEY, json.dumps(items))
+    window_txt = "no expiry" if window_min <= 0 else f"within {window_min:.0f}m"
+    log.info(f"[{signal.source or analyst_key}] {signal.symbol} {signal.side.upper()} queued "
+             f"({condition}, ref {ref_price}, {window_txt})")
+
+
+def _check_pending_entries(dry_run: bool):
+    """Each fast tick: fill or expire queued pending entries. Mirrors
+    _check_watches — re-reads the persisted queue so a restart resumes it."""
+    items = _load_pending()
+    if not items:
+        return
+    keep, changed = [], False
+    for it in items:
+        window_min = float(it.get("window_min", 30))
+        # window_min <= 0 means "rest indefinitely" (limit orders): never expire.
+        if window_min > 0:
+            try:
+                age_min = (now_local() - datetime.fromisoformat(it["created_at"])).total_seconds() / 60
+            except Exception:
+                age_min = 0
+            if age_min > window_min:
+                log.info(f"[{it['source']}] pending {it['condition']} on {it['symbol']} expired "
+                         f"(>{window_min:.0f}m, no fill)")
+                _logger_mod.log_signal(it.get("analyst_key") or it["source"], it.get("raw_text", ""),
+                                       outcome=f"pending_{it['condition']}_expired {it['symbol']}")
+                changed = True
+                continue
+        price = bf.get_market_price(it["symbol"])
+        if price is None:
+            keep.append(it)
+            continue
+        ref, side, thr = it["ref_price"], it["side"], float(it["threshold_pct"])
+        if it["condition"] == "revert":
+            fired = (price >= ref * (1 + thr)) if side == "buy" else (price <= ref * (1 - thr))
+        elif it["condition"] == "pullback":
+            fired = (price <= ref * (1 - thr)) if side == "buy" else (price >= ref * (1 + thr))
+        elif it["condition"] == "limit_fill":
+            # Filled when price trades through the limit: at/below for a long, at/above for a short.
+            fired = (price <= ref) if side == "buy" else (price >= ref)
+        else:
+            fired = False
+        if not fired:
+            keep.append(it)
+            continue
+        changed = True
+        if it["condition"] == "limit_fill":
+            # Open at the limit price with the analyst's original setup intact. Mark
+            # is_market_order so _process_new opens it now and doesn't re-queue.
+            sig = sp.Signal(
+                message_type=MessageType.NEW, symbol=it["symbol"], side=side,
+                analyst=it.get("analyst_key", ""), raw_text=it.get("raw_text", ""),
+                entry=ref, sl=it.get("sl"), tp=it.get("tp"), is_market_order=True,
+                source=it["source"], soft_stop=bool(it.get("soft_stop")),
+            )
+        else:
+            sig = sp.Signal(
+                message_type=MessageType.NEW, symbol=it["symbol"], side=side,
+                analyst=it.get("analyst_key", ""), raw_text=it.get("raw_text", ""),
+                entry=None, is_market_order=True, source=it["source"],
+                signal_tf=it.get("signal_tf", ""), rsi_value=it.get("rsi_value"),
+                change_24h=it.get("change_24h"), oracle_signal_type=it.get("oracle_signal_type", ""),
+            )
+        log.info(f"[{it.get('analyst_key') or it['source']}] pending {it['condition']} on "
+                 f"{it['symbol']} filled @ {price} (ref {ref}) — entering")
+        _process_new(sig, pt.get_open_positions(), dry_run,
+                     int(it.get("leverage", 50)), it.get("analyst_key", ""))
+    if changed:
+        pt.set_state(_PENDING_KEY, json.dumps(keep))
+
+
+# ---------------------------------------------------------------------------
 # Per-type handlers
 # ---------------------------------------------------------------------------
 
@@ -118,8 +301,11 @@ def _calc_auto_tp(signal: sp.Signal) -> float | None:
 def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
                  leverage: int = 50, analyst_key: str = ""):
     """Validate and place a new order (limit or market)."""
-    analyst = signal.analyst
-    analyst_key = analyst_key or analyst or "unknown"
+    analyst_key = analyst_key or signal.analyst or "unknown"
+    # Use the canonical key for ALL log lines and signal records, so a strategy
+    # trade reads "[RSI Extreme]" / "[OracleAlgo]" (its attribution key) rather
+    # than the raw notification author, and matches positions.analyst in the DB.
+    analyst = analyst_key
 
     # If this analyst flagged a POI that's now armed, use it to fill a vague entry.
     _apply_armed_watch(signal, analyst_key)
@@ -147,20 +333,25 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     # tp_ladder = ordered TP targets (nearest first) for scale-out management.
     tp_ladder: list[float] = []
 
-    # RSI Extreme strategy: derive SL/TP as fixed percentages around the live
-    # entry (mean-reversion). Long: TP above / SL below; short: the reverse.
+    # RSI Extreme strategy: fixed % SL + a scale-out TP ladder around the live
+    # entry (mean-reversion). RSI_TP_PCTS is the ladder (half off at the first
+    # rung, SL ratchets to break-even, remainder to the last) — the same engine
+    # the OracleAlgo/analyst trades use. RSI_TP_PCT is the single-rung fallback.
     if signal.source == "rsi_extreme" and signal.entry is not None:
-        tp_pct = float(os.getenv("RSI_TP_PCT", "0.10"))
         sl_pct = float(os.getenv("RSI_SL_PCT", "0.05"))
+        tp_pcts = [float(p) for p in os.getenv("RSI_TP_PCTS", "").split(",") if p.strip()]
+        if not tp_pcts:
+            tp_pcts = [float(os.getenv("RSI_TP_PCT", "0.10"))]
         if signal.side == "buy":
             signal.sl = round(signal.entry * (1 - sl_pct), 8)
-            signal.tp = round(signal.entry * (1 + tp_pct), 8)
+            tp_ladder = [round(signal.entry * (1 + p), 8) for p in tp_pcts]
         else:
             signal.sl = round(signal.entry * (1 + sl_pct), 8)
-            signal.tp = round(signal.entry * (1 - tp_pct), 8)
-        tp_ladder = [signal.tp]
+            tp_ladder = [round(signal.entry * (1 - p), 8) for p in tp_pcts]
+        signal.tp = tp_ladder[-1]
         log.info(f"[RSI] {signal.symbol} {signal.side.upper()} reversion — entry {signal.entry} "
-                 f"SL {signal.sl} ({sl_pct*100:.0f}%) TP {signal.tp} (+{tp_pct*100:.0f}%)")
+                 f"SL {signal.sl} ({sl_pct*100:.0f}%) TP ladder {tp_ladder} "
+                 f"({'/'.join(f'{p*100:.0f}%' for p in tp_pcts)})")
 
     # OracleAlgo: fixed % stop + a scale-out TP ladder around the live entry.
     if signal.source == "oraclealgo" and signal.entry is not None:
@@ -204,9 +395,13 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         tp_ladder = [signal.tp]
 
     if signal.entry is None or signal.sl is None or signal.tp is None:
-        log.warning(f"[{analyst}] NEW signal missing entry/sl/tp — skipping")
-        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
-                               outcome="incomplete_signal")
+        # Distinguish a genuinely incomplete signal from a notification card that
+        # arrived clipped mid-field (ends on a dangling "$" or a price with no
+        # decimals) — the next periodic sweep usually re-captures the full card.
+        truncated = bool(re.search(r'\$\s*\d*\.?\s*$', (signal.raw_text or "").rstrip()))
+        outcome = "possibly_truncated" if truncated else "incomplete_signal"
+        log.warning(f"[{analyst}] NEW signal missing entry/sl/tp ({outcome}) — skipping")
+        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal, outcome=outcome)
         return
 
     # Sanity guard for vision/market levels: SL or TP implausibly far from the
@@ -235,6 +430,20 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome=f"rejected:{reason}")
         return
+
+    # Dry-run limit-fill fidelity: a limit entry price hasn't reached yet rests in
+    # the pending queue (no expiry) and opens only when price trades through it —
+    # instead of the old behaviour of recording an instant fill at the ideal price.
+    # (Live places a real resting limit order on the exchange, so this is dry-run only.)
+    if dry_run and not signal.is_market_order and signal.entry is not None:
+        live = bf.get_market_price(signal.symbol)
+        reached = live is not None and (
+            (live <= signal.entry) if signal.side == "buy" else (live >= signal.entry))
+        if live is not None and not reached:
+            _enqueue_pending(signal, "limit_fill", 0.0, leverage, analyst_key, 0, signal.entry)
+            _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                                   outcome="dry_run_limit_resting", )
+            return
 
     balance = bf.get_balance()
     if balance is None:
@@ -272,7 +481,8 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
             symbol=signal.symbol, side=signal.side, entry=signal.entry,
             sl=signal.sl, tp=signal.tp, size=size, order_id=order_id,
             opened_at=now_local().isoformat(), analyst=analyst_key,
-            tps=tp_ladder, orig_size=size,
+            tps=tp_ladder, orig_size=size, soft_stop=signal.soft_stop,
+            leverage=leverage,
         ))
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome=f"dry_run (lev {leverage}x)", order_id=order_id)
@@ -301,6 +511,8 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
             analyst=analyst_key,
             tps=tp_ladder,
             orig_size=size,
+            soft_stop=signal.soft_stop,
+            leverage=leverage,
         )
         pt.open_position(pos)
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
@@ -368,34 +580,91 @@ def _pnl_usdt(entry: float, exit_price: float, contracts: float,
     return (exit_price - entry) * coins if side == "buy" else (entry - exit_price) * coins
 
 
+def _eff_taker() -> float:
+    """Effective taker fee after BloFin's cashback rebate (per fill, fraction)."""
+    taker = float(os.getenv("FEE_TAKER_PCT", "0.0006"))
+    rebate = float(os.getenv("FEE_REBATE_PCT", "0.5"))
+    return taker * (1 - rebate)
+
+
+def _slice_fee(notional: float) -> float:
+    """Taker fee (post-rebate) on one fill of `notional` USDT."""
+    return _eff_taker() * abs(notional)
+
+
+def _funding_cost(symbol: str, notional: float, hours_held: float) -> float:
+    """Modeled perp funding paid over the hold: rate × notional × (hours / 8),
+    BloFin's 8h funding cadence. 0 when FUNDING_ENABLED is off or rate unknown.
+    Sign follows the rate (a negative rate is a credit, i.e. negative cost)."""
+    if os.getenv("FUNDING_ENABLED", "true").lower() != "true" or hours_held <= 0:
+        return 0.0
+    rate = bf.get_funding_rate(symbol)
+    if rate is None:
+        return 0.0
+    return rate * abs(notional) * (hours_held / 8.0)
+
+
+def _hours_since(opened_at: str) -> float:
+    """Hours elapsed since an ISO timestamp (0 if unparseable)."""
+    try:
+        return max(0.0, (now_local() - datetime.fromisoformat(opened_at)).total_seconds() / 3600)
+    except Exception:
+        return 0.0
+
+
 def _settle_position(position: pt.Position, exit_price: float, reason: str,
-                     won: bool = None):
+                     won: bool = None, dry_run: bool = True):
     """
-    Close a position locally, decide win/loss, record realized PnL, and adapt
-    the analyst's leverage. If `won` is not given it's inferred from exit vs entry
-    (scale-outs pass won explicitly — any banked TP = net win).
+    Close a position locally, decide win/loss, net out trading costs, record the
+    realized PnL + a durable trade-blotter row, and adapt the analyst's leverage.
+    `position.realized_pnl`/`fees_accum` carry the GROSS PnL and exit fees already
+    banked on earlier scale-out slices; this adds the final slice plus the one-off
+    entry fee and the funding paid over the hold. If `won` is not given it's
+    inferred from exit vs entry (scale-outs pass it — any banked TP = net win).
     """
     start, lo, hi, step = _leverage_params()
     if won is None:
         won = exit_price >= position.entry if position.side == "buy" \
             else exit_price <= position.entry
 
-    # Realized PnL on the remaining size being closed here.
     specs = bf.get_contract_specs(position.symbol)
     cv = specs["contract_value"] if specs else 0.0
-    pnl = _pnl_usdt(position.entry, exit_price, position.size, cv, position.side)
-    pt.add_realized_pnl(position.analyst, pnl)
 
+    # Final slice PnL + costs. Entry fee and funding are one-off for the whole
+    # position (not yet counted during partial scale-outs).
+    final_gross = _pnl_usdt(position.entry, exit_price, position.size, cv, position.side)
+    final_exit_fee = _slice_fee(position.size * exit_price * cv)
+    orig_notional = position.orig_size * position.entry * cv
+    entry_fee = _slice_fee(orig_notional)
+    hours = _hours_since(position.opened_at)
+    funding = _funding_cost(position.symbol, orig_notional, hours)
+
+    gross_total = (position.realized_pnl or 0.0) + final_gross
+    fees_total = (position.fees_accum or 0.0) + final_exit_fee + entry_fee
+    net_total = gross_total - fees_total - funding
+
+    # Only the increment not already credited during partials goes to the tally.
+    pt.add_realized_pnl(position.analyst, final_gross - final_exit_fee - entry_fee - funding)
     new_lev = pt.record_outcome(position.analyst, won, step, lo, hi)
     pt.close_position(position.order_id)
+    pt.record_trade(
+        symbol=position.symbol, side=position.side, analyst=position.analyst,
+        entry=position.entry, exit_price=exit_price, size=position.orig_size,
+        leverage=position.leverage, soft_stop=position.soft_stop,
+        opened_at=position.opened_at, closed_at=now_local().isoformat(),
+        duration_s=int(hours * 3600), reason=reason, won=won,
+        gross_pnl=round(gross_total, 6), fees=round(fees_total, 6),
+        funding=round(funding, 6), net_pnl=round(net_total, 6), dry_run=dry_run,
+    )
 
     verdict = "WIN" if won else "LOSS"
     arrow = f"+{step}" if won else f"-{step}"
     log.info(f"[{position.analyst}] {position.symbol} {verdict} ({reason}) "
              f"exit={exit_price} entry={position.entry} tps_hit={position.tps_hit} "
-             f"PnL ${pnl:+.2f} → leverage {arrow} = {new_lev}x")
+             f"net ${net_total:+.2f} (gross ${gross_total:+.2f} − fees ${fees_total:.2f} "
+             f"− funding ${funding:+.2f}) → leverage {arrow} = {new_lev}x")
     _logger_mod.log_signal(position.analyst, f"{position.symbol} {reason}",
-                           outcome=f"{'win' if won else 'loss'}:{reason} pnl=${pnl:+.2f} lev={new_lev}x",
+                           outcome=f"{'win' if won else 'loss'}:{reason} net=${net_total:+.2f} lev={new_lev}x",
                            order_id=position.order_id)
     return won, new_lev
 
@@ -419,7 +688,7 @@ def _process_close(signal: sp.Signal, position: pt.Position, dry_run: bool):
             return
 
     if price is not None:
-        _settle_position(position, price, "manual_close")
+        _settle_position(position, price, "manual_close", dry_run=dry_run)
     else:
         # Couldn't price the exit — close without adjusting leverage (rare).
         pt.close_position(position.order_id)
@@ -463,11 +732,25 @@ def _resolve_open_positions(dry_run: bool = True):
         # 1) Stop-loss (possibly ratcheted) hit?
         sl_hit = (is_long and price <= pos.sl) or (not is_long and price >= pos.sl)
         if sl_hit:
+            # Soft stop: the analyst only honours the stop on a CANDLE CLOSE beyond
+            # it, not an intrabar wick. Once price ratchets to break-even/a prior TP
+            # (tps_hit>=1) the stop is ours to protect profit, so enforce it hard.
+            if pos.soft_stop and pos.tps_hit == 0:
+                close_px = bf.get_recent_close(pos.symbol, "1H")
+                confirmed = close_px is not None and (
+                    (is_long and close_px <= pos.sl) or (not is_long and close_px >= pos.sl))
+                if not confirmed:
+                    log.info(f"[{pos.analyst}] {pos.symbol} soft stop: price {price} beyond "
+                             f"SL {pos.sl} but last 1h close "
+                             f"{close_px if close_px is not None else 'unavailable'} hasn't — holding")
+                    continue
+                log.info(f"[{pos.analyst}] {pos.symbol} soft stop CONFIRMED — 1h closed "
+                         f"{close_px} beyond SL {pos.sl}")
             won = pos.tps_hit >= 1  # banked >=TP1 → net win; raw stop with none → loss
             reason = "trail_stop" if pos.tps_hit >= 1 else "sl"
             if not dry_run:
                 _live_close_remaining(pos)
-            _settle_position(pos, price, reason, won=won)
+            _settle_position(pos, price, reason, won=won, dry_run=dry_run)
             continue
 
         # 2) Next take-profit target hit?
@@ -484,7 +767,7 @@ def _resolve_open_positions(dry_run: bool = True):
         if new_hit >= n:
             if not dry_run:
                 _live_close_remaining(pos)
-            _settle_position(pos, price, f"tp{new_hit}_final", won=True)
+            _settle_position(pos, price, f"tp{new_hit}_final", won=True, dry_run=dry_run)
             continue
 
         # Intermediate target → partial close + ratchet SL.
@@ -498,7 +781,7 @@ def _resolve_open_positions(dry_run: bool = True):
         if chunk <= 0 or remaining <= 0:
             if not dry_run:
                 _live_close_remaining(pos)
-            _settle_position(pos, price, f"tp{new_hit}_nosplit", won=True)
+            _settle_position(pos, price, f"tp{new_hit}_nosplit", won=True, dry_run=dry_run)
             continue
 
         new_sl = pos.entry if new_hit == 1 else ladder[new_hit - 2]
@@ -512,14 +795,18 @@ def _resolve_open_positions(dry_run: bool = True):
             except Exception as e:
                 log.error(f"Scale-out order/amend failed for {pos.symbol}: {e}")
 
-        # Realized PnL on the slice we just took off.
-        slice_pnl = _pnl_usdt(pos.entry, price, chunk, cv, pos.side)
-        pt.add_realized_pnl(pos.analyst, slice_pnl)
+        # Realized PnL on the slice we just took off, net of its exit fee. The gross
+        # PnL + fee are banked on the position so the final trade record sums every
+        # leg; the analyst tally gets the net.
+        slice_gross = _pnl_usdt(pos.entry, price, chunk, cv, pos.side)
+        slice_fee = _slice_fee(chunk * price * cv)
+        pt.add_realized_pnl(pos.analyst, slice_gross - slice_fee)
+        pt.accumulate_costs(pos.order_id, slice_gross, slice_fee)
         pt.apply_partial(pos.order_id, remaining, new_sl, new_hit)
         log.info(f"[{pos.analyst}] {pos.symbol} TP{new_hit} hit @ {price} — closed {chunk} "
-                 f"(${slice_pnl:+.2f}), {remaining} left, SL → {new_sl} ({sl_label})")
+                 f"(net ${slice_gross - slice_fee:+.2f}), {remaining} left, SL → {new_sl} ({sl_label})")
         _logger_mod.log_signal(pos.analyst, f"{pos.symbol} TP{new_hit} scale-out",
-                               outcome=f"scaled_tp{new_hit} pnl=${slice_pnl:+.2f} sl={new_sl}",
+                               outcome=f"scaled_tp{new_hit} net=${slice_gross - slice_fee:+.2f} sl={new_sl}",
                                order_id=pos.order_id)
 
 
@@ -554,6 +841,49 @@ def _live_close_remaining(pos: pt.Position):
         bf.close_position_api(inst, side)
     except Exception as e:
         log.error(f"Live close failed for {pos.symbol}: {e}")
+
+
+def _refresh_account(bot_state: dict):
+    """Update the dashboard's balance/equity/free-margin from the exchange.
+    Best-effort — leaves the prior values in place on a transient API miss."""
+    summary = bf.get_account_summary()
+    if summary:
+        for k in ("balance", "equity", "free_margin"):
+            if summary.get(k) is not None:
+                bot_state[k] = summary[k]
+
+
+def _reconcile_with_exchange(dry_run: bool):
+    """
+    LIVE only: keep the local DB in sync with what BloFin actually holds.
+      • A position open in our DB but ABSENT on the exchange was closed/liquidated
+        externally — settle it locally at its real exit (last fill price if we can
+        read one, else the current market price).
+      • A position on the exchange but ABSENT from our DB is a manual/external trade
+        — log a loud warning but do NOT adopt it (the bot only manages its own).
+    No-op in dry-run (there are no real exchange positions to reconcile against).
+    """
+    if dry_run:
+        return
+    live = bf.get_live_positions()
+    if live is None:
+        return
+    live_syms = {p["symbol"] for p in live}
+    db_open = pt.get_open_positions()
+    db_syms = set()
+    for pos in db_open:
+        inst = pos.symbol if "-USDT" in pos.symbol else f"{pos.symbol}-USDT"
+        db_syms.add(inst)
+        if inst not in live_syms:
+            fills = bf.get_recent_fills(pos.symbol)
+            exit_px = fills[0]["price"] if fills else (bf.get_market_price(pos.symbol) or pos.entry)
+            log.warning(f"[recon] {pos.symbol} open locally but gone on exchange "
+                        f"(closed/liquidated externally) — settling @ {exit_px}")
+            _settle_position(pos, exit_px, "exchange_closed", dry_run=dry_run)
+    for p in live:
+        if p["symbol"] not in db_syms:
+            log.warning(f"[recon] {p['symbol']} {p['side']} size {p['size']} is open on the "
+                        f"exchange but NOT tracked locally (manual/external trade) — not adopting")
 
 
 # ---------------------------------------------------------------------------
@@ -683,15 +1013,77 @@ def _is_whitelisted(msg: dict, whitelist_lower: set[str]) -> bool:
 
 
 _ORACLE_BIAS_KEY = "btc_oracle_bias"
+_ORACLE_CONFLUENCE_KEY = "oracle_confluence"
+
+
+def _set_oracle_bias(bias: str):
+    """Persist the 4H bias WITH a timestamp so it can go stale (see _get_oracle_bias)."""
+    pt.set_state(_ORACLE_BIAS_KEY, json.dumps({"bias": bias, "ts": now_local().isoformat()}))
+
+
+def _get_oracle_bias(ignore_ttl: bool = False) -> str | None:
+    """The current BTC bias ('bull'/'bear'), or None if unset or older than
+    ORACLE_BIAS_TTL_HOURS. A bare legacy string (pre-TTL format) is treated as fresh.
+    Pass ignore_ttl=True to read the stored value regardless of age (flip detection)."""
+    raw = pt.get_state(_ORACLE_BIAS_KEY)
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        bias, ts = d.get("bias"), d.get("ts")
+    except (ValueError, TypeError):
+        return raw or None       # legacy bare-string bias — treat as fresh
+    if not bias:
+        return None
+    if ignore_ttl:
+        return bias
+    ttl_h = float(os.getenv("ORACLE_BIAS_TTL_HOURS", "8"))
+    if ttl_h > 0 and ts:
+        try:
+            age_h = (now_local() - datetime.fromisoformat(ts)).total_seconds() / 3600
+            if age_h > ttl_h:
+                return None
+        except Exception:
+            pass
+    return bias
+
+
+def _oracle_confluence(signal: sp.Signal) -> tuple[bool, int]:
+    """Record this 1H signal in the rolling confluence buffer and report whether
+    >= ORACLE_CONFLUENCE_N DISTINCT aligned signal types have fired within
+    ORACLE_CONFLUENCE_WINDOW_MIN. Returns (ok, distinct_aligned_count)."""
+    n = int(os.getenv("ORACLE_CONFLUENCE_N", "1"))
+    window = float(os.getenv("ORACLE_CONFLUENCE_WINDOW_MIN", "45"))
+    raw = pt.get_state(_ORACLE_CONFLUENCE_KEY)
+    try:
+        buf = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        buf = []
+    now = now_local()
+    fresh = []
+    for e in buf:
+        try:
+            if (now - datetime.fromisoformat(e["ts"])).total_seconds() / 60 <= window:
+                fresh.append(e)
+        except Exception:
+            pass
+    fresh.append({"type": signal.oracle_signal_type or "?", "side": signal.side,
+                  "ts": now.isoformat()})
+    pt.set_state(_ORACLE_CONFLUENCE_KEY, json.dumps(fresh))
+    distinct = len({e["type"] for e in fresh if e["side"] == signal.side})
+    return distinct >= n, distinct
 
 
 def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     """
     OracleAlgo BTC state machine:
-      • 4H signal → set/refresh the BTC bias (bull/bear). On a bias FLIP, close
-        any open OracleAlgo position that now runs counter to it. No entry.
-      • 1H signal → enter ONLY if it agrees with the current 4H bias and there's
-        no BTC position open. SL/TP (1.5% stop + 2%/4% scale-out) set in _process_new.
+      • 4H signal → set/refresh the BTC bias (bull/bear), timestamped so it can
+        expire (ORACLE_BIAS_TTL_HOURS). On a bias FLIP, close any open OracleAlgo
+        position that now runs counter to it. No entry.
+      • 1H signal → enter ONLY if it agrees with the current (fresh) 4H bias,
+        clears the confluence requirement, and there's no BTC position open.
+        With ORACLE_PULLBACK_PCT>0, queue a pullback-limit entry instead of a
+        market fill. SL/TP (1.5% stop + 2%/4% scale-out) set in _process_new.
     """
     content = msg.get("content", "")
     if os.getenv("ORACLEALGO_ENABLED", "true").lower() != "true":
@@ -703,8 +1095,8 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
 
     # --- 4H signal: set bias (and flatten an opposing position) ---
     if signal.signal_tf == "4h":
-        prev = pt.get_state(_ORACLE_BIAS_KEY)
-        pt.set_state(_ORACLE_BIAS_KEY, want_bias)
+        prev = _get_oracle_bias(ignore_ttl=True)
+        _set_oracle_bias(want_bias)
         if prev != want_bias:
             log.info(f"[OracleAlgo] 4H bias flip {prev or 'none'} → {want_bias.upper()}")
             existing = pt.find_open_by_symbol(signal.symbol, "OracleAlgo")
@@ -720,23 +1112,50 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
                                outcome=f"bias_{want_bias}")
         return
 
-    # --- 1H signal: entry if aligned with bias ---
-    bias = pt.get_state(_ORACLE_BIAS_KEY)
+    # --- 1H signal: entry if aligned with a fresh bias and confluence clears ---
+    bias = _get_oracle_bias()
+    entry_price = bf.get_market_price(signal.symbol)
+    confluence_on = int(os.getenv("ORACLE_CONFLUENCE_N", "1")) > 1
+    ok_conf, distinct = _oracle_confluence(signal)
+
+    def _shadow(decision):
+        _shadow_strategy(signal, entry_price, {"confluence_count": distinct, "decision": decision})
+
     if not bias:
-        log.info(f"[OracleAlgo] 1H {signal.side} but no 4H bias yet — waiting for a 4H signal")
+        log.info(f"[OracleAlgo] 1H {signal.side} but no fresh 4H bias — waiting for a 4H signal")
+        _shadow("no_bias")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_no_bias")
         return
     if bias != want_bias:
         log.info(f"[OracleAlgo] 1H {signal.side} counter to {bias.upper()} bias — skipping")
+        _shadow("counter_bias")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_counter_bias")
         return
-    if _find_existing(signal.symbol, "OracleAlgo"):
-        log.info(f"[OracleAlgo] {signal.symbol} already open — skipping")
+    if _find_existing(signal.symbol, "OracleAlgo") or _has_pending(signal.symbol, "oraclealgo"):
+        log.info(f"[OracleAlgo] {signal.symbol} already open/pending — skipping")
+        _shadow("already_open")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_already_open")
+        return
+    if confluence_on and not ok_conf:
+        log.info(f"[OracleAlgo] 1H {signal.side} confluence {distinct}/"
+                 f"{os.getenv('ORACLE_CONFLUENCE_N')} not met — waiting")
+        _shadow("low_confluence")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_low_confluence")
         return
 
     start, lo, hi, _step = _leverage_params()
     leverage = pt.get_analyst_leverage("OracleAlgo", start, lo, hi)
+
+    # Optional pullback-limit entry: wait for a better fill instead of market.
+    pullback_pct = float(os.getenv("ORACLE_PULLBACK_PCT", "0") or "0")
+    if pullback_pct > 0 and entry_price:
+        _shadow("pending_pullback")
+        _enqueue_pending(signal, "pullback", pullback_pct, leverage, "OracleAlgo",
+                         float(os.getenv("ORACLE_PULLBACK_WINDOW_MIN", "20")), entry_price)
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_pending_pullback")
+        return
+
+    _shadow("enter")
     log.info(f"[OracleAlgo] 1H {signal.side.upper()} aligned with {bias.upper()} bias — entering")
     _process_new(signal, pt.get_open_positions(), dry_run, leverage, "OracleAlgo")
 
@@ -770,14 +1189,59 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
                                    outcome="rsi_disabled")
             return
-        existing = _find_existing(signal.symbol, "RSI Extreme")
-        if existing:
+        if _find_existing(signal.symbol, "RSI Extreme"):
             log.info(f"[RSI] {signal.symbol} already open — skipping duplicate RSI entry")
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
                                    outcome="rsi_already_open")
             return
+        if _has_pending(signal.symbol, "rsi_extreme"):
+            log.info(f"[RSI] {signal.symbol} already awaiting confirmation — skipping")
+            _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
+                                   outcome="rsi_already_pending")
+            return
+
+        # Quality filters. They only BLOCK when their flag is on; otherwise the
+        # verdict is shadow-logged and the trade proceeds (measure-then-tune).
+        f_strength, f_chase, f_regime = _rsi_filter_verdicts(signal)
+        filters_on = os.getenv("RSI_FILTERS_ENABLED", "false").lower() == "true"
+        regime_on = os.getenv("RSI_REGIME_GATE", "false").lower() == "true"
+        confirm_on = os.getenv("RSI_CONFIRM_ENABLED", "false").lower() == "true"
+
+        block = None
+        if filters_on and f_strength is False:
+            block = "weak_rsi"
+        elif filters_on and f_chase is False:
+            block = "over_chased"
+        elif regime_on and f_regime is False:
+            block = "counter_regime"
+
+        entry_price = bf.get_market_price(signal.symbol)
+        decision = block or ("pending_confirm" if confirm_on else "enter")
+        _shadow_strategy(signal, entry_price,
+                         {"f_strength": f_strength, "f_chase": f_chase,
+                          "f_regime": f_regime, "decision": decision})
+
+        if block:
+            log.info(f"[RSI] {signal.symbol} {signal.side.upper()} blocked by filter: {block}")
+            _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
+                                   outcome=f"rsi_blocked:{block}")
+            return
+
         start, lo, hi, _step = _leverage_params()
         leverage = pt.get_analyst_leverage("RSI Extreme", start, lo, hi)
+
+        # Confirmation-on-turn: don't knife-catch — wait for price to start
+        # reverting before entering. Falls through to immediate entry if there's
+        # no live price to anchor the confirmation against.
+        if confirm_on and entry_price:
+            _enqueue_pending(signal, "revert",
+                             float(os.getenv("RSI_CONFIRM_REVERT_PCT", "0.005")),
+                             leverage, "RSI Extreme",
+                             float(os.getenv("RSI_CONFIRM_WINDOW_MIN", "30")), entry_price)
+            _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
+                                   outcome="rsi_pending_confirm")
+            return
+
         _process_new(signal, pt.get_open_positions(), dry_run, leverage, "RSI Extreme")
         return
 
@@ -876,12 +1340,20 @@ def _log_strategy_config():
              f"leverage start {os.getenv('LEVERAGE_START','75')}x "
              f"({os.getenv('LEVERAGE_MIN','50')}-{os.getenv('LEVERAGE_MAX','125')}x, "
              f"±{os.getenv('LEVERAGE_STEP','10')} by performance)")
+    def flag(v):  # filters default OFF (shadow-only)
+        return "ON " if os.getenv(v, "false").lower() == "true" else "shadow"
+    rsi_ladder = os.getenv("RSI_TP_PCTS", "") or os.getenv("RSI_TP_PCT", "0.10")
     log.info(f"  RSI Extreme [{on('RSI_EXTREME_ENABLED')}]: "
-             f"SL {float(os.getenv('RSI_SL_PCT','0.05'))*100:.0f}% / "
-             f"TP {float(os.getenv('RSI_TP_PCT','0.10'))*100:.0f}%")
+             f"SL {float(os.getenv('RSI_SL_PCT','0.05'))*100:.0f}% / TP ladder {rsi_ladder} | "
+             f"filters[{flag('RSI_FILTERS_ENABLED')}] regime[{flag('RSI_REGIME_GATE')}] "
+             f"confirm[{flag('RSI_CONFIRM_ENABLED')}]")
     log.info(f"  OracleAlgo  [{on('ORACLEALGO_ENABLED')}]: 4H bias + 1H entry | "
              f"SL {float(os.getenv('ORACLE_SL_PCT','0.015'))*100:.1f}% / "
-             f"TP ladder {os.getenv('ORACLE_TP_PCTS','0.02,0.04')}")
+             f"TP ladder {os.getenv('ORACLE_TP_PCTS','0.02,0.04')} | "
+             f"bias TTL {os.getenv('ORACLE_BIAS_TTL_HOURS','8')}h, "
+             f"confluence N={os.getenv('ORACLE_CONFLUENCE_N','1')}, "
+             f"pullback {float(os.getenv('ORACLE_PULLBACK_PCT','0') or '0')*100:.1f}%")
+    log.info(f"  Strategy shadow log [{on('STRATEGY_SHADOW_LOG')}] → strategy_shadow.csv")
     log.info(f"  Vision: model '{os.getenv('LOCAL_VISION_MODEL','(none)')}' | "
              f"max level deviation {float(os.getenv('VISION_MAX_DEVIATION_PCT','0.5'))*100:.0f}%")
 
@@ -967,6 +1439,9 @@ def main():
         "chrome_connected": False,
         "discord_tab": False,
         "last_signal_at": None,
+        "balance": None,
+        "equity": None,
+        "free_margin": None,
     }
     dashboard.start(bot_state, port=5050)
     log.info("Dashboard running at http://localhost:5050")
@@ -1001,6 +1476,8 @@ def main():
 
     # Subsystem health check (BloFin, LM Studio, Chrome/Discord).
     _startup_health_check(dry_run)
+    pt.prune_seen(5000)  # cap the seen-messages table so it can't grow unbounded
+    _refresh_account(bot_state)  # seed dashboard balance/equity/free-margin
     seen_ids = pt.get_seen_ids()
     log.info(f"Loaded {len(seen_ids)} previously-seen message IDs")
 
@@ -1019,6 +1496,8 @@ def main():
     # Reconcile open positions FIRST — settle/scale anything that moved while
     # the bot was offline, before processing any new inbox signals.
     _reconcile_on_startup(dry_run)
+    # Then (live only) align the DB with the exchange's actual positions.
+    _reconcile_with_exchange(dry_run)
 
     # Startup sweep — catch any messages that arrived while the bot was offline
     log.info("Running startup inbox sweep…")
@@ -1035,6 +1514,8 @@ def main():
 
     last_sweep = time.time()
     last_resolve = time.time()
+    last_recon = time.time()
+    recon_interval = float(os.getenv("EXCHANGE_RECON_MIN", "15")) * 60
 
     while True:
         try:
@@ -1060,18 +1541,28 @@ def main():
                 time.sleep(resolve_interval)
 
             # Fast cadence: mark-to-market PnL + TP/SL/scale-out off cached prices,
-            # plus arm any POI watch whose level price has reached.
+            # arm any POI watch whose level price has reached, and fill/expire any
+            # queued pending entries (RSI confirmation / Oracle pullback).
             if time.time() - last_resolve >= resolve_interval:
                 if price_stream:
                     watched = [w.symbol for w in pt.get_active_watches()]
-                    price_stream.ensure([p.symbol for p in pt.get_open_positions()] + watched)
+                    pending = [it["symbol"] for it in _load_pending()]
+                    price_stream.ensure([p.symbol for p in pt.get_open_positions()]
+                                        + watched + pending)
                 _resolve_open_positions(dry_run)
                 _check_watches()
+                _check_pending_entries(dry_run)
                 last_resolve = time.time()
+
+            # Periodic live reconciliation against the exchange (no-op in dry-run).
+            if not dry_run and time.time() - last_recon >= recon_interval:
+                _reconcile_with_exchange(dry_run)
+                last_recon = time.time()
 
             # Periodic sweep: re-inject observer + full inbox scan.
             if time.time() - last_sweep >= sweep_interval:
                 log.info("Periodic sweep: re-injecting observer and scanning inbox")
+                _refresh_account(bot_state)  # keep dashboard balance fresh
                 if listener:
                     listener.reinject()
                 sweep_msgs = dr.poll_inbox(seen_ids, server_filter)

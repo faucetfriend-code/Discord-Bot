@@ -78,7 +78,7 @@ def _read_positions() -> list[dict]:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         rows = con.execute(
             "SELECT symbol, side, entry, sl, tp, size, order_id, opened_at, "
-            "analyst, tps, tps_hit, last_price, unrealized_pnl "
+            "analyst, tps, tps_hit, last_price, unrealized_pnl, soft_stop "
             "FROM positions WHERE status='open' ORDER BY id DESC"
         ).fetchall()
         con.close()
@@ -92,9 +92,66 @@ def _read_positions() -> list[dict]:
                 "symbol": r[0], "side": r[1], "entry": r[2], "sl": r[3], "tp": r[4],
                 "size": r[5], "order_id": r[6], "opened_at": r[7], "analyst": r[8] or "",
                 "tps": tps, "tps_hit": r[10] or 0, "last_price": r[11] or 0,
-                "unrealized_pnl": r[12] or 0,
+                "unrealized_pnl": r[12] or 0, "soft_stop": bool(r[13]) if len(r) > 13 else False,
             })
         return out
+    except Exception:
+        return []
+
+
+def _read_trades(limit: int = 40) -> list[dict]:
+    """Most recent closed trades for the blotter, newest first."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT closed_at, symbol, side, analyst, entry, exit_price, size, "
+            "leverage, soft_stop, duration_s, reason, won, net_pnl, fees, funding "
+            "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        con.close()
+        keys = ("closed_at", "symbol", "side", "analyst", "entry", "exit_price", "size",
+                "leverage", "soft_stop", "duration_s", "reason", "won", "net_pnl",
+                "fees", "funding")
+        return [dict(zip(keys, r)) for r in rows]
+    except Exception:
+        return []
+
+
+def _read_equity_curve() -> list[float]:
+    """Running cumulative net PnL over all closed trades (oldest→newest)."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute("SELECT net_pnl FROM trades ORDER BY id ASC").fetchall()
+        con.close()
+        cum, out = 0.0, []
+        for (net,) in rows:
+            cum += (net or 0.0)
+            out.append(round(cum, 2))
+        return out
+    except Exception:
+        return []
+
+
+def _read_pending() -> list[dict]:
+    """Queued pending entries (RSI confirmation / Oracle pullback / resting limits)."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        row = con.execute("SELECT v FROM strategy_state WHERE k='pending_entries'").fetchone()
+        con.close()
+        items = json.loads(row[0]) if row and row[0] else []
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def _read_shadow(limit: int = 30) -> list[dict]:
+    """Tail of strategy_shadow.csv — the measure-then-tune filter verdicts."""
+    path = Path(__file__).parent / "strategy_shadow.csv"
+    try:
+        import csv
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return rows[-limit:][::-1]   # newest first
     except Exception:
         return []
 
@@ -184,13 +241,15 @@ def _read_roster() -> list[dict]:
     return roster
 
 
-def _read_signals(limit: int = 40) -> list[dict]:
-    """The most recent `limit` parsed signals with their outcomes."""
+def _read_signals(limit: int = 40, show_all: bool = False) -> list[dict]:
+    """The most recent `limit` parsed signals with their outcomes. By default the
+    `no_signal` chatter is hidden (it dominates the feed); show_all includes it."""
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        where = "" if show_all else "WHERE outcome != 'no_signal' "
         rows = con.execute(
             "SELECT ts, analyst, symbol, side, outcome, raw_text "
-            "FROM signals ORDER BY id DESC LIMIT ?", (limit,)
+            f"FROM signals {where}ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         con.close()
         return [
@@ -230,6 +289,10 @@ def api_status():
         "positions": _read_positions(),
         "analyst_stats": _read_analyst_stats(),
         "recent_signals": _read_signals(20),
+        "trades": _read_trades(40),
+        "equity_curve": _read_equity_curve(),
+        "pending": _read_pending(),
+        "shadow": _read_shadow(30),
     })
 
 
@@ -237,12 +300,17 @@ def api_status():
 def index():
     """Render the full dashboard page (self-contained HTML + CSS, no external assets)."""
     s        = _state
+    show_all = request.args.get("all") == "1"
     positions = _read_positions()
-    signals  = _read_signals(40)
+    signals  = _read_signals(40, show_all=show_all)
     analysts = _read_analyst_stats()
     roster   = _read_roster()
     watches  = _read_watches()
     state    = _read_strategy_state()
+    trades   = _read_trades(40)
+    equity   = _read_equity_curve()
+    pending  = _read_pending()
+    shadow   = _read_shadow(30)
     log_tail = _read_log_tail()
 
     mode_badge  = '<span class="badge dry">DRY RUN</span>' if s.get("dry_run") else '<span class="badge live">LIVE</span>'
@@ -293,7 +361,17 @@ def index():
     def _strat(env, default="true"):
         return ("on", "#3fb950") if os.getenv(env, default).lower() == "true" else ("off", "#8b949e")
 
-    bias = state.get("btc_oracle_bias", "")
+    def _flag(env):
+        """Filters default OFF (shadow-only) — green when enforced, grey when shadowing."""
+        return ("on", "#3fb950") if os.getenv(env, "false").lower() == "true" else ("shadow", "#8b949e")
+
+    # The OracleAlgo bias is stored as JSON ({"bias","ts"}) since the TTL change; tolerate
+    # the legacy bare-string form too.
+    bias_raw = state.get("btc_oracle_bias", "") or ""
+    try:
+        bias = json.loads(bias_raw).get("bias", "") if bias_raw.startswith("{") else bias_raw
+    except (ValueError, TypeError):
+        bias = bias_raw
     bias_html = ("—" if not bias else
                  f'<span class="buy">BULL</span>' if bias == "bull" else '<span class="sell">BEAR</span>')
 
@@ -305,11 +383,12 @@ def index():
             side_cls = "buy" if p["side"] == "buy" else "sell"
             n = len(p["tps"]) or 1
             prog = f"TP {p['tps_hit']}/{n}" if n > 1 else ("hit" if p["tps_hit"] else "open")
+            soft = ' <span class="tcard-tag" title="soft stop — triggers on a 1h candle close">SOFT</span>' if p.get("soft_stop") else ""
             html += f"""<tr>
               <td><b>{p['symbol']}</b><div class="small">{p['analyst']}</div></td>
               <td class="{side_cls}">{p['side'].upper()}</td>
               <td>{p['entry']}</td>
-              <td>{p['sl']}</td>
+              <td>{p['sl']}{soft}</td>
               <td class="small">{', '.join(str(t) for t in p['tps']) if p['tps'] else p['tp']}</td>
               <td>{p['size']}</td>
               <td>{p['last_price'] or '—'}</td>
@@ -317,6 +396,96 @@ def index():
               <td class="small">{prog}</td>
             </tr>"""
         return html
+
+    def _dur(secs):
+        secs = int(secs or 0)
+        if secs < 3600:
+            return f"{secs // 60}m"
+        if secs < 86400:
+            return f"{secs // 3600}h{(secs % 3600) // 60}m"
+        return f"{secs // 86400}d{(secs % 86400) // 3600}h"
+
+    def trade_rows():
+        if not trades:
+            return '<tr><td colspan="9" class="empty">No closed trades yet</td></tr>'
+        html = ""
+        for t in trades:
+            side_cls = "buy" if t["side"] == "buy" else "sell"
+            wl = '<span class="buy">WIN</span>' if t["won"] else '<span class="sell">LOSS</span>'
+            soft = ' <span class="tcard-tag">S</span>' if t.get("soft_stop") else ""
+            html += f"""<tr>
+              <td class="small">{(t['closed_at'] or '')[:19]}</td>
+              <td><b>{t['symbol']}</b><div class="small">{t['analyst']}</div></td>
+              <td class="{side_cls}">{t['side'].upper()}</td>
+              <td class="small">{t['entry']} → {t['exit_price']}</td>
+              <td class="small">{_dur(t['duration_s'])}</td>
+              <td class="small">{t['reason']}{soft}</td>
+              <td>{wl}</td>
+              <td class="small">{t['leverage']}x</td>
+              <td>{_pnl_html(t['net_pnl'])}</td>
+            </tr>"""
+        return html
+
+    def pending_rows():
+        if not pending:
+            return '<tr><td colspan="5" class="empty">No pending entries</td></tr>'
+        html = ""
+        for it in pending:
+            side_cls = "buy" if it.get("side") == "buy" else "sell"
+            cond = it.get("condition", "")
+            src = it.get("analyst_key") or it.get("source") or "—"
+            html += f"""<tr>
+              <td><b>{it.get('symbol','')}</b><div class="small">{src}</div></td>
+              <td class="{side_cls}">{(it.get('side') or '').upper()}</td>
+              <td>{cond}</td>
+              <td>{it.get('ref_price','')}</td>
+              <td class="small mono">{_elapsed(it.get('created_at'))}</td>
+            </tr>"""
+        return html
+
+    def shadow_rows():
+        if not shadow:
+            return '<tr><td colspan="8" class="empty">No strategy signals logged yet</td></tr>'
+        html = ""
+        for r in shadow:
+            dec = r.get("decision", "")
+            cls = "outcome-ok" if dec in ("enter",) else \
+                  "outcome-err" if dec.startswith("block") or "counter" in dec else "outcome-info"
+            html += f"""<tr>
+              <td class="small">{(r.get('ts') or '')[11:19]}</td>
+              <td><b>{r.get('symbol','')}</b></td>
+              <td>{(r.get('side') or '').upper()}</td>
+              <td class="small">{r.get('rsi_value','') or r.get('oracle_type','')}</td>
+              <td class="small">{r.get('change_24h','')}</td>
+              <td class="small">{r.get('btc_bias','') or '—'}</td>
+              <td class="small">s:{r.get('f_strength','')} c:{r.get('f_chase','')} r:{r.get('f_regime','')}</td>
+              <td class="{cls}">{dec}</td>
+            </tr>"""
+        return html
+
+    def equity_svg():
+        if len(equity) < 2:
+            return '<div class="small" style="padding:14px;">Need at least 2 closed trades to chart.</div>'
+        w, h, pad = 720, 120, 8
+        lo, hi = min(equity), max(equity)
+        rng = (hi - lo) or 1
+        n = len(equity)
+        pts = []
+        for i, v in enumerate(equity):
+            x = pad + i * (w - 2 * pad) / (n - 1)
+            y = h - pad - (v - lo) / rng * (h - 2 * pad)
+            pts.append(f"{x:.1f},{y:.1f}")
+        last = equity[-1]
+        colour = "#3fb950" if last >= 0 else "#f85149"
+        zero_y = h - pad - (0 - lo) / rng * (h - 2 * pad) if lo <= 0 <= hi else None
+        zero_line = (f'<line x1="{pad}" y1="{zero_y:.1f}" x2="{w-pad}" y2="{zero_y:.1f}" '
+                     'stroke="#30363d" stroke-dasharray="3,3"/>') if zero_y is not None else ""
+        return (f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" '
+                f'style="width:100%;height:{h}px;">{zero_line}'
+                f'<polyline fill="none" stroke="{colour}" stroke-width="2" points="{" ".join(pts)}"/>'
+                f'</svg><div class="small" style="padding:0 14px 12px;">Cumulative net PnL: '
+                f'<span class="{"buy" if last>=0 else "sell"}">${last:+,.2f}</span> '
+                f'over {n} trades</div>')
 
     def watch_rows():
         if not watches:
@@ -434,6 +603,14 @@ def index():
     .log-box .ERR  {{ color: #f85149; }}
     .log-box .WARN {{ color: #d29922; }}
     .log-box .INFO {{ color: #58a6ff; }}
+    /* Mobile: let wide tables scroll horizontally instead of overflowing the page. */
+    @media (max-width: 760px) {{
+      .container {{ padding: 12px; gap: 14px; }}
+      .header {{ padding: 12px 14px; gap: 10px; flex-wrap: wrap; }}
+      .status-bar {{ gap: 16px; padding: 10px 12px; }}
+      table {{ display: block; overflow-x: auto; white-space: nowrap; }}
+      .updated {{ width: 100%; margin-left: 0; }}
+    }}
   </style>
 </head>
 <body>
@@ -454,17 +631,22 @@ def index():
       <div class="stat"><span class="label">Last Signal</span><span class="value">{_elapsed(s.get('last_signal_at'))}</span></div>
       <div class="stat"><span class="label">Chrome</span><span class="value">{chrome_icon}</span></div>
       <div class="stat"><span class="label">Discord Tab</span><span class="value">{discord_icon}</span></div>
+      <div class="stat"><span class="label">Balance</span><span class="value">{f"${s['balance']:,.2f}" if s.get('balance') is not None else '—'}</span></div>
+      <div class="stat"><span class="label">Equity</span><span class="value">{f"${s['equity']:,.2f}" if s.get('equity') is not None else '—'}</span></div>
+      <div class="stat"><span class="label">Free Margin</span><span class="value">{f"${s['free_margin']:,.2f}" if s.get('free_margin') is not None else '—'}</span></div>
       <div class="stat"><span class="label">Realized PnL</span><span class="value">{_pnl_html(total_realized)}</span></div>
       <div class="stat"><span class="label">Unrealized PnL</span><span class="value">{_pnl_html(total_unreal)}</span></div>
     </div>
 
     <div class="status-bar">
       <div class="stat"><span class="label">RSI Extreme</span><span class="value" style="color:{_strat('RSI_EXTREME_ENABLED')[1]}">{_strat('RSI_EXTREME_ENABLED')[0]}</span></div>
+      <div class="stat"><span class="label">RSI Filters</span><span class="value" style="color:{_flag('RSI_FILTERS_ENABLED')[1]}">{_flag('RSI_FILTERS_ENABLED')[0]}</span></div>
+      <div class="stat"><span class="label">RSI Confirm</span><span class="value" style="color:{_flag('RSI_CONFIRM_ENABLED')[1]}">{_flag('RSI_CONFIRM_ENABLED')[0]}</span></div>
       <div class="stat"><span class="label">OracleAlgo</span><span class="value" style="color:{_strat('ORACLEALGO_ENABLED')[1]}">{_strat('ORACLEALGO_ENABLED')[0]}</span></div>
+      <div class="stat"><span class="label">Oracle Confluence</span><span class="value">N={os.getenv('ORACLE_CONFLUENCE_N','1')}</span></div>
       <div class="stat"><span class="label">BTC 4H Bias</span><span class="value">{bias_html}</span></div>
       <div class="stat"><span class="label">Risk / Trade</span><span class="value">{float(os.getenv('RISK_PCT','0.01'))*100:.1f}%</span></div>
-      <div class="stat"><span class="label">Max Positions</span><span class="value">{os.getenv('MAX_OPEN_POSITIONS','3')}</span></div>
-      <div class="stat"><span class="label">Vision Model</span><span class="value small">{os.getenv('LOCAL_VISION_MODEL','(none)')}</span></div>
+      <div class="stat"><span class="label">Shadow Log</span><span class="value" style="color:{_strat('STRATEGY_SHADOW_LOG')[1]}">{_strat('STRATEGY_SHADOW_LOG')[0]}</span></div>
     </div>
 
     <div class="card">
@@ -472,6 +654,27 @@ def index():
       <table>
         <thead><tr><th>Symbol / Strategy</th><th>Side</th><th>Entry</th><th>SL</th><th>TPs</th><th>Size</th><th>Last</th><th>Unreal. PnL</th><th>Progress</th></tr></thead>
         <tbody>{pos_rows()}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Equity Curve — Cumulative Net PnL</div>
+      {equity_svg()}
+    </div>
+
+    <div class="card">
+      <div class="card-title">Closed Trades ({len(trades)})</div>
+      <table>
+        <thead><tr><th>Closed</th><th>Symbol / Source</th><th>Side</th><th>Entry → Exit</th><th>Held</th><th>Reason</th><th>W/L</th><th>Lev</th><th>Net&nbsp;PnL</th></tr></thead>
+        <tbody>{trade_rows()}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Pending Entries ({len(pending)})</div>
+      <table>
+        <thead><tr><th>Symbol / Source</th><th>Side</th><th>Condition</th><th>Ref Price</th><th>Age</th></tr></thead>
+        <tbody>{pending_rows()}</tbody>
       </table>
     </div>
 
@@ -492,7 +695,15 @@ def index():
     </div>
 
     <div class="card">
-      <div class="card-title">Recent Signals (last 40)</div>
+      <div class="card-title">Strategy Shadow Log — filter what-ifs ({len(shadow)})</div>
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>RSI/Type</th><th>24h</th><th>Bias</th><th>Filters (s/c/r)</th><th>Decision</th></tr></thead>
+        <tbody>{shadow_rows()}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Recent Signals (last 40){' — all' if show_all else ''} &nbsp;<a href="{'?' if show_all else '?all=1'}" class="small">[{'hide chatter' if show_all else 'show all'}]</a></div>
       <table>
         <thead><tr><th>Time</th><th>Analyst</th><th>Symbol</th><th>Side</th><th>Outcome</th><th>Message</th></tr></thead>
         <tbody>{sig_rows()}</tbody>

@@ -56,6 +56,10 @@ class Position:
     orig_size: float = 0.0   # original size at open (for computing scale-out chunks)
     last_price: float = 0.0  # most recent market price seen (for unrealized PnL)
     unrealized_pnl: float = 0.0  # mark-to-market PnL on the remaining size, in USDT
+    soft_stop: bool = False  # SL triggers only on a candle CLOSE beyond it, not a wick
+    realized_pnl: float = 0.0  # net PnL banked on already-closed slices of this position
+    fees_accum: float = 0.0  # trading fees banked on those closed slices
+    leverage: int = 0        # leverage applied at open (for the trade record)
     id: Optional[int] = None
 
 
@@ -95,9 +99,44 @@ def init_db():
         con.execute("ALTER TABLE positions ADD COLUMN last_price REAL DEFAULT 0")
     if "unrealized_pnl" not in cols:
         con.execute("ALTER TABLE positions ADD COLUMN unrealized_pnl REAL DEFAULT 0")
+    if "soft_stop" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN soft_stop INTEGER DEFAULT 0")
+    # realized_pnl: net PnL accumulated across this position's closed slices (USDT).
+    # fees_accum:   trading fees accumulated across those slices (USDT).
+    if "realized_pnl" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN realized_pnl REAL DEFAULT 0")
+    if "fees_accum" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN fees_accum REAL DEFAULT 0")
+    if "leverage" not in cols:
+        con.execute("ALTER TABLE positions ADD COLUMN leverage INTEGER DEFAULT 0")
     con.execute("""
         CREATE TABLE IF NOT EXISTS seen_messages (
             msg_id TEXT PRIMARY KEY
+        )
+    """)
+    # One row per fully-closed position — the durable trade blotter / equity-curve
+    # source. gross_pnl = price PnL before costs; net_pnl = gross − fees − funding.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol      TEXT,
+            side        TEXT,
+            analyst     TEXT,
+            entry       REAL,
+            exit_price  REAL,
+            size        REAL,
+            leverage    INTEGER,
+            soft_stop   INTEGER DEFAULT 0,
+            opened_at   TEXT,
+            closed_at   TEXT,
+            duration_s  INTEGER,
+            reason      TEXT,
+            won         INTEGER,
+            gross_pnl   REAL,
+            fees        REAL,
+            funding     REAL,
+            net_pnl     REAL,
+            dry_run     INTEGER DEFAULT 1
         )
     """)
     # Adaptive per-analyst leverage, adjusted by realised trade outcomes.
@@ -176,11 +215,11 @@ def open_position(pos: Position) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.execute("""
         INSERT INTO positions (symbol, side, entry, sl, tp, size, order_id, opened_at,
-                               status, analyst, tps, tps_hit, orig_size)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               status, analyst, tps, tps_hit, orig_size, soft_stop, leverage)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (pos.symbol, pos.side, pos.entry, pos.sl, pos.tp,
           pos.size, pos.order_id, pos.opened_at, pos.status, pos.analyst,
-          tps_json, pos.tps_hit, orig))
+          tps_json, pos.tps_hit, orig, 1 if pos.soft_stop else 0, pos.leverage or 0))
     row_id = cur.lastrowid
     con.commit()
     con.close()
@@ -198,12 +237,78 @@ def apply_partial(order_id: str, remaining_size: float, new_sl: float, tps_hit: 
     con.close()
 
 
+def accumulate_costs(order_id: str, pnl_delta: float, fee_delta: float):
+    """Add a just-closed slice's net PnL and fee onto a position's running totals,
+    so the final trade record reflects every scale-out leg, not just the last."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE positions SET realized_pnl = COALESCE(realized_pnl,0) + ?, "
+        "fees_accum = COALESCE(fees_accum,0) + ? WHERE order_id=?",
+        (pnl_delta, fee_delta, order_id),
+    )
+    con.commit()
+    con.close()
+
+
 def close_position(order_id: str):
     """Mark a position closed (status='closed') by its order id."""
     con = sqlite3.connect(DB_PATH)
     con.execute("UPDATE positions SET status='closed' WHERE order_id=?", (order_id,))
     con.commit()
     con.close()
+
+
+# ---------------------------------------------------------------------------
+# Trade blotter — one durable row per fully-closed position
+# ---------------------------------------------------------------------------
+
+def record_trade(*, symbol, side, analyst, entry, exit_price, size, leverage,
+                 soft_stop, opened_at, closed_at, duration_s, reason, won,
+                 gross_pnl, fees, funding, net_pnl, dry_run) -> int:
+    """Insert one closed-trade row; returns its id."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute("""
+        INSERT INTO trades (symbol, side, analyst, entry, exit_price, size, leverage,
+                            soft_stop, opened_at, closed_at, duration_s, reason, won,
+                            gross_pnl, fees, funding, net_pnl, dry_run)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (symbol, side, analyst, entry, exit_price, size, int(leverage or 0),
+          1 if soft_stop else 0, opened_at, closed_at, duration_s, reason,
+          1 if won else 0, gross_pnl, fees, funding, net_pnl, 1 if dry_run else 0))
+    row_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return row_id
+
+
+def get_trades(limit: int = 50) -> list[dict]:
+    """Most recent closed trades, newest first (for the dashboard blotter)."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT symbol, side, analyst, entry, exit_price, size, leverage, soft_stop, "
+        "opened_at, closed_at, duration_s, reason, won, gross_pnl, fees, funding, net_pnl "
+        "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    con.close()
+    keys = ("symbol", "side", "analyst", "entry", "exit_price", "size", "leverage",
+            "soft_stop", "opened_at", "closed_at", "duration_s", "reason", "won",
+            "gross_pnl", "fees", "funding", "net_pnl")
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def get_trade_stats() -> list[dict]:
+    """Closed trades oldest→newest with a running cumulative net PnL — the
+    equity-curve series for the dashboard."""
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT closed_at, net_pnl FROM trades ORDER BY id ASC"
+    ).fetchall()
+    con.close()
+    out, cum = [], 0.0
+    for closed_at, net in rows:
+        cum += (net or 0.0)
+        out.append({"closed_at": closed_at, "net_pnl": net or 0.0, "cumulative": cum})
+    return out
 
 
 def _parse_tps(raw) -> list:
@@ -222,7 +327,8 @@ def get_open_positions() -> list[Position]:
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
         "SELECT id, symbol, side, entry, sl, tp, size, order_id, opened_at, status, "
-        "analyst, tps, tps_hit, orig_size, last_price, unrealized_pnl "
+        "analyst, tps, tps_hit, orig_size, last_price, unrealized_pnl, soft_stop, "
+        "realized_pnl, fees_accum, leverage "
         "FROM positions WHERE status='open'"
     ).fetchall()
     con.close()
@@ -231,7 +337,10 @@ def get_open_positions() -> list[Position]:
                  tp=r[5], size=r[6], order_id=r[7], opened_at=r[8], status=r[9],
                  analyst=r[10] or "", tps=_parse_tps(r[11]),
                  tps_hit=r[12] or 0, orig_size=r[13] or r[6],
-                 last_price=r[14] or 0.0, unrealized_pnl=r[15] or 0.0)
+                 last_price=r[14] or 0.0, unrealized_pnl=r[15] or 0.0,
+                 soft_stop=bool(r[16]) if len(r) > 16 else False,
+                 realized_pnl=r[17] or 0.0, fees_accum=r[18] or 0.0,
+                 leverage=r[19] or 0)
         for r in rows
     ]
 
@@ -322,6 +431,19 @@ def get_seen_ids() -> set[str]:
     rows = con.execute("SELECT msg_id FROM seen_messages").fetchall()
     con.close()
     return {r[0] for r in rows}
+
+
+def prune_seen(keep: int = 5000):
+    """Cap the seen-messages table at the `keep` most recent rows so it can't grow
+    without bound. (rowid is monotonic, so highest rowids = most recently inserted.)"""
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "DELETE FROM seen_messages WHERE rowid NOT IN "
+        "(SELECT rowid FROM seen_messages ORDER BY rowid DESC LIMIT ?)",
+        (keep,),
+    )
+    con.commit()
+    con.close()
 
 
 # ---------------------------------------------------------------------------
