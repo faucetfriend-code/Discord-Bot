@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Analyst Signals — Unity Oracle Aggregator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+  <style>
+    @import url('https://fonts.cdnfonts.com/css/cabinet-grotesk');
+  </style>
+</head>
+<body class="bg-gradient">
+  <nav class="nav-bar">
+    <div class="logo">
+      <span class="accent-dot"></span>
+      Unity Oracle
+      <div class="glass logo-dropdown" id="logoDropdown">
+        <a href="profile.html" class="dd-item">
+          <div class="dd-icon" style="background:linear-gradient(135deg,#5865F2,#7289da);color:#fff;">●</div>
+          Profile
+        </a>
+        <a href="settings.html" class="dd-item">
+          <div class="dd-icon" style="background:rgba(255,255,255,0.08);color:var(--fg-2);">⚙</div>
+          Settings
+        </a>
+      </div>
+    </div>
+    <div class="nav-actions">
+      <a href="index.html" style="display:flex;">
+        <button class="icon-btn" title="All screens">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+      </a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <div class="analyst-header">
+      <h2>Analyst Signals</h2>
+      <div class="analyst-filters">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="buy">Buy</button>
+        <button class="filter-btn" data-filter="sell">Sell</button>
+        <button class="filter-btn" data-filter="hold">Hold</button>
+      </div>
+    </div>
+
+    <!-- Summary stats -->
+    <div class="grid-4" style="margin-bottom:var(--space-6);">
+      <div class="glass-sm stat-card">
+        <div class="stat-label">Signals Active</div>
+        <div class="stat-value" style="font-size:var(--text-xl);">30</div>
+        <div class="stat-change up">+6 today</div>
+      </div>
+      <div class="glass-sm stat-card">
+        <div class="stat-label">Analysts Tracked</div>
+        <div class="stat-value" style="font-size:var(--text-xl);">13</div>
+        <div class="stat-change up"><span style="color:var(--muted);font-weight:400;">+3 auto sources</span></div>
+      </div>
+      <div class="glass-sm stat-card">
+        <div class="stat-label">High Conviction</div>
+        <div class="stat-value" style="font-size:var(--text-xl);">8</div>
+        <div class="stat-change up">Active signals</div>
+      </div>
+      <div class="glass-sm stat-card">
+        <div class="stat-label">Market Sentiment</div>
+        <div class="stat-value" style="font-size:var(--text-xl);color:var(--positive);">Bullish</div>
+        <div class="stat-change">62% positive</div>
+      </div>
+    </div>
+
+    <!-- Analyst grid (11 analysts + 3 automated) -->
+    <div class="section-header">
+      <h3 style="font-family:var(--font-display);font-size:var(--text-lg);font-weight:700;">Analysts & Sources</h3>
+      <span style="font-size:var(--text-xs);color:var(--muted);">Click to filter by source</span>
+    </div>
+    <div class="analyst-grid" id="analystGrid"></div>
+
+    <!-- Coin detail header (shown when ?token=X) -->
+    <div class="glass coin-header" id="coinHeader" style="display:none;"></div>
+
+    <!-- Signal cards -->
+    <div class="section-header">
+      <h3 style="font-family:var(--font-display);font-size:var(--text-lg);font-weight:700;">Signal Feed</h3>
+      <span class="badge badge-accent" id="signalCount">30 signals</span>
+    </div>
+    <div id="signalContainer"></div>
+  </main>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

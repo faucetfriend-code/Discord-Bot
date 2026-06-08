@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings — Unity Oracle Aggregator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+  <style>
+    @import url('https://fonts.cdnfonts.com/css/cabinet-grotesk');
+    .settings-group { padding: var(--space-5); margin-bottom: var(--space-4); }
+    .settings-group h3 { font-family: var(--font-display); font-size: var(--text-lg); font-weight: 700; margin-bottom: var(--space-5); }
+    .setting-row { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .setting-row:last-child { border-bottom: none; }
+    .setting-row .setting-info .title { font-size: var(--text-base); font-weight: 500; }
+    .setting-row .setting-info .desc { font-size: var(--text-sm); color: var(--muted); margin-top: 2px; }
+    .currency-select { padding: 8px 16px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-glass); border-radius: var(--radius-pill); color: var(--fg); font-size: var(--text-sm); min-height: 40px; }
+    .currency-select:focus { outline: none; border-color: var(--accent); }
+    .upload-area { padding: var(--space-8); text-align: center; border: 1px dashed var(--border-glass); border-radius: var(--radius-md); cursor: pointer; transition: border-color var(--motion-fast); }
+    .upload-area:hover { border-color: var(--accent); }
+    .upload-area .icon { font-size: var(--text-3xl); margin-bottom: var(--space-3); }
+    .danger-zone { border: 1px solid oklch(0.50 0.22 25 / 0.3); }
+    @media (max-width: 767px) { .setting-row { flex-direction: column; align-items: flex-start; gap: var(--space-3); } }
+  </style>
+</head>
+<body class="bg-gradient">
+  <nav class="nav-bar">
+    <div class="logo">
+      <span class="accent-dot"></span>
+      Unity Oracle
+      <div class="glass logo-dropdown" id="logoDropdown">
+        <a href="profile.html" class="dd-item">
+          <div class="dd-icon" style="background:linear-gradient(135deg,#5865F2,#7289da);color:#fff;">●</div>
+          Profile
+        </a>
+        <a href="index.html" class="dd-item">
+          <div class="dd-icon" style="background:linear-gradient(135deg,#ff6b35,#dc3545);color:#fff;">◉</div>
+          All Screens
+        </a>
+      </div>
+    </div>
+    <div class="nav-actions">
+      <a href="index.html" style="display:flex;">
+        <button class="icon-btn" title="All screens">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+      </a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <div class="section-header">
+      <h2>Settings</h2>
+      <span style="font-size:var(--text-sm);color:var(--muted);">Preferences are saved locally</span>
+    </div>
+
+    <!-- Notifications -->
+    <div class="glass settings-group">
+      <h3>Notifications</h3>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Price Alerts</div>
+          <div class="desc">Push notifications when assets hit your target prices</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="notifPrice" checked /><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Position Liquidation Warning</div>
+          <div class="desc">Alert when a position approaches liquidation price</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="notifLiq" checked /><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Market Anomalies</div>
+          <div class="desc">On-chain volume spikes and whale movement alerts</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="notifAnomaly" checked /><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Daily Digest</div>
+          <div class="desc">Daily summary of portfolio performance and market moves</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="notifDigest" /><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Email Reports</div>
+          <div class="desc">Weekly PDF report of positions and analytics</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="notifEmail" /><span class="track"></span></label>
+      </div>
+    </div>
+
+    <!-- Preferences -->
+    <div class="glass settings-group">
+      <h3>Preferences</h3>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Display Currency</div>
+          <div class="desc">Default currency for portfolio and market values</div>
+        </div>
+        <select class="currency-select" id="currency">
+          <option value="USD">USD ($)</option>
+          <option value="EUR">EUR (€)</option>
+          <option value="GBP">GBP (£)</option>
+          <option value="JPY">JPY (¥)</option>
+          <option value="USDT">USDT</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Default Leverage</div>
+          <div class="desc">Leverage applied to new positions</div>
+        </div>
+        <select class="currency-select" id="leverage">
+          <option value="1">1x</option>
+          <option value="2" selected>2x</option>
+          <option value="3">3x</option>
+          <option value="5">5x</option>
+          <option value="10">10x</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Preferred Oracle</div>
+          <div class="desc">Default price feed source for new positions</div>
+        </div>
+        <select class="currency-select" id="oracle">
+          <option value="chainlink" selected>Chainlink</option>
+          <option value="pyth">Pyth</option>
+          <option value="cryptocompare">CryptoCompare</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Dark Mode</div>
+          <div class="desc">Toggle dark/light theme</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="darkMode" checked disabled /><span class="track"></span></label>
+      </div>
+    </div>
+
+    <!-- Profile upload -->
+    <div class="glass settings-group">
+      <h3>Profile & Data</h3>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Profile Picture</div>
+          <div class="desc">Upload a new avatar image</div>
+        </div>
+        <button class="btn btn-ghost btn-sm">Upload</button>
+      </div>
+      <button class="btn btn-primary btn-sm" id="importPortfolioBtn" style="margin-top:var(--space-3);">Import CSV / JSON</button>
+      <div style="font-size:var(--text-xs);color:var(--muted);margin-top:var(--space-2);">Supports CoinTracker, Koinly, and CSV/JSON exports</div>
+    </div>
+
+    <!-- Danger zone -->
+    <div class="glass settings-group danger-zone">
+      <h3 style="color:var(--negative);">Danger Zone</h3>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Export All Data</div>
+          <div class="desc">Download your positions, watchlist, and settings</div>
+        </div>
+        <button class="btn btn-ghost btn-sm">Export</button>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Clear All Settings</div>
+          <div class="desc">Reset all preferences to default values</div>
+        </div>
+        <button class="btn btn-primary btn-sm" style="background:var(--negative);box-shadow:0 4px 16px oklch(0.50 0.22 25 / 0.3);">Reset</button>
+      </div>
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="title">Delete Account</div>
+          <div class="desc">Permanently delete your account and all data</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" style="color:var(--negative);border-color:var(--negative);">Delete</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Portfolio Import Modal -->
+  <div class="import-overlay" id="importOverlay">
+    <div class="glass import-modal">
+      <div class="section-header">
+        <h3 style="font-family:var(--font-display);font-size:var(--text-lg);font-weight:700;">Import Portfolio</h3>
+        <button class="btn btn-ghost btn-sm" id="importCloseBtn" style="color:var(--muted);font-size:var(--text-lg);padding:4px 8px;">✕</button>
+      </div>
+      <div class="import-tabs">
+        <button class="it active">CSV</button>
+        <button class="it">JSON</button>
+        <button class="it">Paste</button>
+      </div>
+      <div class="import-drop" id="mockImportBtn">
+        <div class="id-icon" style="color:var(--muted);">⇧</div>
+        <div style="color:var(--muted);font-size:var(--text-sm);">Drop your CSV/JSON file here or click to browse</div>
+        <div style="font-size:var(--text-xs);color:var(--muted);margin-top:var(--space-2);">Or click to load sample data</div>
+      </div>
+      <div class="import-preview"></div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

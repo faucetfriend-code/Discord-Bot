@@ -24,11 +24,15 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request
+from flask import (Flask, Response, jsonify, redirect, request,
+                   send_from_directory)
 
-DB_PATH   = Path(__file__).parent / "bot.db"
-LOG_PATH  = Path(__file__).parent / "bot.log"
-LOG_LINES = 80
+DB_PATH    = Path(__file__).parent / "bot.db"
+LOG_PATH   = Path(__file__).parent / "bot.log"
+# Static mobile UI bundle (Unity Oracle prototype) served at /mobile.
+# Override with MOBILE_UI_DIR to point at a different build directory.
+MOBILE_DIR = Path(os.getenv("MOBILE_UI_DIR", str(Path(__file__).parent / "mobile")))
+LOG_LINES  = 80
 
 app = Flask(__name__)
 _state: dict = {}
@@ -45,6 +49,12 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 @app.before_request
 def _require_auth():
+    # The Oracle Aggregator JSON API (/api/oracle/*) authenticates with its own
+    # bearer token (see _require_oracle_token), so skip Basic auth for those paths.
+    # The /mobile prototype is intentionally open (no auth yet) — it's a static UI
+    # with no secrets; revisit before wiring it to live/authenticated data.
+    if request.path.startswith("/api/oracle/") or request.path.startswith("/mobile"):
+        return
     password = os.getenv("DASHBOARD_PASSWORD", "").strip()
     if not password:
         return  # auth disabled
@@ -57,6 +67,114 @@ def _require_auth():
             "Authentication required", 401,
             {"WWW-Authenticate": 'Basic realm="Discord Signal Bot"'},
         )
+
+
+# ---------------------------------------------------------------------------
+# Oracle Aggregator JSON API — read-only feeds consumed by the
+# unity-oracle-aggregator Next.js app. Gated by a shared bearer token
+# (ORACLE_API_TOKEN). Fails closed: if the token isn't set, the API is off.
+# ---------------------------------------------------------------------------
+
+def _require_oracle_token() -> Response | None:
+    """Return a 401/503 Response if the request is not a valid Oracle API call,
+    else None to allow it. Accepts `Authorization: Bearer <token>` or `?token=`."""
+    expected = os.getenv("ORACLE_API_TOKEN", "").strip()
+    if not expected:
+        # Fail closed — never expose trade data without an explicitly set token.
+        return Response(
+            json.dumps({"success": False, "error": "Oracle API disabled (ORACLE_API_TOKEN unset)"}),
+            503, content_type="application/json",
+        )
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else request.args.get("token", "")
+    if not (token and hmac.compare_digest(token, expected)):
+        return Response(
+            json.dumps({"success": False, "error": "Unauthorized"}),
+            401, content_type="application/json",
+        )
+    return None
+
+
+def _oracle_json(payload: dict) -> Response:
+    """Wrap a payload in the Oracle's standard envelope with a server timestamp."""
+    payload.setdefault("success", True)
+    payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+    return jsonify(payload)
+
+
+@app.route("/api/oracle/signals")
+def api_oracle_signals():
+    """Recent parsed analyst/OracleAlgo signals → powers the Oracle Alerts feed."""
+    guard = _require_oracle_token()
+    if guard:
+        return guard
+    limit = min(int(request.args.get("limit", 50) or 50), 200)
+    show_all = request.args.get("all") == "1"
+    return _oracle_json({"data": _read_signals(limit, show_all=show_all)})
+
+
+@app.route("/api/oracle/positions")
+def api_oracle_positions():
+    """Open positions with mark-to-market PnL."""
+    guard = _require_oracle_token()
+    if guard:
+        return guard
+    return _oracle_json({"data": _read_positions()})
+
+
+@app.route("/api/oracle/trades")
+def api_oracle_trades():
+    """Closed-trade blotter, newest first."""
+    guard = _require_oracle_token()
+    if guard:
+        return guard
+    limit = min(int(request.args.get("limit", 100) or 100), 500)
+    return _oracle_json({"data": _read_trades(limit), "equity_curve": _read_equity_curve()})
+
+
+@app.route("/api/oracle/analyst-stats")
+def api_oracle_analyst_stats():
+    """Per-analyst win/loss tally and realized PnL (the leaderboard)."""
+    guard = _require_oracle_token()
+    if guard:
+        return guard
+    return _oracle_json({"data": _read_analyst_stats(), "roster": _read_roster()})
+
+
+@app.route("/api/oracle/watchlist")
+def api_oracle_watchlist():
+    """Active POI watches (watching / armed)."""
+    guard = _require_oracle_token()
+    if guard:
+        return guard
+    return _oracle_json({"data": _read_watches()})
+
+
+@app.route("/api/oracle/funding")
+def api_oracle_funding():
+    """Live BloFin funding rate(s). `?symbol=BTC-USDT` for one, or comma-separated.
+    Defaults to the symbols of currently open positions if none given."""
+    guard = _require_oracle_token()
+    if guard:
+        return guard
+    raw = request.args.get("symbol", "").strip()
+    if raw:
+        symbols = [s.strip() for s in raw.split(",") if s.strip()]
+    else:
+        symbols = sorted({p["symbol"] for p in _read_positions()})
+    out = []
+    try:
+        import blofin_client  # lazy: avoid coupling dashboard import to the exchange client
+        for sym in symbols[:25]:
+            try:
+                rate = blofin_client.get_funding_rate(sym)
+            except Exception:
+                rate = None
+            if rate is not None:
+                out.append({"symbol": sym, "rate": rate})
+    except Exception as e:
+        return _oracle_json({"success": False, "error": f"funding unavailable: {e}", "data": []})
+    return _oracle_json({"data": out})
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +412,26 @@ def api_status():
         "pending": _read_pending(),
         "shadow": _read_shadow(30),
     })
+
+
+@app.route("/mobile")
+def mobile_root():
+    """Redirect to the trailing-slash form so the page's relative asset paths
+    (css/app.css, js/app.js, *.html links) resolve under /mobile/."""
+    return redirect("/mobile/", code=308)
+
+
+@app.route("/mobile/")
+def mobile_index():
+    """Serve the Unity Oracle mobile/responsive UI landing page."""
+    return send_from_directory(MOBILE_DIR, "index.html")
+
+
+@app.route("/mobile/<path:filename>")
+def mobile_asset(filename: str):
+    """Serve any file in the mobile UI bundle (pages, css/, js/, images).
+    send_from_directory blocks path traversal outside MOBILE_DIR."""
+    return send_from_directory(MOBILE_DIR, filename)
 
 
 @app.route("/")

@@ -177,6 +177,8 @@ _SYMBOL_BLOCKLIST = frozenset({
     'LIMIT', 'REACHED', 'PRICE', 'CURRENT', 'FILLED', 'FILLING', 'ORDER',
     'AVERAGE', 'AVG', 'DCA', 'CMP', 'REQUIRED', 'LATER', 'PROFIT', 'PROFITS',
     'NOTES', 'HARD', 'LEVERAGE', 'TAKEN', 'ENTRIES', 'BEING', 'WHITE',
+    # freeform-note words (e.g. "Market long BLESS … 4H close under X for stops")
+    'MARKET', 'CLOSE', 'EXIT', 'STOPS', 'CHART', 'PLAY', 'WEEKEND',
     # quote currencies — never the traded symbol itself (e.g. "H/USDT" -> "USDT")
     'USDT', 'USDC', 'USD',
 })
@@ -336,7 +338,14 @@ def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
         gd = m.groupdict()
         side_raw = gd["side"].lower()
         side = "buy" if side_raw in ("buy", "long") else "sell"
-        symbol = _normalise_symbol(gd["sym"])
+        # The pattern can grab a leading prose word as the "ticker" (e.g.
+        # "Close long SOL …" → "CLOSE"). If so, fall back to a blocklist-aware
+        # scan of the whole message for the real all-caps symbol.
+        sym_raw = gd["sym"]
+        if sym_raw.upper() in _SYMBOL_BLOCKLIST:
+            symbol = _extract_symbol(msg.get("content", ""))
+        else:
+            symbol = _normalise_symbol(sym_raw)
         entry = _to_float(gd["entry"])
         sl = _to_float(gd["sl"])
         # tp group is optional in the 4th pattern — may be None
@@ -584,7 +593,16 @@ def _try_position_update(text: str, msg: dict) -> Optional[Signal]:
 
 def _try_close_regex(text: str, msg: dict) -> Optional[Signal]:
     """Fast-path: detect explicit close/exit phrases."""
-    if not _CLOSE_KEYWORDS.search(text):
+    # "4H close under X" / "close below X" is stop-loss phrasing, NOT a close
+    # instruction — strip those occurrences before testing for a genuine close
+    # keyword (otherwise a new setup's soft-stop note hijacks the close path).
+    probe = _CLOSE_UNDER_SL.sub(" ", text)
+    if not _CLOSE_KEYWORDS.search(probe):
+        return None
+    # A new-entry directional call ("Market long BLESS", "shorting ETH") is an
+    # OPEN, not a close — even when its stop note mentions a candle "close".
+    if re.search(r'\bmarket\s+(?:long|short|buy|sell)\b|\b(?:long|short)ing\b',
+                 text, re.IGNORECASE):
         return None
     # Only treat as CLOSE if there's no entry price (otherwise it's a new signal direction)
     if re.search(r'entr(?:y|:)[\s:]*[\d,.]+', text, re.IGNORECASE):

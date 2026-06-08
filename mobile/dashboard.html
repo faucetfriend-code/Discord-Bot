@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dashboard — Unity Oracle Aggregator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+  <style>
+    @import url('https://fonts.cdnfonts.com/css/cabinet-grotesk');
+    .hero-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4); margin-bottom: var(--space-8); }
+    .market-panel { padding: var(--space-5); margin-bottom: var(--space-6); }
+    .portfolio-card { padding: var(--space-5); }
+    .source-toggle .src-btn { padding: 8px 20px; font-size: var(--text-sm); font-weight: 600; background: transparent; border: 1px solid var(--border-glass); border-radius: var(--radius-pill); color: var(--muted); transition: all var(--motion-fast) var(--ease-out); min-height: 40px; }
+    .source-toggle .src-btn:hover { border-color: var(--accent); color: var(--fg-2); }
+    .source-toggle .src-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: var(--accent-glow); }
+    .recent-alert { padding: 12px 16px; border-left: 3px solid var(--accent); margin-bottom: 8px; }
+    .recent-alert.alert-red { border-left-color: var(--negative); }
+    .recent-alert.alert-gold { border-left-color: var(--positive); }
+    .portfolio-allocation { display: flex; gap: var(--space-2); margin-top: var(--space-4); }
+    .alloc-bar { height: 6px; border-radius: 3px; flex: 1; }
+
+    @media (max-width: 1023px) { .hero-metrics { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 767px) { .hero-metrics { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body class="bg-gradient">
+  <!-- Nav -->
+  <nav class="nav-bar">
+    <div class="logo">
+      <span class="accent-dot"></span>
+      Unity Oracle
+      <div class="glass logo-dropdown" id="logoDropdown">
+        <a href="profile.html" class="dd-item">
+          <div class="dd-icon" style="background:linear-gradient(135deg,#5865F2,#7289da);color:#fff;">●</div>
+          Profile
+        </a>
+        <a href="settings.html" class="dd-item">
+          <div class="dd-icon" style="background:rgba(255,255,255,0.08);color:var(--fg-2);">⚙</div>
+          Settings
+        </a>
+      </div>
+    </div>
+    <div class="nav-actions">
+      <div style="position:relative;">
+        <button class="icon-btn" id="notifBell">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          <span class="notif-badge-dot dot"></span>
+          <span class="notif-unread-count" style="position:absolute;top:-2px;right:-2px;background:var(--negative);color:#fff;font-size:9px;font-weight:700;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;display:none;">0</span>
+        </button>
+      </div>
+      <a href="index.html" style="display:flex;">
+        <button class="icon-btn" title="All screens">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+      </a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <!-- Hero Metrics -->
+    <div class="hero-metrics">
+      <div class="glass stat-card">
+        <div class="stat-label">Total Portfolio</div>
+        <div class="stat-value" style="color:var(--fg);">$247,832</div>
+        <div class="stat-change up">+$12,430 <span style="font-weight:400;color:var(--muted);">(5.3%)</span></div>
+      </div>
+      <div class="glass stat-card">
+        <div class="stat-label">BTC Price</div>
+        <div class="stat-value" style="color:var(--accent);">$67,421</div>
+        <div class="stat-change down">-$1,284 <span style="font-weight:400;color:var(--muted);">(1.9%)</span></div>
+      </div>
+      <div class="glass stat-card">
+        <div class="stat-label">Open Positions</div>
+        <div class="stat-value">12</div>
+        <div class="stat-change up">3 profitable <span style="font-weight:400;color:var(--muted);">· 9 pending</span></div>
+      </div>
+      <div class="glass stat-card">
+        <div class="stat-label">24h Volume</div>
+        <div class="stat-value" style="color:var(--positive);">$1.24M</div>
+        <div class="stat-change up">+18.2%</div>
+      </div>
+    </div>
+
+    <!-- Data source toggle + Market overview -->
+    <div class="market-panel glass">
+      <div class="section-header">
+        <h2>Market Overview</h2>
+        <div class="row gap-3 source-toggle">
+          <span style="font-size:var(--text-sm);color:var(--muted);">Source:</span>
+          <button class="src-btn active" data-source="chainlink">Chainlink</button>
+          <button class="src-btn" data-source="pyth">Pyth</button>
+          <button class="src-btn" data-source="cryptocompare">CryptoCompare</button>
+        </div>
+      </div>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Asset</th>
+            <th>Price</th>
+            <th>24h Change</th>
+            <th>High 24h</th>
+            <th>Low 24h</th>
+            <th>Volume</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span style="font-weight:600;">BTC</span> <span class="badge badge-muted" style="margin-left:6px;">Bitcoin</span></td>
+            <td class="mono">$67,421.30</td>
+            <td class="mono down">-1.87%</td>
+            <td class="mono">$68,945.10</td>
+            <td class="mono">$66,832.40</td>
+            <td class="mono">$28.4B</td>
+            <td><span class="badge badge-accent">Chainlink</span></td>
+          </tr>
+          <tr>
+            <td><span style="font-weight:600;">ETH</span> <span class="badge badge-muted" style="margin-left:6px;">Ethereum</span></td>
+            <td class="mono">$3,482.15</td>
+            <td class="mono up">+2.34%</td>
+            <td class="mono">$3,521.80</td>
+            <td class="mono">$3,398.20</td>
+            <td class="mono">$15.7B</td>
+            <td><span class="badge badge-accent">Chainlink</span></td>
+          </tr>
+          <tr>
+            <td><span style="font-weight:600;">SOL</span> <span class="badge badge-muted" style="margin-left:6px;">Solana</span></td>
+            <td class="mono">$145.82</td>
+            <td class="mono up">+5.61%</td>
+            <td class="mono">$148.30</td>
+            <td class="mono">$138.12</td>
+            <td class="mono">$4.2B</td>
+            <td><span class="badge badge-accent">Pyth</span></td>
+          </tr>
+          <tr>
+            <td><span style="font-weight:600;">ARB</span> <span class="badge badge-muted" style="margin-left:6px;">Arbitrum</span></td>
+            <td class="mono">$0.84</td>
+            <td class="mono down">-0.42%</td>
+            <td class="mono">$0.86</td>
+            <td class="mono">$0.82</td>
+            <td class="mono">$890M</td>
+            <td><span class="badge badge-accent">Chainlink</span></td>
+          </tr>
+          <tr>
+            <td><span style="font-weight:600;">LINK</span> <span class="badge badge-muted" style="margin-left:6px;">Chainlink</span></td>
+            <td class="mono">$16.24</td>
+            <td class="mono up">+1.12%</td>
+            <td class="mono">$16.48</td>
+            <td class="mono">$15.95</td>
+            <td class="mono">$1.1B</td>
+            <td><span class="badge badge-accent">Chainlink</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Portfolio summary + recent alerts -->
+    <div class="grid-2" style="margin-bottom:var(--space-8);">
+      <div class="glass portfolio-card">
+        <div class="section-header">
+          <h2>Portfolio</h2>
+          <a href="positions.html" style="font-size:var(--text-sm);">View all →</a>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr><th>Asset</th><th>Holdings</th><th>Value</th><th>P&L</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>BTC</td><td class="mono">1.42</td>
+              <td class="mono">$95,738</td>
+              <td class="mono up">+$3,210</td>
+            </tr>
+            <tr>
+              <td>ETH</td><td class="mono">12.8</td>
+              <td class="mono">$44,572</td>
+              <td class="mono down">-$892</td>
+            </tr>
+            <tr>
+              <td>SOL</td><td class="mono">85</td>
+              <td class="mono">$12,395</td>
+              <td class="mono up">+$1,847</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="portfolio-allocation">
+          <div class="alloc-bar" style="background:var(--accent);flex:4;"></div>
+          <div class="alloc-bar" style="background:var(--positive);flex:2;"></div>
+          <div class="alloc-bar" style="background:#6c5ce7;flex:1;"></div>
+          <div class="alloc-bar" style="background:var(--muted);flex:1;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:var(--space-2);">
+          <span style="font-size:var(--text-xs);color:var(--muted);">BTC 48%</span>
+          <span style="font-size:var(--text-xs);color:var(--muted);">ETH 22%</span>
+          <span style="font-size:var(--text-xs);color:var(--muted);">SOL 15%</span>
+          <span style="font-size:var(--text-xs);color:var(--muted);">Other 15%</span>
+        </div>
+      </div>
+
+      <div class="glass portfolio-card">
+        <div class="section-header">
+          <h2>Recent Alerts</h2>
+          <button class="btn btn-ghost btn-sm">Clear all</button>
+        </div>
+        <div class="recent-alert row-between">
+          <div><span style="font-weight:600;">BTC</span> <span style="font-size:var(--text-sm);color:var(--muted);margin-left:6px;">Liquidation cluster near $66k</span></div>
+          <span class="badge badge-negative">High</span>
+        </div>
+        <div class="recent-alert alert-gold row-between">
+          <div><span style="font-weight:600;">SOL</span> <span style="font-size:var(--text-sm);color:var(--muted);margin-left:6px;">Funding rate spike — long bias</span></div>
+          <span class="badge badge-positive">Signal</span>
+        </div>
+        <div class="recent-alert row-between">
+          <div><span style="font-weight:600;">ETH</span> <span style="font-size:var(--text-sm);color:var(--muted);margin-left:6px;">Whale accumulation detected</span></div>
+          <span class="badge badge-accent">Info</span>
+        </div>
+        <div class="recent-alert alert-red row-between">
+          <div><span style="font-weight:600;">LINK</span> <span style="font-size:var(--text-sm);color:var(--muted);margin-left:6px;">On-chain volume anomaly</span></div>
+          <span class="badge badge-accent">Info</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Notification Center -->
+  <div class="notif-overlay" id="notifOverlay"></div>
+  <div class="glass notif-modal" id="notifModal">
+    <div class="notif-head">
+      <h3>Notifications</h3>
+      <div class="row gap-2">
+        <button class="btn btn-ghost btn-sm" id="markAllRead">Mark all read</button>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('notifOverlay').classList.remove('open');document.getElementById('notifModal').classList.remove('open');" style="color:var(--muted);font-size:var(--text-lg);padding:4px 8px;">✕</button>
+      </div>
+    </div>
+    <div class="notif-cats">
+      <button class="nf-cat active" data-cat="all">All</button>
+      <button class="nf-cat" data-cat="price">Price</button>
+      <button class="nf-cat" data-cat="portfolio">Portfolio</button>
+      <button class="nf-cat" data-cat="analyst">Analyst</button>
+      <button class="nf-cat" data-cat="system">System</button>
+    </div>
+    <div class="notif-list" id="notifList"></div>
+  </div>
+
+  <script src="js/app.js"></script>
+  <script>
+    // Source toggle interaction
+    document.querySelectorAll('.src-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        document.querySelectorAll('.src-btn').forEach(function (b) { b.classList.remove('active'); });
+        this.classList.add('active');
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Profile — Unity Oracle Aggregator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+  <style>
+    @import url('https://fonts.cdnfonts.com/css/cabinet-grotesk');
+    .profile-card { padding: var(--space-6); text-align: center; }
+    .avatar { width: 80px; height: 80px; border-radius: 50%; background: linear-gradient(135deg, #ff6b35, #dc3545); display: flex; align-items: center; justify-content: center; margin: 0 auto var(--space-4); font-size: var(--text-2xl); font-weight: 700; color: #fff; }
+    .discord-card { padding: var(--space-5); display: flex; align-items: center; gap: var(--space-4); margin-bottom: var(--space-4); }
+    .discord-card .discord-icon { width: 48px; height: 48px; border-radius: 12px; background: #5865F2; display: grid; place-items: center; flex-shrink: 0; }
+    .analyst-item { display: flex; align-items: center; gap: var(--space-3); padding: 12px 16px; }
+    .analyst-item .analyst-avatar { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-size: var(--text-sm); font-weight: 700; color: #fff; flex-shrink: 0; }
+    @media (max-width: 767px) { .discord-card { flex-direction: column; align-items: flex-start; } }
+  </style>
+</head>
+<body class="bg-gradient">
+  <!-- Nav -->
+  <nav class="nav-bar">
+    <div class="logo">
+      <span class="accent-dot"></span>
+      Unity Oracle
+      <div class="glass logo-dropdown" id="logoDropdown">
+        <div class="dd-divider"></div>
+        <a href="settings.html" class="dd-item">
+          <div class="dd-icon" style="background:rgba(255,255,255,0.08);color:var(--fg-2);">⚙</div>
+          Settings
+        </a>
+      </div>
+    </div>
+    <div class="nav-actions">
+      <a href="index.html" style="display:flex;">
+        <button class="icon-btn" title="All screens">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+      </a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <!-- LOGIN VIEW (shown when logged out) -->
+    <div id="guestView" class="glass login-section">
+      <div class="login-icon">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+      </div>
+      <h2>Sign in to Unity Oracle</h2>
+      <p>Connect your Discord account to sync your portfolio, preferences, and analyst subscriptions across devices.</p>
+      <button class="btn btn-primary btn-shine" id="loginBtn" style="background:#5865F2;box-shadow:0 4px 20px rgba(88,101,242,0.4);min-width:240px;">Log in with Discord</button>
+    </div>
+
+    <!-- AUTH VIEW (shown when logged in) -->
+    <div id="authUser" style="display:none;">
+      <div class="grid-2" style="margin-bottom:var(--space-6);">
+        <!-- Profile -->
+        <div class="glass profile-card">
+          <div class="avatar">JD</div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:var(--space-2);margin-bottom:4px;">
+            <h3 class="auth-name" style="font-family:var(--font-display);font-size:var(--text-xl);font-weight:700;">Jamie Duval</h3>
+            <span class="badge badge-gold premium-badge" style="display:none;">✦ Premium</span>
+          </div>
+          <p style="color:var(--muted);font-size:var(--text-sm);">Discord ID: 428391029384</p>
+          <div style="display:flex;gap:var(--space-2);justify-content:center;margin-top:var(--space-4);flex-wrap:wrap;">
+            <button class="btn btn-ghost btn-sm" id="logoutBtn">Disconnect</button>
+            <a href="settings.html"><button class="btn btn-ghost btn-sm">Settings</button></a>
+          </div>
+        </div>
+
+        <!-- Discord server card -->
+        <div class="glass discord-card">
+          <div class="discord-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+          </div>
+          <div style="flex:1;">
+            <div style="font-weight:600;font-size:var(--text-lg);">Unity Oracle Server</div>
+            <div style="font-size:var(--text-sm);color:var(--muted);margin-top:2px;">Discord member · 2,431 members</div>
+          </div>
+          <span class="badge badge-accent">Connected</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Subscription (always visible) -->
+    <div class="grid-2" style="margin-bottom:var(--space-6);">
+      <div class="glass sub-card">
+        <div class="sub-price">$0<span class="period">/mo</span></div>
+        <div class="sub-tier" style="margin-top:var(--space-2);">Free</div>
+        <ul class="sub-features" style="list-style:none;">
+          <li class="sf">• Up to 10 watchlist assets</li>
+          <li class="sf">• 3 price alerts</li>
+          <li class="sf">• Basic market data</li>
+          <li class="sf">• 7-day signal history</li>
+        </ul>
+        <div class="sub-divider"></div>
+        <div style="text-align:center;">
+          <span style="font-size:var(--text-sm);color:var(--muted);">Current plan</span>
+        </div>
+      </div>
+
+      <div class="glass sub-card" style="border-color:oklch(0.78 0.16 85 / 0.3);">
+        <div class="sub-price">$19<span class="period">/mo</span></div>
+        <div class="sub-tier" style="margin-top:var(--space-2);color:var(--positive);">Premium</div>
+        <ul class="sub-features" style="list-style:none;">
+          <li class="sf">✦ Unlimited watchlist assets</li>
+          <li class="sf">✦ Unlimited price alerts</li>
+          <li class="sf">✦ All analyst signals + automated alerts</li>
+          <li class="sf">✦ Full signal history with export</li>
+          <li class="sf">✦ Priority data feeds (100ms latency)</li>
+          <li class="sf">✦ Advanced filters & portfolio import</li>
+        </ul>
+        <div class="sub-divider"></div>
+        <button class="btn btn-highlight btn-shine sub-btn" style="width:100%;">Upgrade to Premium</button>
+      </div>
+    </div>
+
+    <!-- Followed analysts (always visible) -->
+    <div class="glass" style="padding:var(--space-5);margin-bottom:var(--space-6);">
+      <div class="section-header">
+        <h2>Followed Analysts</h2>
+        <a href="analyst.html" class="btn btn-ghost btn-sm">All Analysts →</a>
+      </div>
+      <div class="analyst-item glass-sm">
+        <div class="analyst-avatar" style="background:#ff6b35;">AK</div>
+        <div style="flex:1;"><div style="font-weight:600;">Alex Korsakov</div><div style="font-size:var(--text-sm);color:var(--muted);">On-chain analyst · 12.4k followers</div></div>
+        <span class="badge badge-accent">Following</span>
+      </div>
+      <div class="analyst-item glass-sm">
+        <div class="analyst-avatar" style="background:#dc3545;">MC</div>
+        <div style="flex:1;"><div style="font-weight:600;">Maria Chen</div><div style="font-size:var(--text-sm);color:var(--muted);">Derivatives trader · 8.7k followers</div></div>
+        <span class="badge badge-accent">Following</span>
+      </div>
+      <div class="analyst-item glass-sm">
+        <div class="analyst-avatar" style="background:#6c5ce7;">TR</div>
+        <div style="flex:1;"><div style="font-weight:600;">Tyler Reeves</div><div style="font-size:var(--text-sm);color:var(--muted);">Macro researcher · 5.2k followers</div></div>
+        <span class="badge badge-accent">Following</span>
+      </div>
+      <div class="analyst-item glass-sm">
+        <div class="analyst-avatar" style="background:#8b5cf6;">DV</div>
+        <div style="flex:1;"><div style="font-weight:600;">Dmitri Volkov</div><div style="font-size:var(--text-sm);color:var(--muted);">Whale tracker · 15.6k followers</div></div>
+        <span class="badge badge-accent">Following</span>
+      </div>
+    </div>
+
+    <!-- Premium upsell section -->
+    <div class="premium-upsell glass" style="padding:var(--space-5);margin-bottom:var(--space-6);text-align:center;">
+      <div style="font-size:var(--text-2xl);margin-bottom:var(--space-2);">✦</div>
+      <h3 style="font-family:var(--font-display);font-size:var(--text-xl);font-weight:700;margin-bottom:var(--space-2);">Unlock Premium</h3>
+      <p style="color:var(--muted);font-size:var(--text-sm);margin-bottom:var(--space-4);max-width:400px;margin-left:auto;margin-right:auto;">Get unlimited watchlist, all analyst signals, and portfolio import. Upgrade to Premium for $19/mo.</p>
+      <button class="btn btn-highlight btn-shine" onclick="document.querySelector('.sub-card .sub-btn').click();">Upgrade Now</button>
+    </div>
+
+    <!-- Portfolio holdings -->
+    <div class="glass" style="padding:var(--space-5);">
+      <div class="section-header">
+        <h2>Portfolio Holdings</h2>
+        <span style="font-size:var(--text-sm);color:var(--muted);">Total: $247,832</span>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr><th>Asset</th><th>Amount</th><th>Avg Entry</th><th>Value</th><th>P&L</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span style="font-weight:600;">BTC</span></td><td class="mono">1.42</td><td class="mono">$61,200</td><td class="mono">$95,738</td><td class="mono up">+$8,834</td></tr>
+          <tr><td><span style="font-weight:600;">ETH</span></td><td class="mono">12.8</td><td class="mono">$3,420</td><td class="mono">$44,572</td><td class="mono up">+$793</td></tr>
+          <tr><td><span style="font-weight:600;">SOL</span></td><td class="mono">85</td><td class="mono">$124.50</td><td class="mono">$12,395</td><td class="mono up">+$1,812</td></tr>
+          <tr><td><span style="font-weight:600;">ARB</span></td><td class="mono">4,200</td><td class="mono">$0.92</td><td class="mono">$3,528</td><td class="mono down">-$336</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <!-- Auth Overlay -->
+  <div class="auth-overlay" id="authOverlay">
+    <div class="glass auth-modal">
+      <div class="auth-icon">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+      </div>
+      <h2>Connect Discord</h2>
+      <p>Link your Discord account to unlock the full Unity Oracle experience. Your portfolio, alerts, and preferences sync automatically.</p>
+      <div class="auth-benefits">
+        <div class="benefit"><span class="check">✓</span> Sync portfolio across devices</div>
+        <div class="benefit"><span class="check">✓</span> Get real-time push notifications</div>
+        <div class="benefit"><span class="check">✓</span> Follow analysts and track signals</div>
+        <div class="benefit"><span class="check">✓</span> Premium features with subscription</div>
+      </div>
+      <button class="btn btn-primary btn-shine" data-auth="discord" style="background:#5865F2;box-shadow:0 4px 20px rgba(88,101,242,0.4);width:100%;">Authorize with Discord</button>
+      <div style="margin-top:var(--space-3);font-size:var(--text-xs);color:var(--muted);">This is a prototype — no real Discord API call will be made</div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

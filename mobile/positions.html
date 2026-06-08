@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Positions — Unity Oracle Aggregator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+  <style>
+    @import url('https://fonts.cdnfonts.com/css/cabinet-grotesk');
+    .pos-card { padding: var(--space-5); margin-bottom: var(--space-4); cursor: pointer; transition: all var(--motion-fast) var(--ease-out); }
+    .pos-card:hover { border-color: oklch(0.62 0.22 42 / 0.3); }
+    .pos-card .pos-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4); }
+    .pos-card .pos-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-3); }
+    .pos-card .pos-metric .label { font-size: var(--text-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    .pos-card .pos-metric .value { font-family: var(--font-mono); font-size: var(--text-lg); font-weight: 700; margin-top: 2px; }
+    .pos-detail { display: none; padding: var(--space-4); margin-top: var(--space-3); border-top: 1px solid var(--border-glass); }
+    .pos-detail.open { display: block; }
+    .pos-detail-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); }
+    .pos-summary { display: flex; gap: var(--space-6); flex-wrap: wrap; margin-bottom: var(--space-6); }
+    .pos-summary .stat { display: flex; flex-direction: column; }
+    .pos-summary .stat .val { font-family: var(--font-mono); font-size: var(--text-2xl); font-weight: 700; }
+    .pos-summary .stat .lbl { font-size: var(--text-sm); color: var(--muted); }
+    @media (max-width: 767px) { .pos-card .pos-metrics { grid-template-columns: repeat(2, 1fr); } .pos-detail-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body class="bg-gradient">
+  <nav class="nav-bar">
+    <div class="logo">
+      <span class="accent-dot"></span>
+      Unity Oracle
+      <div class="glass logo-dropdown" id="logoDropdown">
+        <a href="profile.html" class="dd-item">
+          <div class="dd-icon" style="background:linear-gradient(135deg,#5865F2,#7289da);color:#fff;">●</div>
+          Profile
+        </a>
+        <a href="settings.html" class="dd-item">
+          <div class="dd-icon" style="background:rgba(255,255,255,0.08);color:var(--fg-2);">⚙</div>
+          Settings
+        </a>
+      </div>
+    </div>
+    <div class="nav-actions">
+      <a href="index.html" style="display:flex;">
+        <button class="icon-btn" title="All screens">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+      </a>
+    </div>
+  </nav>
+
+  <main class="page">
+    <div class="section-header">
+      <h2>Positions Tracker</h2>
+      <div class="row gap-3">
+        <button class="btn btn-primary btn-sm btn-shine">Close All</button>
+        <button class="btn btn-ghost btn-sm">Export</button>
+      </div>
+    </div>
+
+    <!-- Summary -->
+    <div class="glass pos-summary" style="padding:var(--space-5);">
+      <div class="stat"><span class="val" style="color:var(--fg);">$124,560</span><span class="lbl">Total Value</span></div>
+      <div class="stat"><span class="val" style="color:var(--positive);">+$4,832</span><span class="lbl">Unrealized P&L</span></div>
+      <div class="stat"><span class="val" style="color:var(--fg);">12</span><span class="lbl">Open Positions</span></div>
+      <div class="stat"><span class="val" style="color:var(--accent);">3.2x</span><span class="lbl">Avg Leverage</span></div>
+    </div>
+
+    <!-- Positions -->
+    <div class="pos-card glass" data-position="btc">
+      <div class="pos-header">
+        <div class="row gap-3">
+          <span style="font-family:var(--font-mono);font-weight:700;font-size:var(--text-lg);">BTC</span>
+          <span class="badge badge-accent">Long</span>
+          <span class="badge" style="background:rgba(255,255,255,0.06);color:var(--fg-2);">3x Leverage</span>
+        </div>
+        <div class="row gap-3">
+          <span class="badge badge-positive">+$2,140</span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted);"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+      <div class="pos-metrics">
+        <div class="pos-metric"><div class="label">Entry</div><div class="value" style="color:var(--fg-2);">$64,210</div></div>
+        <div class="pos-metric"><div class="label">Mark</div><div class="value">$67,421</div></div>
+        <div class="pos-metric"><div class="label">Size</div><div class="value" style="color:var(--fg-2);">0.85 BTC</div></div>
+        <div class="pos-metric"><div class="label">Liq. Price</div><div class="value" style="color:var(--negative);">$58,200</div></div>
+      </div>
+      <div class="pos-detail">
+        <div class="pos-detail-grid">
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Margin</div><div class="mono" style="font-weight:600;">$18,165</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Unrealized P&L</div><div class="mono" style="font-weight:600;color:var(--positive);">+$2,140 (11.8%)</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Realized P&L</div><div class="mono" style="font-weight:600;color:var(--negative);">-$320</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Funding</div><div class="mono" style="font-weight:600;color:var(--muted);">0.01% / 8h</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Opened</div><div class="mono" style="font-weight:600;color:var(--fg-2);">2026-06-05</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Oracle</div><div class="mono" style="font-weight:600;"><span class="badge badge-accent">Chainlink</span></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="pos-card glass" data-position="eth">
+      <div class="pos-header">
+        <div class="row gap-3">
+          <span style="font-family:var(--font-mono);font-weight:700;font-size:var(--text-lg);">ETH</span>
+          <span class="badge badge-negative">Short</span>
+          <span class="badge" style="background:rgba(255,255,255,0.06);color:var(--fg-2);">2x Leverage</span>
+        </div>
+        <div class="row gap-3">
+          <span class="badge badge-negative">-$892</span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted);"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+      <div class="pos-metrics">
+        <div class="pos-metric"><div class="label">Entry</div><div class="value" style="color:var(--fg-2);">$3,580</div></div>
+        <div class="pos-metric"><div class="label">Mark</div><div class="value">$3,482</div></div>
+        <div class="pos-metric"><div class="label">Size</div><div class="value" style="color:var(--fg-2);">12.8 ETH</div></div>
+        <div class="pos-metric"><div class="label">Liq. Price</div><div class="value" style="color:var(--negative);">$4,120</div></div>
+      </div>
+      <div class="pos-detail">
+        <div class="pos-detail-grid">
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Margin</div><div class="mono" style="font-weight:600;">$22,912</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Unrealized P&L</div><div class="mono" style="font-weight:600;color:var(--negative);">-$892 (3.9%)</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Realized P&L</div><div class="mono" style="font-weight:600;color:var(--positive);">+$1,250</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Funding</div><div class="mono" style="font-weight:600;color:var(--muted);">0.005% / 8h</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Opened</div><div class="mono" style="font-weight:600;color:var(--fg-2);">2026-06-03</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Oracle</div><div class="mono" style="font-weight:600;"><span class="badge badge-accent">Pyth</span></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="pos-card glass" data-position="sol">
+      <div class="pos-header">
+        <div class="row gap-3">
+          <span style="font-family:var(--font-mono);font-weight:700;font-size:var(--text-lg);">SOL</span>
+          <span class="badge badge-accent">Long</span>
+          <span class="badge" style="background:rgba(255,255,255,0.06);color:var(--fg-2);">5x Leverage</span>
+        </div>
+        <div class="row gap-3">
+          <span class="badge badge-positive">+$1,847</span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--muted);"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+      <div class="pos-metrics">
+        <div class="pos-metric"><div class="label">Entry</div><div class="value" style="color:var(--fg-2);">$132.50</div></div>
+        <div class="pos-metric"><div class="label">Mark</div><div class="value">$145.82</div></div>
+        <div class="pos-metric"><div class="label">Size</div><div class="value" style="color:var(--fg-2);">85 SOL</div></div>
+        <div class="pos-metric"><div class="label">Liq. Price</div><div class="value" style="color:var(--negative);">$118.00</div></div>
+      </div>
+      <div class="pos-detail">
+        <div class="pos-detail-grid">
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Margin</div><div class="mono" style="font-weight:600;">$2,252</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Unrealized P&L</div><div class="mono" style="font-weight:600;color:var(--positive);">+$1,847 (82%)</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Realized P&L</div><div class="mono" style="font-weight:600;color:var(--muted);">$0</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Funding</div><div class="mono" style="font-weight:600;color:var(--muted);">0.02% / 8h</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Opened</div><div class="mono" style="font-weight:600;color:var(--fg-2);">2026-06-06</div></div>
+          <div><div class="label" style="font-size:var(--text-xs);color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;">Oracle</div><div class="mono" style="font-weight:600;"><span class="badge badge-accent">Chainlink</span></div></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
