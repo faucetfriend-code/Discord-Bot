@@ -1,0 +1,12 @@
+2026-06-08 09:50:31 INFO Servers in inbox: ['APP Ajmal ⚡', 'APP Caleb Unity:', 'APP OracleAlgo Alerts:', 'APP Soul 🚬', 'APP Sveezy ✅', 'APP Unity Dashboard Intel:', 'Ana\xa0[UNTY],\xa0Server Tag: UNTYUNTY:', 'Badillusion
+2026-06-08 09:50:31 INFO Inbox poll: 47 total, 1 unseen
+2026-06-08 09:50:31 INFO Attempting vision parse for LIT-USDT from chart: https://cdn.discordapp.com/attachments/1185557996437262386/15135558094
+2026-06-08 09:50:34 INFO HTTP Request: POST http://127.0.0.1:1234/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-08 09:50:34 INFO Vision parse result: {'entry': 1.549, 'sl': 1.3906, 'tps': [2.1997, 2.05], 'levels': [1.3906, 1.549, 2.05, 2.1997]}
+2026-06-08 09:50:34 INFO Vision read 4 price level(s) for LIT-USDT: [1.3906, 1.549, 2.05, 2.1997]
+2026-06-08 09:50:34 INFO [Caleb Unity] Classified as NEW | LIT-USDT
+2026-06-08 09:50:34 INFO [Caleb Alerts] LIT-USDT TP ladder from chart → [2.05, 2.1997]
+2026-06-08 09:50:34 INFO [Caleb Alerts] NEW LIMIT BUY LIT-USDT entry=1.547 sl=1.3923 tp=2.1997
+2026-06-08 09:50:35 ERROR No contract specs for LIT-USDT — cannot size safely, skipping. (Instrument may be unlisted on BloFin or instruments fetch failed.)
+2026-06-08 09:50:35 WARNING Position size too small — skipping
+2026-06-08 09:51:36 INFO Periodic sweep: re-injecting observer and scanning inbox

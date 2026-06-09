@@ -229,6 +229,33 @@ def _check_pending_entries(dry_run: bool):
         if price is None:
             keep.append(it)
             continue
+        # Staleness sweep for indefinitely-resting limit orders: if the market has
+        # run far PAST the limit (so it will realistically never fill) or it has
+        # simply aged out, drop it rather than leave a ghost order that could fill
+        # unexpectedly long after the analyst's setup is irrelevant. Tunable; set
+        # either threshold to 0 to disable that half.
+        if it["condition"] == "limit_fill":
+            stale_pct = float(os.getenv("LIMIT_STALE_PCT", "0.10"))
+            stale_hours = float(os.getenv("LIMIT_STALE_HOURS", "48"))
+            ref0 = it["ref_price"]
+            # how far the market has moved AWAY from the fill side (positive = worse)
+            away = (price - ref0) / ref0 if it["side"] == "buy" else (ref0 - price) / ref0
+            try:
+                age_h = (now_local() - datetime.fromisoformat(it["created_at"])).total_seconds() / 3600
+            except Exception:
+                age_h = 0.0
+            stale_reason = None
+            if stale_pct > 0 and away > stale_pct:
+                stale_reason = f"price {away*100:.1f}% past limit"
+            elif stale_hours > 0 and age_h > stale_hours:
+                stale_reason = f"aged {age_h:.0f}h"
+            if stale_reason:
+                log.info(f"[{it.get('analyst_key') or it['source']}] resting limit on "
+                         f"{it['symbol']} dropped — stale ({stale_reason}, ref {ref0})")
+                _logger_mod.log_signal(it.get("analyst_key") or it["source"], it.get("raw_text", ""),
+                                       outcome=f"pending_limit_fill_stale {it['symbol']}")
+                changed = True
+                continue
         ref, side, thr = it["ref_price"], it["side"], float(it["threshold_pct"])
         if it["condition"] == "revert":
             fired = (price >= ref * (1 + thr)) if side == "buy" else (price <= ref * (1 - thr))
@@ -377,9 +404,26 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         if signal.sl is None and chart_sl is not None:
             signal.sl = chart_sl
             log.info(f"[{analyst}] {signal.symbol} SL from chart (geometry) → {signal.sl}")
-        if chart_tps:
-            tp_ladder = chart_tps                 # full ladder (TP1, TP2, TP3 …)
-            signal.tp = chart_tps[-1]             # furthest target = final/attached TP
+        # Guard: the vision model often reads a chart's ENTRY-ZONE / STOP lines and
+        # mislabels them as take-profits, yielding a "TP" only a percent or two past
+        # entry. That fails the R:R check and wrongly kills a clean text signal (the
+        # analyst gave entry+SL but no TP, which should just auto-TP at DEFAULT_RR).
+        # Only trust chart TPs whose furthest target clears the minimum R:R; otherwise
+        # treat the read as bogus and let the DEFAULT_RR auto-TP below take over.
+        if chart_tps and signal.sl is not None:
+            risk = abs(signal.entry - signal.sl)
+            best_rr = abs(chart_tps[-1] - signal.entry) / risk if risk > 0 else 0
+            if best_rr >= rm._MIN_RISK_REWARD:
+                tp_ladder = chart_tps             # full ladder (TP1, TP2, TP3 …)
+                signal.tp = chart_tps[-1]         # furthest target = final/attached TP
+                log.info(f"[{analyst}] {signal.symbol} TP ladder from chart → {tp_ladder}")
+            else:
+                log.info(f"[{analyst}] {signal.symbol} ignoring chart TPs {chart_tps} "
+                         f"(best R:R {best_rr:.2f} < {rm._MIN_RISK_REWARD}; likely an "
+                         f"entry-zone/stop misread) — will auto-TP at DEFAULT_RR")
+        elif chart_tps:                           # no SL to judge against — keep as-is
+            tp_ladder = chart_tps
+            signal.tp = chart_tps[-1]
             log.info(f"[{analyst}] {signal.symbol} TP ladder from chart → {tp_ladder}")
 
     # Auto-calculate TP at DEFAULT_RR if still none (analyst gave no TP, no chart).
@@ -461,9 +505,18 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
 
     size = rm.calculate_size(balance, signal)
     if size is None:
-        log.warning("Position size too small — skipping")
-        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
-                               outcome="size_too_small")
+        # calculate_size returns None for two distinct reasons — disambiguate so the
+        # outcome is actionable: a symbol with NO contract specs simply isn't listed
+        # on this BloFin endpoint (can't trade it here — same as the CMP path's
+        # symbol_not_listed), vs a LISTED symbol whose risk-based size floors below
+        # the exchange minimum (stop too wide / balance too small).
+        if bf.get_contract_specs(signal.symbol) is None:
+            log.warning(f"[{analyst}] {signal.symbol} not listed on BloFin — skipping")
+            outcome = "symbol_not_listed"
+        else:
+            log.warning(f"[{analyst}] {signal.symbol} position size too small — skipping")
+            outcome = "size_too_small"
+        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal, outcome=outcome)
         return
 
     log.info(f"Balance ${balance:.2f} | Size {size} {signal.symbol} | "
