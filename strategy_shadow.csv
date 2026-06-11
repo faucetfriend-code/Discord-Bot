@@ -19,3 +19,8 @@ ts,source,symbol,side,rsi_value,change_24h,oracle_type,btc_bias,entry_price,f_st
 2026-06-09T01:20:17.565014-05:00,rsi_extreme,SAHARA-USDT,buy,14.9,-56.07,,,,True,False,,,,enter
 2026-06-09T09:00:51.403133-05:00,oraclealgo,BTC-USDT,sell,,,MSS,,62305.0,,,,,1,no_bias
 2026-06-09T10:01:25.958954-05:00,oraclealgo,BTC-USDT,sell,,,,,61371.1,,,,,1,no_bias
+2026-06-10T07:10:50.020188-05:00,rsi_extreme,HMSTR-USDT,sell,90.2,30.42,,,,True,False,,,,enter
+2026-06-10T09:21:25.971958-05:00,rsi_extreme,HMSTR-USDT,sell,90.5,38.47,,,,True,False,,,,enter
+2026-06-10T11:01:30.811115-05:00,oraclealgo,BTC-USDT,buy,,,,bull,62522.6,,,,,1,enter
+2026-06-10T11:20:37.467427-05:00,rsi_extreme,HMSTR-USDT,sell,94.5,44.5,,bull,,True,False,False,,,enter
+2026-06-10T21:10:28.695462-05:00,rsi_extreme,AIO-USDT,sell,91.7,86.69,,,,True,False,,,,enter

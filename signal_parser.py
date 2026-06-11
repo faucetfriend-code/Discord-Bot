@@ -59,7 +59,8 @@ class Signal:
     raw_text: str
     entry: Optional[float] = None    # new signals only; None = market order (CMP)
     sl: Optional[float] = None       # new signal SL
-    tp: Optional[float] = None       # new signal TP
+    tp: Optional[float] = None       # new signal TP (final/validation target)
+    tps: Optional[list] = None       # analyst-stated multi-TP ladder from text (nearest-first)
     new_sl: Optional[float] = None   # update: new stop loss value
     new_tp: Optional[float] = None   # update: new take profit value
     new_avg_entry: Optional[float] = None  # update: DCA/averaging shifted the entry basis
@@ -72,6 +73,8 @@ class Signal:
     change_24h: Optional[float] = None     # RSI Extreme: 24h % change from the alert (e.g. +14.84)
     oracle_signal_type: str = ""           # OracleAlgo: alert type token (MSS / BOS / Supertrend / Delta)
     soft_stop: bool = False                # SL only triggers on a candle CLOSE beyond it, not a wick
+    alert_price: Optional[float] = None    # price quoted IN the alert text (RSI "Price$X") — survives
+                                           # even when the symbol isn't listed on BloFin (shadow/backtest)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +231,11 @@ _RSI_EXTREME = re.compile(
 # strategy can filter on extremity + momentum instead of discarding the numbers.
 _RSI_VALUE = re.compile(r'RSI\s*(?P<rsi>[0-9]{1,3}(?:\.[0-9]+)?)', re.IGNORECASE)
 _RSI_CHANGE = re.compile(r'24h\s*Change\s*(?P<chg>[+\-]?[0-9.]+)\s*%', re.IGNORECASE)
+# The alert's quoted price ("Price$0.3697"). In the run-together card text the
+# price digits butt straight against "24h" ("Price$0.369724h Change"), so require
+# the number to NOT be followed by another digit or letter — the deduplicated
+# repeats later in the card ("Price $0.3697 ") then match cleanly.
+_RSI_PRICE = re.compile(r'Price\s*\$\s*(?P<px>[0-9,]+(?:\.[0-9]+)?)(?![0-9A-Za-z.,])')
 
 # OracleAlgo BTC structure/momentum alerts (MSS / BOS / Supertrend / Delta), e.g.:
 #   "Bearish 1H MSS  BTCUSDT 1H bearish market structure shift confirmed
@@ -310,6 +318,14 @@ def _to_float(s: str) -> float:
 _SOFT_STOP = re.compile(
     r'\bsoft\b|(?:\d+\s*[hmdHMD]|candle|hourly|daily|weekly)\s+close', re.IGNORECASE)
 
+# Numbered take-profit ladder in the message text, e.g.
+#   "Take ProfitsTP1: $55.00 (+11.11%) TP2: $65.00 TP3: $75.00 TP4: $100.00"
+# The single-TP groups in _NEW_PATTERNS only catch the first target (and miss the
+# "TPn: $price" colon form entirely), so this collects the whole ladder separately.
+_TP_LADDER = re.compile(
+    r'(?:tp|take\s*profit)\s*([1-9])\b[^$\d]*\$?\s*([\d][\d,]*(?:\.\d+)?)',
+    re.IGNORECASE)
+
 
 def _enrich_new(sig: Optional[Signal], text: str) -> Optional[Signal]:
     """Post-process a freshly built NEW signal:
@@ -329,6 +345,24 @@ def _enrich_new(sig: Optional[Signal], text: str) -> Optional[Signal]:
                 sig.entry = _to_float(avg.group(1))
             except (TypeError, ValueError):
                 pass
+    # Capture a numbered TP ladder ("TP1 … TP2 … TP3 …") so stated targets aren't
+    # lost — the regex patterns only grab the first TP. Kept in listed order (the
+    # analyst always lists the nearest target first).
+    ladder, seen = [], set()
+    for m in _TP_LADDER.finditer(text):
+        try:
+            v = _to_float(m.group(2))
+        except (TypeError, ValueError):
+            continue
+        if v not in seen:
+            seen.add(v)
+            ladder.append(v)
+    if len(ladder) >= 2:
+        sig.tps = ladder
+    # Backfill a single TP too: the "TPn: $price" colon form defeats the single-TP
+    # groups in _NEW_PATTERNS, so without this a lone "TP1: $64000" would auto-TP.
+    if sig.tp is None and ladder:
+        sig.tp = ladder[0]
     return sig
 
 
@@ -502,13 +536,17 @@ def _try_rsi_extreme(text: str, msg: dict) -> Optional[Signal]:
     # and momentum (e.g. skip a "fade" against a coin already trending hard).
     rsi_m = _RSI_VALUE.search(text)
     chg_m = _RSI_CHANGE.search(text)
+    px_m = _RSI_PRICE.search(text)
     rsi_value = None
     change_24h = None
+    alert_price = None
     try:
         if rsi_m:
             rsi_value = float(rsi_m.group("rsi"))
         if chg_m:
             change_24h = float(chg_m.group("chg"))
+        if px_m:
+            alert_price = float(px_m.group("px").replace(",", ""))
     except (TypeError, ValueError):
         pass
 
@@ -523,6 +561,7 @@ def _try_rsi_extreme(text: str, msg: dict) -> Optional[Signal]:
         source="rsi_extreme",
         rsi_value=rsi_value,
         change_24h=change_24h,
+        alert_price=alert_price,
     )
 
 

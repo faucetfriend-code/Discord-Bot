@@ -129,8 +129,25 @@ _SHADOW_FIELDS = [
     "ts", "source", "symbol", "side",
     "rsi_value", "change_24h", "oracle_type", "btc_bias", "entry_price",
     "f_strength", "f_chase", "f_regime", "confirm_would_fire",
-    "confluence_count", "decision",
+    "confluence_count", "repeat_n", "decision",
 ]
+
+
+def _migrate_shadow_header():
+    """If the on-disk CSV predates a column addition, rewrite it in the new
+    layout (missing columns blank) so old and new rows stay aligned."""
+    if not SHADOW_CSV_PATH.exists():
+        return
+    with open(SHADOW_CSV_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames == _SHADOW_FIELDS:
+            return
+        old_rows = list(reader)
+    with open(SHADOW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_SHADOW_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for r in old_rows:
+            writer.writerow({k: r.get(k, "") for k in _SHADOW_FIELDS})
 
 
 def log_shadow(source, symbol, side, fields: dict):
@@ -145,6 +162,7 @@ def log_shadow(source, symbol, side, fields: dict):
         if k in row and v is not None:
             row[k] = v
 
+    _migrate_shadow_header()
     write_header = not SHADOW_CSV_PATH.exists()
     with open(SHADOW_CSV_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_SHADOW_FIELDS)

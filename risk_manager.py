@@ -147,10 +147,11 @@ def calculate_size(balance: float, signal: Signal) -> Optional[float]:
 
     specs = bf.get_contract_specs(signal.symbol)
     if not specs or specs["contract_value"] <= 0:
-        log.error(
-            f"No contract specs for {signal.symbol} — cannot size safely, skipping. "
-            f"(Instrument may be unlisted on BloFin or instruments fetch failed.)"
-        )
+        # Expected for symbols not listed on this BloFin endpoint (the caller reports
+        # the outcome as symbol_not_listed). Logged at INFO so it doesn't masquerade
+        # as a real error — a genuine instruments-fetch failure shows up as ALL
+        # symbols failing at once, which is visible on its own.
+        log.info(f"No contract specs for {signal.symbol} — not tradeable here, skipping")
         return None
 
     contract_value = specs["contract_value"]

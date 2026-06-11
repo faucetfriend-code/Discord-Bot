@@ -18,7 +18,7 @@ import os
 import queue as _queue
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -144,6 +144,42 @@ def _rsi_filter_verdicts(signal: sp.Signal) -> tuple:
     return f_strength, f_chase, f_regime
 
 
+# Repeat-alert tracker. Outcome analysis showed first alerts on a symbol ran 80%
+# WR / +0.60 avgR while 2nd+ alerts within 24h ran 38% / −0.19: when the same coin
+# keeps re-alerting the move is still going and the fade keeps failing. Every RSI
+# alert is recorded here (even ones skipped for other reasons) so the count
+# reflects the alert STREAM, not just trades. Persisted across restarts.
+_RSI_ALERTS_KEY = "rsi_alert_times"
+
+
+def _rsi_repeat_n(symbol: str) -> int:
+    """Record this RSI alert; return which alert it is for the symbol in the
+    trailing 24h (1 = first)."""
+    try:
+        hist = json.loads(pt.get_state(_RSI_ALERTS_KEY) or "{}")
+    except (ValueError, TypeError):
+        hist = {}
+    now = now_local()
+    cutoff = now - timedelta(hours=24)
+
+    def fresh(ts_list):
+        out = []
+        for t in ts_list:
+            try:
+                if datetime.fromisoformat(t) > cutoff:
+                    out.append(t)
+            except ValueError:
+                pass
+        return out
+
+    times = fresh(hist.get(symbol, []))
+    times.append(now.isoformat())
+    hist = {s: kept for s, ts in hist.items() if s != symbol and (kept := fresh(ts))}
+    hist[symbol] = times
+    pt.set_state(_RSI_ALERTS_KEY, json.dumps(hist))
+    return len(times)
+
+
 # Both "wait then enter" features (RSI confirmation-on-turn, Oracle pullback
 # limit) are the same shape, so they share ONE queue persisted in strategy_state
 # (survives restarts) and one checker that runs each fast tick beside the
@@ -187,6 +223,7 @@ def _enqueue_pending(signal: sp.Signal, condition: str, threshold_pct: float,
         "leverage": leverage,
         "analyst_key": analyst_key,
         "created_at": now_local().isoformat(),
+        "created_price": bf.get_market_price(signal.symbol),
         "window_min": window_min,
         "raw_text": signal.raw_text,
         "rsi_value": signal.rsi_value,
@@ -229,25 +266,34 @@ def _check_pending_entries(dry_run: bool):
         if price is None:
             keep.append(it)
             continue
-        # Staleness sweep for indefinitely-resting limit orders: if the market has
-        # run far PAST the limit (so it will realistically never fill) or it has
-        # simply aged out, drop it rather than leave a ghost order that could fill
-        # unexpectedly long after the analyst's setup is irrelevant. Tunable; set
-        # either threshold to 0 to disable that half.
+        # Staleness sweep for indefinitely-resting limit orders: drop one the market
+        # has clearly abandoned rather than leave a ghost that could fill unexpectedly
+        # long after the analyst's setup is irrelevant. Two independent triggers:
+        #   • distance — price has run further from the limit than when it was queued
+        #     (we compare to created_price, NOT the absolute gap, so a deliberate
+        #     pull-back limit placed below market isn't killed the instant it's set);
+        #   • age — older than LIMIT_STALE_HOURS.
+        # Set either threshold to 0 to disable that half.
         if it["condition"] == "limit_fill":
             stale_pct = float(os.getenv("LIMIT_STALE_PCT", "0.10"))
             stale_hours = float(os.getenv("LIMIT_STALE_HOURS", "48"))
             ref0 = it["ref_price"]
-            # how far the market has moved AWAY from the fill side (positive = worse)
-            away = (price - ref0) / ref0 if it["side"] == "buy" else (ref0 - price) / ref0
+            created_price = it.get("created_price")
             try:
                 age_h = (now_local() - datetime.fromisoformat(it["created_at"])).total_seconds() / 3600
             except Exception:
                 age_h = 0.0
+            # distance the market has moved AWAY from the fill side (positive = worse)
+            def _away(p):
+                return (p - ref0) / ref0 if it["side"] == "buy" else (ref0 - p) / ref0
             stale_reason = None
-            if stale_pct > 0 and away > stale_pct:
-                stale_reason = f"price {away*100:.1f}% past limit"
-            elif stale_hours > 0 and age_h > stale_hours:
+            # Distance trigger only when we know where price started (older queue items
+            # predating created_price fall back to the age trigger alone).
+            if stale_pct > 0 and created_price:
+                drift = _away(price) - _away(created_price)
+                if drift > stale_pct:
+                    stale_reason = f"price ran {drift*100:.1f}% further from limit since queued"
+            if not stale_reason and stale_hours > 0 and age_h > stale_hours:
                 stale_reason = f"aged {age_h:.0f}h"
             if stale_reason:
                 log.info(f"[{it.get('analyst_key') or it['source']}] resting limit on "
@@ -425,6 +471,15 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
             tp_ladder = chart_tps
             signal.tp = chart_tps[-1]
             log.info(f"[{analyst}] {signal.symbol} TP ladder from chart → {tp_ladder}")
+
+    # Analyst-stated multi-TP ladder from the message text ("TP1 $55 TP2 $65 …").
+    # Used when no chart/strategy ladder was set — so stated targets are honoured
+    # instead of falling through to a single auto-TP (the furthest is the final
+    # validation target; the resolver scales out at each rung).
+    if not tp_ladder and getattr(signal, "tps", None):
+        tp_ladder = list(signal.tps)
+        signal.tp = tp_ladder[-1]
+        log.info(f"[{analyst}] {signal.symbol} TP ladder from text → {tp_ladder}")
 
     # Auto-calculate TP at DEFAULT_RR if still none (analyst gave no TP, no chart).
     if signal.tp is None and signal.entry is not None and signal.sl is not None:
@@ -1172,7 +1227,18 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     ok_conf, distinct = _oracle_confluence(signal)
 
     def _shadow(decision):
-        _shadow_strategy(signal, entry_price, {"confluence_count": distinct, "decision": decision})
+        # When the fresh bias is gone, record the STALE one (expired by TTL) in the
+        # btc_bias column as "stale-bull"/"stale-bear" — the analyzer uses this to
+        # answer "would a longer ORACLE_BIAS_TTL_HOURS have let this entry through,
+        # and would it have won?". Blank = no bias has ever been set.
+        bias_note = bias or ""
+        if not bias:
+            stale = _get_oracle_bias(ignore_ttl=True)
+            if stale:
+                bias_note = f"stale-{stale}"
+        _shadow_strategy(signal, entry_price,
+                         {"confluence_count": distinct, "decision": decision,
+                          "btc_bias": bias_note})
 
     if not bias:
         log.info(f"[OracleAlgo] 1H {signal.side} but no fresh 4H bias — waiting for a 4H signal")
@@ -1242,6 +1308,10 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
                                    outcome="rsi_disabled")
             return
+        # Count this alert toward the symbol's 24h alert stream BEFORE any skip —
+        # a re-alert while a position is open still means the move is continuing.
+        repeat_n = _rsi_repeat_n(signal.symbol)
+
         if _find_existing(signal.symbol, "RSI Extreme"):
             log.info(f"[RSI] {signal.symbol} already open — skipping duplicate RSI entry")
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
@@ -1259,9 +1329,12 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         filters_on = os.getenv("RSI_FILTERS_ENABLED", "false").lower() == "true"
         regime_on = os.getenv("RSI_REGIME_GATE", "false").lower() == "true"
         confirm_on = os.getenv("RSI_CONFIRM_ENABLED", "false").lower() == "true"
+        first_only = os.getenv("RSI_FIRST_ALERT_ONLY", "true").lower() == "true"
 
         block = None
-        if filters_on and f_strength is False:
+        if first_only and repeat_n > 1:
+            block = "repeat_alert"
+        elif filters_on and f_strength is False:
             block = "weak_rsi"
         elif filters_on and f_chase is False:
             block = "over_chased"
@@ -1270,9 +1343,14 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
 
         entry_price = bf.get_market_price(signal.symbol)
         decision = block or ("pending_confirm" if confirm_on else "enter")
-        _shadow_strategy(signal, entry_price,
+        # Shadow row uses the live price when BloFin has one, else the price quoted
+        # in the alert itself — so unlisted symbols still get a backtestable entry.
+        # Blocked repeats are shadow-logged too: the analyzer keeps simulating their
+        # outcomes, so the 80/38 first-vs-repeat split keeps accumulating evidence.
+        _shadow_strategy(signal, entry_price or signal.alert_price,
                          {"f_strength": f_strength, "f_chase": f_chase,
-                          "f_regime": f_regime, "decision": decision})
+                          "f_regime": f_regime, "repeat_n": repeat_n,
+                          "decision": decision})
 
         if block:
             log.info(f"[RSI] {signal.symbol} {signal.side.upper()} blocked by filter: {block}")
