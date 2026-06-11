@@ -262,11 +262,28 @@ def main():
     print("\n=== Confirmation-on-turn (simulated, RSI only) ===")
     print(f"  fired {len(conf)} / skipped {nofire} of {len(conf)+nofire} with data")
     print("  confirmed entries:  ", stats(conf))
+
+    print("\n=== RSI Extreme by symbol 1H ADX regime at alert time ===")
+    for lbl in ("ranging_calm", "indecisive", "trending_moderate", "trending_strong"):
+        print(f"  {lbl:26s}", stats([x for x in rsi if x.get("adx_regime") == lbl]))
+    print("  (no ADX data):            ", stats([x for x in rsi if not x.get("adx_regime")]))
+    print("  BTC 4H trending (macro):", stats([x for x in rsi
+                                               if str(x.get("btc_adx_regime","")).endswith(
+                                                   ("trending_moderate","trending_strong"))]))
+    print("  BTC 4H ranging (macro): ", stats([x for x in rsi
+                                               if str(x.get("btc_adx_regime","")).endswith(
+                                                   ("ranging_calm","indecisive"))]))
+
     print("\n=== OracleAlgo (simulated as if every 1H signal entered) ===")
     print("  ALL 1H signals:     ", stats(ora))
     print("  had fresh bias:     ", stats([x for x in ora if x.get("btc_bias") in ("bull", "bear")]))
+    print("  htf-fallback bias:  ", stats([x for x in ora if str(x.get("btc_bias", "")).startswith("htf_")]))
     print("  stale-bias only:    ", stats([x for x in ora if str(x.get("btc_bias", "")).startswith("stale")]))
     print("  no bias at all:     ", stats([x for x in ora if not x.get("btc_bias")]))
+    print("\n  BTC 4H ADX regime at signal time:")
+    for lbl in ("ranging_calm", "indecisive", "trending_moderate", "trending_strong"):
+        subset = [x for x in ora if f"_{lbl}" in str(x.get("btc_adx_regime", ""))]
+        print(f"    {lbl:26s}", stats(subset))
 
 
 if __name__ == "__main__":

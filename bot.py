@@ -31,6 +31,7 @@ from signal_parser import MessageType
 import risk_manager as rm
 import blofin_client as bf
 import dashboard
+import market_regime as mr
 from price_stream import PriceStream
 from logger import log, now_local
 
@@ -1226,25 +1227,46 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     confluence_on = int(os.getenv("ORACLE_CONFLUENCE_N", "1")) > 1
     ok_conf, distinct = _oracle_confluence(signal)
 
+    # BTC 4H ADX regime — annotates shadow rows and serves as a fallback bias
+    # when no text-parsed 4H OracleAlgo signal has arrived yet (the common case:
+    # 6/7 prior signals were bias-starved because the 4H alert hadn't been seen).
+    adx_period = int(os.getenv("ADX_PERIOD", "14"))
+    htf_dir, htf_adx, htf_regime = mr.get_btc_htf_regime("4h", adx_period)
+    btc_adx_label = f"{htf_dir}_{htf_regime}" if htf_dir and htf_regime else ""
+    htf_fallback = os.getenv("ORACLE_HTF_FALLBACK", "true").lower() == "true"
+    htf_trending = bool(htf_dir and htf_regime in ("trending_moderate", "trending_strong"))
+
+    # Pre-compute the btc_bias shadow annotation.  Three cases:
+    #   text bias present → use it as-is ("bull"/"bear")
+    #   HTF fallback active + trending → "htf_bull"/"htf_bear"
+    #   neither → "" or "stale-*" (same as before)
+    if bias:
+        _btc_bias_note = bias
+    elif htf_fallback and htf_trending:
+        _btc_bias_note = f"htf_{htf_dir}"
+    else:
+        stale = _get_oracle_bias(ignore_ttl=True)
+        _btc_bias_note = f"stale-{stale}" if stale else ""
+
     def _shadow(decision):
-        # When the fresh bias is gone, record the STALE one (expired by TTL) in the
-        # btc_bias column as "stale-bull"/"stale-bear" — the analyzer uses this to
-        # answer "would a longer ORACLE_BIAS_TTL_HOURS have let this entry through,
-        # and would it have won?". Blank = no bias has ever been set.
-        bias_note = bias or ""
-        if not bias:
-            stale = _get_oracle_bias(ignore_ttl=True)
-            if stale:
-                bias_note = f"stale-{stale}"
         _shadow_strategy(signal, entry_price,
                          {"confluence_count": distinct, "decision": decision,
-                          "btc_bias": bias_note})
+                          "btc_bias": _btc_bias_note,
+                          "btc_adx_regime": btc_adx_label})
 
     if not bias:
-        log.info(f"[OracleAlgo] 1H {signal.side} but no fresh 4H bias — waiting for a 4H signal")
-        _shadow("no_bias")
-        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_no_bias")
-        return
+        if htf_fallback and htf_trending:
+            bias = htf_dir          # rebind for the direction-alignment check below
+            log.info(f"[OracleAlgo] No text bias — BTC 4H {htf_regime} "
+                     f"({htf_dir.upper()}) ADX={htf_adx:.1f} used as fallback")
+        else:
+            htf_note = (f" (BTC ADX={htf_adx:.1f}, {htf_regime})"
+                        if htf_adx else "")
+            log.info(f"[OracleAlgo] 1H {signal.side} but no fresh 4H bias{htf_note} "
+                     f"— waiting for a 4H signal")
+            _shadow("no_bias")
+            _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_no_bias")
+            return
     if bias != want_bias:
         log.info(f"[OracleAlgo] 1H {signal.side} counter to {bias.upper()} bias — skipping")
         _shadow("counter_bias")
@@ -1343,6 +1365,12 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
 
         entry_price = bf.get_market_price(signal.symbol)
         decision = block or ("pending_confirm" if confirm_on else "enter")
+        # Fetch the symbol's own 1H ADX regime and BTC 4H macro regime for the
+        # shadow row.  Shadow-only (measure-then-tune) — not a gate yet.
+        adx_period = int(os.getenv("ADX_PERIOD", "14"))
+        adx_val, adx_regime_str = mr.get_adx_regime(signal.symbol, "1h", adx_period)
+        btc_dir, _, btc_htf_str = mr.get_btc_htf_regime("4h", adx_period)
+        btc_adx_label = f"{btc_dir}_{btc_htf_str}" if btc_dir and btc_htf_str else ""
         # Shadow row uses the live price when BloFin has one, else the price quoted
         # in the alert itself — so unlisted symbols still get a backtestable entry.
         # Blocked repeats are shadow-logged too: the analyzer keeps simulating their
@@ -1350,6 +1378,8 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         _shadow_strategy(signal, entry_price or signal.alert_price,
                          {"f_strength": f_strength, "f_chase": f_chase,
                           "f_regime": f_regime, "repeat_n": repeat_n,
+                          "adx_value": adx_val or "", "adx_regime": adx_regime_str or "",
+                          "btc_adx_regime": btc_adx_label,
                           "decision": decision})
 
         if block:

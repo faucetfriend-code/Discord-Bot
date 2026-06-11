@@ -129,7 +129,8 @@ _SHADOW_FIELDS = [
     "ts", "source", "symbol", "side",
     "rsi_value", "change_24h", "oracle_type", "btc_bias", "entry_price",
     "f_strength", "f_chase", "f_regime", "confirm_would_fire",
-    "confluence_count", "repeat_n", "decision",
+    "confluence_count", "repeat_n", "adx_value", "adx_regime", "btc_adx_regime",
+    "decision",
 ]
 
 

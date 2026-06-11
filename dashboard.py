@@ -446,6 +446,16 @@ def index():
     watches  = _read_watches()
     state    = _read_strategy_state()
     trades   = _read_trades(40)
+    # Live BTC 4H ADX regime — same cache as the bot; cache hit = free
+    try:
+        import market_regime as mr
+        _btc_htf_dir, _btc_htf_adx, _btc_htf_regime = mr.get_btc_htf_regime("4h")
+        _btc_adx_label = (f"{_btc_htf_dir.upper()} · {(_btc_htf_regime or '').replace('_',' ')}"
+                          if _btc_htf_dir else "—")
+        _btc_adx_color = ("#3fb950" if _btc_htf_dir == "bull" else
+                          "#f85149" if _btc_htf_dir == "bear" else "#8b949e")
+    except Exception:
+        _btc_adx_label, _btc_adx_color = "—", "#8b949e"
     equity   = _read_equity_curve()
     pending  = _read_pending()
     shadow   = _read_shadow(30)
@@ -583,21 +593,44 @@ def index():
 
     def shadow_rows():
         if not shadow:
-            return '<tr><td colspan="8" class="empty">No strategy signals logged yet</td></tr>'
+            return '<tr><td colspan="9" class="empty">No strategy signals logged yet</td></tr>'
         html = ""
         for r in shadow:
             dec = r.get("decision", "")
-            cls = "outcome-ok" if dec in ("enter",) else \
-                  "outcome-err" if dec.startswith("block") or "counter" in dec else "outcome-info"
+            dec_cls = ("outcome-ok" if dec == "enter" else
+                       "outcome-err" if "block" in dec or "counter" in dec or "repeat" in dec else
+                       "outcome-info")
+            # btc_bias + btc_adx_regime stacked in one cell
+            bias = r.get("btc_bias", "") or "—"
+            btc_adx = r.get("btc_adx_regime", "")
+            bias_cell = (f'{bias}<div class="small" style="color:#6e7681">{btc_adx}</div>'
+                         if btc_adx else bias)
+            # Symbol's own ADX (RSI rows) + value
+            adx_r = r.get("adx_regime", "")
+            adx_v = r.get("adx_value", "")
+            if adx_r:
+                adx_color = ("#f85149" if "strong" in adx_r else
+                             "#d29922" if "moderate" in adx_r or "indecisive" in adx_r else
+                             "#8b949e")
+                adx_cell = f'<span style="color:{adx_color}">{adx_r.replace("_"," ")}</span>'
+                if adx_v:
+                    adx_cell += f'<div class="small">{adx_v}</div>'
+            else:
+                adx_cell = "—"
+            # repeat_n badge on the symbol when > 1
+            rn = r.get("repeat_n", "")
+            rn_badge = (f' <span class="tcard-tag" style="color:#d29922">#{rn}</span>'
+                        if rn and str(rn) not in ("", "1") else "")
             html += f"""<tr>
               <td class="small">{(r.get('ts') or '')[11:19]}</td>
-              <td><b>{r.get('symbol','')}</b></td>
+              <td><b>{r.get('symbol','')}</b>{rn_badge}</td>
               <td>{(r.get('side') or '').upper()}</td>
               <td class="small">{r.get('rsi_value','') or r.get('oracle_type','')}</td>
               <td class="small">{r.get('change_24h','')}</td>
-              <td class="small">{r.get('btc_bias','') or '—'}</td>
+              <td class="small">{bias_cell}</td>
+              <td class="small">{adx_cell}</td>
               <td class="small">s:{r.get('f_strength','')} c:{r.get('f_chase','')} r:{r.get('f_regime','')}</td>
-              <td class="{cls}">{dec}</td>
+              <td class="{dec_cls}">{dec}</td>
             </tr>"""
         return html
 
@@ -778,11 +811,14 @@ def index():
 
     <div class="status-bar">
       <div class="stat"><span class="label">RSI Extreme</span><span class="value" style="color:{_strat('RSI_EXTREME_ENABLED')[1]}">{_strat('RSI_EXTREME_ENABLED')[0]}</span></div>
+      <div class="stat"><span class="label">First Alert</span><span class="value" style="color:{_strat('RSI_FIRST_ALERT_ONLY')[1]}">{_strat('RSI_FIRST_ALERT_ONLY')[0]}</span></div>
       <div class="stat"><span class="label">RSI Filters</span><span class="value" style="color:{_flag('RSI_FILTERS_ENABLED')[1]}">{_flag('RSI_FILTERS_ENABLED')[0]}</span></div>
       <div class="stat"><span class="label">RSI Confirm</span><span class="value" style="color:{_flag('RSI_CONFIRM_ENABLED')[1]}">{_flag('RSI_CONFIRM_ENABLED')[0]}</span></div>
       <div class="stat"><span class="label">OracleAlgo</span><span class="value" style="color:{_strat('ORACLEALGO_ENABLED')[1]}">{_strat('ORACLEALGO_ENABLED')[0]}</span></div>
+      <div class="stat"><span class="label">HTF Fallback</span><span class="value" style="color:{_strat('ORACLE_HTF_FALLBACK')[1]}">{_strat('ORACLE_HTF_FALLBACK')[0]}</span></div>
       <div class="stat"><span class="label">Oracle Confluence</span><span class="value">N={os.getenv('ORACLE_CONFLUENCE_N','1')}</span></div>
       <div class="stat"><span class="label">BTC 4H Bias</span><span class="value">{bias_html}</span></div>
+      <div class="stat"><span class="label">BTC 4H Regime</span><span class="value" style="color:{_btc_adx_color};font-size:13px;">{_btc_adx_label}</span></div>
       <div class="stat"><span class="label">Risk / Trade</span><span class="value">{float(os.getenv('RISK_PCT','0.01'))*100:.1f}%</span></div>
       <div class="stat"><span class="label">Shadow Log</span><span class="value" style="color:{_strat('STRATEGY_SHADOW_LOG')[1]}">{_strat('STRATEGY_SHADOW_LOG')[0]}</span></div>
     </div>
@@ -835,7 +871,7 @@ def index():
     <div class="card">
       <div class="card-title">Strategy Shadow Log — filter what-ifs ({len(shadow)})</div>
       <table>
-        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>RSI/Type</th><th>24h</th><th>Bias</th><th>Filters (s/c/r)</th><th>Decision</th></tr></thead>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>RSI/Type</th><th>24h Δ</th><th>Bias / BTC ADX</th><th>Symbol ADX</th><th>Filters (s/c/r)</th><th>Decision</th></tr></thead>
         <tbody>{shadow_rows()}</tbody>
       </table>
     </div>
