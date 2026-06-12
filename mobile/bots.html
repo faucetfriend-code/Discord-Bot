@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bots - Unity Oracle</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+  <style>
+    .bots-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+                 gap:14px; margin-top:16px; }
+    .bot-card { padding:16px; border-radius:16px; }
+    .bot-head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+    .bot-name { font-weight:600; font-size:1rem; }
+    .bot-kind { font-size:.65rem; letter-spacing:.08em; text-transform:uppercase;
+                padding:2px 8px; border-radius:99px; border:1px solid rgba(255,255,255,.18);
+                color:var(--muted, #9aa0a6); }
+    .bot-kind.strategy { color:#ffc107; border-color:#ffc107; }
+    .bot-bal { font-family:'JetBrains Mono',monospace; font-size:1.3rem;
+               font-weight:700; margin-top:8px; }
+    .bot-ret { font-size:.8rem; margin-left:6px; }
+    .up { color:#4ade80; } .down { color:#f87171; }
+    .bot-meta { font-size:.75rem; color:var(--muted, #9aa0a6); margin-top:4px; }
+    .spark { width:100%; height:34px; margin-top:10px; }
+    .btn { display:block; width:100%; margin-top:12px; padding:8px 0; text-align:center;
+           border-radius:10px; border:1px solid rgba(255,255,255,.18); cursor:pointer;
+           background:rgba(255,255,255,.06); color:inherit; font:inherit; font-size:.85rem; }
+    .btn.primary { background:linear-gradient(135deg,#ff6b35,#dc3545); border:none; color:#fff; }
+    .btn.following { background:transparent; border-color:#4ade80; color:#4ade80; }
+    .auth-card { max-width:360px; padding:18px; border-radius:16px; margin-top:16px; }
+    .auth-card input { width:100%; margin-bottom:10px; padding:9px 12px; border-radius:10px;
+                       border:1px solid rgba(255,255,255,.15); background:rgba(0,0,0,.3);
+                       color:inherit; font:inherit; font-size:.9rem; }
+    .auth-err { color:#f87171; font-size:.78rem; min-height:16px; }
+    .auth-row { display:flex; gap:10px; }
+    .pf-card { padding:18px; border-radius:16px; margin-top:16px; }
+    .pf-stats { display:flex; gap:24px; flex-wrap:wrap; }
+    .pf-stat .l { font-size:.68rem; text-transform:uppercase; letter-spacing:.06em;
+                  color:var(--muted, #9aa0a6); display:block; }
+    .pf-stat .v { font-family:'JetBrains Mono',monospace; font-size:1.15rem; font-weight:700; }
+    .pf-pos { width:100%; border-collapse:collapse; font-size:.8rem; margin-top:10px; }
+    .pf-pos th, .pf-pos td { text-align:left; padding:5px 8px;
+                             border-bottom:1px solid rgba(255,255,255,.08); }
+    .pf-pos th { color:var(--muted, #9aa0a6); font-weight:500; font-size:.65rem;
+                 text-transform:uppercase; }
+    .topbar { display:flex; justify-content:space-between; align-items:center;
+              margin-top:8px; flex-wrap:wrap; gap:10px; }
+    .userline { font-size:.85rem; color:var(--muted, #9aa0a6); display:flex;
+                gap:10px; align-items:center; }
+    .userline .btn { width:auto; margin:0; padding:6px 14px; display:inline-block; }
+    .section-label { margin-top:28px; font-size:.72rem; letter-spacing:.1em;
+                     text-transform:uppercase; color:var(--muted, #9aa0a6); }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="topbar">
+      <h2 style="margin:0">Strategy Bots</h2>
+      <div class="userline" id="userbar"><a href="index.html">Home</a></div>
+    </div>
+
+    <div id="authPanel" class="glass auth-card hidden">
+      <input id="username" placeholder="username" autocomplete="username" />
+      <input id="password" type="password" placeholder="password" autocomplete="current-password" />
+      <input id="invite" class="hidden" placeholder="invite code" />
+      <div class="auth-err" id="authErr"></div>
+      <div class="auth-row">
+        <button class="btn primary" onclick="auth('login')">Log in</button>
+        <button class="btn" onclick="auth('register')">Register</button>
+      </div>
+    </div>
+
+    <div id="portfolio" class="hidden">
+      <div class="section-label">My portfolio</div>
+      <div class="glass pf-card">
+        <div class="pf-stats">
+          <div class="pf-stat"><span class="l">Balance</span><span class="v" id="pBal"></span></div>
+          <div class="pf-stat"><span class="l">Return</span><span class="v" id="pRet"></span></div>
+          <div class="pf-stat"><span class="l">Following</span><span class="v" id="pFollow"></span></div>
+          <div class="pf-stat"><span class="l">Open</span><span class="v" id="pOpen"></span></div>
+        </div>
+        <svg class="spark" id="pSpark" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>
+        <div id="pPositions"></div>
+      </div>
+    </div>
+
+    <div class="section-label">Available bots</div>
+    <div class="bots-grid" id="botGrid"></div>
+  </main>
+
+<script>
+const API = '..';  /* /mobile/bots.html -> dashboard API root */
+const tok = () => localStorage.getItem('ub_token') || '';
+const hdrs = () => tok() ? {'Authorization':'Bearer '+tok(),'Content-Type':'application/json'}
+                         : {'Content-Type':'application/json'};
+
+function spark(el, pts, color) {
+  if (!pts || pts.length < 2) { el.innerHTML=''; return; }
+  const min = Math.min(...pts), max = Math.max(...pts), span = (max-min) || 1;
+  const step = 100 / (pts.length - 1);
+  const d = pts.map((p,i) =>
+    (i?'L':'M') + (i*step).toFixed(2) + ',' + (28 - (p-min)/span*26).toFixed(2)
+  ).join(' ');
+  el.innerHTML = '<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.5"/>';
+}
+
+function fmt(v) { return '$' + Number(v).toLocaleString(undefined,
+  {minimumFractionDigits:2, maximumFractionDigits:2}); }
+
+async function loadBots() {
+  const r = await fetch(API+'/api/v1/bots', {headers: hdrs()});
+  const j = await r.json();
+  const grid = document.getElementById('botGrid');
+  grid.innerHTML = '';
+  for (const b of j.bots) {
+    const cls = b.return_pct >= 0 ? 'up' : 'down';
+    const card = document.createElement('div');
+    card.className = 'glass bot-card';
+    card.innerHTML =
+      '<div class="bot-head"><span class="bot-name">'+b.display_name+'</span>'+
+      '<span class="bot-kind '+b.kind+'">'+b.kind+'</span></div>'+
+      '<div class="bot-bal">'+fmt(b.balance)+
+      '<span class="bot-ret '+cls+'">'+(b.return_pct>=0?'+':'')+b.return_pct+'%</span></div>'+
+      '<div class="bot-meta">'+b.trades+' trades'+
+      (b.win_rate!==null ? ' / '+b.win_rate+'% WR' : '')+
+      ' / '+b.open_positions+' open</div>'+
+      '<svg class="spark" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>'+
+      (j.logged_in
+        ? '<button class="btn '+(b.following?'following':'')+'" data-bot="'+b.key+'">'+
+          (b.following?'Following':'Follow')+'</button>'
+        : '');
+    grid.appendChild(card);
+    fetch(API+'/api/v1/bots/'+encodeURIComponent(b.key)).then(r=>r.json()).then(d=>{
+      if (d.success) spark(card.querySelector('svg'), d.bot.equity_curve,
+        b.return_pct >= 0 ? '#4ade80' : '#f87171');
+    });
+    const btn = card.querySelector('button[data-bot]');
+    if (btn) btn.onclick = async () => {
+      const action = btn.classList.contains('following') ? 'unfollow' : 'follow';
+      await fetch(API+'/api/v1/me/'+action, {method:'POST', headers:hdrs(),
+        body: JSON.stringify({bot: btn.dataset.bot})});
+      loadBots(); loadPortfolio();
+    };
+  }
+}
+
+async function loadPortfolio() {
+  const panel = document.getElementById('portfolio');
+  if (!tok()) { panel.classList.add('hidden'); return; }
+  const r = await fetch(API+'/api/v1/me/portfolio', {headers: hdrs()});
+  if (r.status === 401) { localStorage.removeItem('ub_token'); refreshUI(); return; }
+  const p = (await r.json()).portfolio;
+  panel.classList.remove('hidden');
+  document.getElementById('pBal').textContent = fmt(p.balance);
+  const ret = document.getElementById('pRet');
+  ret.textContent = (p.return_pct>=0?'+':'')+p.return_pct+'%';
+  ret.className = 'v ' + (p.return_pct>=0?'up':'down');
+  document.getElementById('pFollow').textContent = p.following.length;
+  document.getElementById('pOpen').textContent = p.open_positions.length;
+  spark(document.getElementById('pSpark'), p.equity_curve,
+        p.return_pct>=0 ? '#4ade80' : '#f87171');
+  const pos = document.getElementById('pPositions');
+  pos.innerHTML = p.open_positions.length
+    ? '<table class="pf-pos"><tr><th>Bot</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Last</th></tr>'+
+      p.open_positions.map(x=>'<tr><td>'+x.analyst+'</td><td>'+x.symbol+'</td><td>'+
+        x.side.toUpperCase()+'</td><td>'+x.entry+'</td><td>'+(x.last_price||'-')+
+        '</td></tr>').join('')+'</table>'
+    : '';
+}
+
+async function auth(mode) {
+  const body = {username: document.getElementById('username').value,
+                password: document.getElementById('password').value,
+                invite_code: document.getElementById('invite').value};
+  const r = await fetch(API+'/api/v1/'+mode, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!j.success) {
+    document.getElementById('authErr').textContent = j.error || 'Failed';
+    if ((j.error||'').toLowerCase().includes('invite'))
+      document.getElementById('invite').classList.remove('hidden');
+    return;
+  }
+  localStorage.setItem('ub_token', j.token);
+  refreshUI();
+}
+
+function logout() { localStorage.removeItem('ub_token'); refreshUI(); }
+
+async function refreshUI() {
+  const bar = document.getElementById('userbar');
+  const authPanel = document.getElementById('authPanel');
+  if (tok()) {
+    const r = await fetch(API+'/api/v1/me', {headers: hdrs()});
+    if (r.ok) {
+      const u = (await r.json()).user;
+      bar.innerHTML = '<a href="index.html">Home</a> <b>'+u.username+'</b> '+
+                      '<button class="btn" onclick="logout()">Log out</button>';
+      authPanel.classList.add('hidden');
+    } else { localStorage.removeItem('ub_token'); return refreshUI(); }
+  } else {
+    bar.innerHTML = '<a href="index.html">Home</a>';
+    authPanel.classList.remove('hidden');
+  }
+  loadBots(); loadPortfolio();
+}
+
+refreshUI();
+setInterval(() => { loadBots(); loadPortfolio(); }, 30000);
+</script>
+</body>
+</html>

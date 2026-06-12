@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import accounts  # virtual bot/user paper accounts
 import logger as _logger_mod
 import position_tracker as pt
 import discord_reader as dr
@@ -37,6 +38,7 @@ from logger import log, now_local
 
 _logger_mod.init_db()
 pt.init_db()
+accounts.init_db()
 
 
 def _get_whitelist() -> list[str]:
@@ -756,7 +758,7 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
     pt.add_realized_pnl(position.analyst, final_gross - final_exit_fee - entry_fee - funding)
     new_lev = pt.record_outcome(position.analyst, won, step, lo, hi)
     pt.close_position(position.order_id)
-    pt.record_trade(
+    trade_id = pt.record_trade(
         symbol=position.symbol, side=position.side, analyst=position.analyst,
         entry=position.entry, exit_price=exit_price, size=position.orig_size,
         leverage=position.leverage, soft_stop=position.soft_stop,
@@ -765,6 +767,16 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
         gross_pnl=round(gross_total, 6), fees=round(fees_total, 6),
         funding=round(funding, 6), net_pnl=round(net_total, 6), dry_run=dry_run,
     )
+
+    # Mirror the result into the per-bot virtual balance and every subscribed
+    # user's paper portfolio (R-multiple scaling; see accounts.py).
+    try:
+        engine_bal = bf.get_balance() or float(os.getenv("ENGINE_BASELINE_BALANCE", "1000"))
+        risk_amount = engine_bal * float(os.getenv("RISK_PCT", "0.01"))
+        accounts.settle_trade(position.analyst, net_total, risk_amount,
+                              trade_id=trade_id, symbol=position.symbol)
+    except Exception as e:
+        log.warning(f"Virtual account settle failed for {position.symbol}: {e}")
 
     verdict = "WIN" if won else "LOSS"
     arrow = f"+{step}" if won else f"-{step}"
@@ -1637,6 +1649,11 @@ def main():
 
     # Subsystem health check (BloFin, LM Studio, Chrome/Discord).
     _startup_health_check(dry_run)
+    # Register every signal source as a virtual bot (backfills history on first run).
+    try:
+        accounts.ensure_bots(accounts.STRATEGY_SOURCES + whitelist)
+    except Exception as e:
+        log.warning(f"Virtual bot registration failed: {e}")
     pt.prune_seen(5000)  # cap the seen-messages table so it can't grow unbounded
     _refresh_account(bot_state)  # seed dashboard balance/equity/free-margin
     seen_ids = pt.get_seen_ids()

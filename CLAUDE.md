@@ -43,6 +43,7 @@ python bot.py
 | `risk_manager.py` | Validation, position sizing, lot-size rounding |
 | `position_tracker.py` | SQLite: open positions + seen message IDs |
 | `logger.py` | Rotating log to `bot.log` + `signals_log.csv` + `bot.db` |
+| `accounts.py` | Virtual bots + users: each signal source is a "bot" with its own paper balance; users register at `/bots`, follow bots, paper portfolios mirror followed bots (R-multiple scaling) |
 
 ## Tuning Signal Parser
 

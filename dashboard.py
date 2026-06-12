@@ -27,6 +27,8 @@ from pathlib import Path
 from flask import (Flask, Response, jsonify, redirect, request,
                    send_from_directory)
 
+import accounts  # virtual bot/user paper accounts
+
 DB_PATH    = Path(__file__).parent / "bot.db"
 LOG_PATH   = Path(__file__).parent / "bot.log"
 # Static mobile UI bundle (Unity Oracle prototype) served at /mobile.
@@ -53,7 +55,12 @@ def _require_auth():
     # bearer token (see _require_oracle_token), so skip Basic auth for those paths.
     # The /mobile prototype is intentionally open (no auth yet) — it's a static UI
     # with no secrets; revisit before wiring it to live/authenticated data.
-    if request.path.startswith("/api/oracle/") or request.path.startswith("/mobile"):
+    # /api/v1/* (user-facing bots/portfolio API) authenticates with per-user
+    # bearer tokens (see _current_user), so Basic auth is skipped there too.
+    # /bots and /portfolio are the user-facing pages driven by that API.
+    if (request.path.startswith("/api/oracle/") or request.path.startswith("/mobile")
+            or request.path.startswith("/api/v1/") or request.path == "/bots"
+            or request.path == "/portfolio"):
         return
     password = os.getenv("DASHBOARD_PASSWORD", "").strip()
     if not password:
@@ -432,6 +439,334 @@ def mobile_asset(filename: str):
     """Serve any file in the mobile UI bundle (pages, css/, js/, images).
     send_from_directory blocks path traversal outside MOBILE_DIR."""
     return send_from_directory(MOBILE_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# User-facing v1 API: bots-as-a-service. Register/login returns a bearer token;
+# authenticated users follow bots and run a paper portfolio that mirrors them.
+# ---------------------------------------------------------------------------
+
+def _current_user() -> dict | None:
+    """Resolve the user from 'Authorization: Bearer <token>', else None."""
+    header = request.headers.get("Authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    return accounts.get_user_by_token(header[7:].strip())
+
+
+def _user_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        user = _current_user()
+        if not user:
+            return jsonify({"success": False, "error": "Login required"}), 401
+        return fn(user, *args, **kwargs)
+    return wrapper
+
+
+@app.route("/api/v1/register", methods=["POST"])
+def api_v1_register():
+    """Create an account. If USER_INVITE_CODE is set in .env, it is required."""
+    data = request.get_json(silent=True) or {}
+    invite_required = os.getenv("USER_INVITE_CODE", "").strip()
+    if invite_required and not hmac.compare_digest(
+            str(data.get("invite_code", "")), invite_required):
+        return jsonify({"success": False, "error": "Invalid invite code"}), 403
+    token, err = accounts.register_user(data.get("username", ""),
+                                        data.get("password", ""))
+    if err:
+        return jsonify({"success": False, "error": err}), 400
+    return jsonify({"success": True, "token": token})
+
+
+@app.route("/api/v1/login", methods=["POST"])
+def api_v1_login():
+    data = request.get_json(silent=True) or {}
+    token, err = accounts.login_user(data.get("username", ""),
+                                     data.get("password", ""))
+    if err:
+        return jsonify({"success": False, "error": err}), 401
+    return jsonify({"success": True, "token": token})
+
+
+@app.route("/api/v1/bots")
+def api_v1_bots():
+    """All virtual bots with balances and stats. If logged in, marks follows."""
+    bots = accounts.get_bots()
+    user = _current_user()
+    following = set(accounts.get_subscriptions(user["id"])) if user else set()
+    for b in bots:
+        b["following"] = b["key"] in following
+    return jsonify({"success": True, "bots": bots,
+                    "logged_in": bool(user)})
+
+
+@app.route("/api/v1/bots/<path:bot_key>")
+def api_v1_bot_detail(bot_key: str):
+    bot = accounts.get_bot_detail(bot_key)
+    if not bot:
+        return jsonify({"success": False, "error": "Unknown bot"}), 404
+    user = _current_user()
+    bot["following"] = bool(
+        user and bot_key in accounts.get_subscriptions(user["id"]))
+    return jsonify({"success": True, "bot": bot})
+
+
+@app.route("/api/v1/me")
+@_user_required
+def api_v1_me(user):
+    return jsonify({"success": True, "user": {
+        "username": user["username"], "balance": user["balance"],
+        "start_balance": user["start_balance"], "risk_pct": user["risk_pct"],
+        "created_at": user["created_at"],
+        "following": accounts.get_subscriptions(user["id"]),
+    }})
+
+
+@app.route("/api/v1/me/follow", methods=["POST"])
+@_user_required
+def api_v1_follow(user):
+    data = request.get_json(silent=True) or {}
+    ok, err = accounts.follow(user["id"], str(data.get("bot", "")))
+    if not ok:
+        return jsonify({"success": False, "error": err}), 400
+    return jsonify({"success": True,
+                    "following": accounts.get_subscriptions(user["id"])})
+
+
+@app.route("/api/v1/me/unfollow", methods=["POST"])
+@_user_required
+def api_v1_unfollow(user):
+    data = request.get_json(silent=True) or {}
+    accounts.unfollow(user["id"], str(data.get("bot", "")))
+    return jsonify({"success": True,
+                    "following": accounts.get_subscriptions(user["id"])})
+
+
+@app.route("/api/v1/me/portfolio")
+@_user_required
+def api_v1_portfolio(user):
+    return jsonify({"success": True,
+                    "portfolio": accounts.get_portfolio(user["id"])})
+
+
+@app.route("/portfolio")
+def portfolio_page():
+    return redirect("/bots", code=308)
+
+
+@app.route("/bots")
+def bots_page():
+    """Self-contained user-facing page: bot marketplace + paper portfolio.
+    Talks to /api/v1 with a bearer token kept in localStorage."""
+    return Response(_BOTS_PAGE_HTML, content_type="text/html; charset=utf-8")
+
+
+_BOTS_PAGE_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unity Bots</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3;
+          --muted:#8b949e; --green:#3fb950; --red:#f85149; --accent:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.5 -apple-system,'Segoe UI',Roboto,sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:20px 16px 60px; }
+  header { display:flex; align-items:center; justify-content:space-between;
+           margin-bottom:18px; flex-wrap:wrap; gap:10px; }
+  h1 { font-size:20px; margin:0; }
+  h2 { font-size:15px; color:var(--muted); margin:26px 0 10px;
+       text-transform:uppercase; letter-spacing:.08em; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--border);
+          border-radius:10px; padding:14px; }
+  .bot-head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .bot-name { font-weight:600; }
+  .tag { font-size:10px; padding:1px 7px; border-radius:10px;
+         border:1px solid var(--border); color:var(--muted); white-space:nowrap; }
+  .tag.strategy { color:var(--accent); border-color:var(--accent); }
+  .bal { font-size:20px; font-weight:700; margin:6px 0 0; }
+  .ret { font-size:12px; }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+  .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  .spark { width:100%; height:36px; margin-top:8px; }
+  button { background:#21262d; color:var(--text); border:1px solid var(--border);
+           border-radius:6px; padding:6px 14px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--muted); }
+  button.primary { background:#1f6feb; border-color:#1f6feb; }
+  button.following { background:transparent; border-color:var(--green); color:var(--green); }
+  .follow-btn { width:100%; margin-top:10px; }
+  input { background:#0d1117; border:1px solid var(--border); color:var(--text);
+          border-radius:6px; padding:7px 10px; font-size:13px; width:100%; }
+  .auth-box { max-width:340px; }
+  .auth-box .row { margin-bottom:8px; }
+  .err { color:var(--red); font-size:12px; min-height:16px; }
+  .userbar { display:flex; gap:10px; align-items:center; color:var(--muted); font-size:13px; }
+  .stats-row { display:flex; gap:18px; flex-wrap:wrap; margin-top:6px; }
+  .stat .label { color:var(--muted); font-size:11px; display:block; }
+  .stat .value { font-size:16px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; }
+  .hidden { display:none; }
+  a { color:var(--accent); text-decoration:none; }
+</style></head>
+<body><div class="wrap">
+<header>
+  <h1>Unity Bots</h1>
+  <div class="userbar" id="userbar"></div>
+</header>
+
+<div id="authPanel" class="card auth-box hidden">
+  <div class="row"><input id="username" placeholder="username" autocomplete="username"></div>
+  <div class="row"><input id="password" type="password" placeholder="password" autocomplete="current-password"></div>
+  <div class="row hidden" id="inviteRow"><input id="invite" placeholder="invite code"></div>
+  <div class="err" id="authErr"></div>
+  <div style="display:flex; gap:8px">
+    <button class="primary" onclick="auth('login')">Log in</button>
+    <button onclick="auth('register')">Register</button>
+  </div>
+</div>
+
+<div id="portfolio" class="hidden">
+  <h2>My portfolio</h2>
+  <div class="card">
+    <div class="stats-row">
+      <div class="stat"><span class="label">Balance</span><span class="value" id="pBal"></span></div>
+      <div class="stat"><span class="label">Return</span><span class="value" id="pRet"></span></div>
+      <div class="stat"><span class="label">Following</span><span class="value" id="pFollow"></span></div>
+      <div class="stat"><span class="label">Open positions</span><span class="value" id="pOpen"></span></div>
+    </div>
+    <svg class="spark" id="pSpark" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>
+    <div id="pPositions"></div>
+  </div>
+</div>
+
+<h2>Available bots</h2>
+<div class="grid" id="botGrid"></div>
+
+</div>
+<script>
+const tok = () => localStorage.getItem('ub_token') || '';
+const hdrs = () => tok() ? {'Authorization':'Bearer '+tok(),'Content-Type':'application/json'}
+                         : {'Content-Type':'application/json'};
+
+function spark(el, pts, color) {
+  if (!pts || pts.length < 2) { el.innerHTML=''; return; }
+  const min = Math.min(...pts), max = Math.max(...pts), span = (max-min) || 1;
+  const step = 100 / (pts.length - 1);
+  const d = pts.map((p,i) =>
+    (i?'L':'M') + (i*step).toFixed(2) + ',' + (28 - (p-min)/span*26).toFixed(2)
+  ).join(' ');
+  el.innerHTML = '<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.5"/>';
+}
+
+function fmt(v) { return '$' + Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+
+async function loadBots() {
+  const r = await fetch('/api/v1/bots', {headers: hdrs()});
+  const j = await r.json();
+  const grid = document.getElementById('botGrid');
+  grid.innerHTML = '';
+  for (const b of j.bots) {
+    const retCls = b.return_pct >= 0 ? 'pos' : 'neg';
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML =
+      '<div class="bot-head"><span class="bot-name">'+b.display_name+'</span>'+
+      '<span class="tag '+b.kind+'">'+b.kind.toUpperCase()+'</span></div>'+
+      '<div class="bal">'+fmt(b.balance)+' <span class="ret '+retCls+'">'+
+      (b.return_pct>=0?'+':'')+b.return_pct+'%</span></div>'+
+      '<div class="meta">'+b.trades+' trades'+
+      (b.win_rate!==null ? ' / '+b.win_rate+'% win rate' : '')+
+      ' / '+b.open_positions+' open</div>'+
+      '<svg class="spark" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>'+
+      (j.logged_in
+        ? '<button class="follow-btn '+(b.following?'following':'')+'" data-bot="'+b.key+'">'+
+          (b.following?'Following':'Follow')+'</button>'
+        : '');
+    grid.appendChild(card);
+    fetch('/api/v1/bots/'+encodeURIComponent(b.key)).then(r=>r.json()).then(d=>{
+      if (d.success) spark(card.querySelector('svg'), d.bot.equity_curve,
+        b.return_pct >= 0 ? '#3fb950' : '#f85149');
+    });
+    const btn = card.querySelector('.follow-btn');
+    if (btn) btn.onclick = async () => {
+      const action = btn.classList.contains('following') ? 'unfollow' : 'follow';
+      await fetch('/api/v1/me/'+action, {method:'POST', headers:hdrs(),
+        body: JSON.stringify({bot: btn.dataset.bot})});
+      loadBots(); loadPortfolio();
+    };
+  }
+}
+
+async function loadPortfolio() {
+  const panel = document.getElementById('portfolio');
+  if (!tok()) { panel.classList.add('hidden'); return; }
+  const r = await fetch('/api/v1/me/portfolio', {headers: hdrs()});
+  if (r.status === 401) { localStorage.removeItem('ub_token'); refreshUI(); return; }
+  const p = (await r.json()).portfolio;
+  panel.classList.remove('hidden');
+  document.getElementById('pBal').textContent = fmt(p.balance);
+  const ret = document.getElementById('pRet');
+  ret.textContent = (p.return_pct>=0?'+':'')+p.return_pct+'%';
+  ret.className = 'value ' + (p.return_pct>=0?'pos':'neg');
+  document.getElementById('pFollow').textContent = p.following.length;
+  document.getElementById('pOpen').textContent = p.open_positions.length;
+  spark(document.getElementById('pSpark'), p.equity_curve,
+        p.return_pct>=0 ? '#3fb950' : '#f85149');
+  const pos = document.getElementById('pPositions');
+  pos.innerHTML = p.open_positions.length
+    ? '<table><tr><th>Bot</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Last</th></tr>'+
+      p.open_positions.map(x=>'<tr><td>'+x.analyst+'</td><td>'+x.symbol+'</td><td>'+
+        x.side.toUpperCase()+'</td><td>'+x.entry+'</td><td>'+(x.last_price||'-')+
+        '</td></tr>').join('')+'</table>'
+    : '';
+}
+
+async function auth(mode) {
+  const body = {username: document.getElementById('username').value,
+                password: document.getElementById('password').value,
+                invite_code: document.getElementById('invite').value};
+  const r = await fetch('/api/v1/'+mode, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!j.success) {
+    document.getElementById('authErr').textContent = j.error || 'Failed';
+    if ((j.error||'').toLowerCase().includes('invite'))
+      document.getElementById('inviteRow').classList.remove('hidden');
+    return;
+  }
+  localStorage.setItem('ub_token', j.token);
+  refreshUI();
+}
+
+function logout() { localStorage.removeItem('ub_token'); refreshUI(); }
+
+async function refreshUI() {
+  const bar = document.getElementById('userbar');
+  const authPanel = document.getElementById('authPanel');
+  if (tok()) {
+    const r = await fetch('/api/v1/me', {headers: hdrs()});
+    if (r.ok) {
+      const u = (await r.json()).user;
+      bar.innerHTML = 'Signed in as <b>'+u.username+'</b>&nbsp;'+
+                      '<button onclick="logout()">Log out</button>';
+      authPanel.classList.add('hidden');
+    } else { localStorage.removeItem('ub_token'); return refreshUI(); }
+  } else {
+    bar.innerHTML = '';
+    authPanel.classList.remove('hidden');
+  }
+  loadBots(); loadPortfolio();
+}
+
+refreshUI();
+setInterval(() => { loadBots(); loadPortfolio(); }, 30000);
+</script>
+</body></html>"""
 
 
 @app.route("/")
