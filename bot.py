@@ -1449,9 +1449,20 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         if existing:
             _process_update(signal, existing, dry_run)
         else:
-            log.info(f"UPDATE for {signal.symbol} but no open position — ignoring")
-            _logger_mod.log_signal(analyst, msg.get("content", ""), signal=signal,
-                                   outcome="update_no_position")
+            # Symbol extraction may have failed; if this analyst has exactly one
+            # open position the update almost certainly targets it.
+            analyst_positions = [p for p in pt.get_open_positions()
+                                 if p.analyst == analyst_key]
+            if len(analyst_positions) == 1:
+                target = analyst_positions[0]
+                log.info(f"[{analyst_key}] UPDATE '{signal.symbol}' not open — "
+                         f"applying to only open position: {target.symbol}")
+                signal.symbol = target.symbol
+                _process_update(signal, target, dry_run)
+            else:
+                log.info(f"UPDATE for {signal.symbol} but no open position — ignoring")
+                _logger_mod.log_signal(analyst, msg.get("content", ""), signal=signal,
+                                       outcome="update_no_position")
 
     elif signal.message_type == MessageType.CLOSE:
         if existing:

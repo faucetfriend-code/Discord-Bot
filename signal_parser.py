@@ -130,7 +130,10 @@ _UPDATE_KEYWORDS = re.compile(
     r'|break\s*even|breakeven'
     r'|t\.?p\.?\s*[12345]\s+hit|take\s+profit\s+hit'
     r'|trailing\s+stop'
-    r'|partial\s+(?:close|profit|tp)',
+    r'|partial\s+(?:close|profit|tp)'
+    r'|stop\s+loss\s+updated|targets?\s+updated'
+    r'|hard\s+s\.?l\b|soft\s+s\.?l\b'
+    r'|full\s+tp\s+at|setting\s+(?:full\s+)?tp',
     re.IGNORECASE,
 )
 
@@ -154,13 +157,24 @@ _POSITION_INFO = re.compile(
     re.IGNORECASE,
 )
 
-# Extract a number after SL/stop keywords in an update message
+# Extract a number after SL/stop keywords in an update message.
+# Arrow variants ("SL: $old -> $new") are kept separate so _try_update_regex
+# can prefer them — the plain extractor would capture the OLD value.
 _UPDATE_SL_EXTRACT = re.compile(
-    r'(?:s\.?l\.?|stop(?:\s+loss)?)(?:\s+to|\s*=|:)?\s*\$?([\d,.]+)',
+    r'(?:hard\s+|soft\s+)?(?:s\.?l\.?|stop(?:\s+loss)?)(?:\s+at|\s+to|\s*=|:)?\s*\$?([\d,.]+)',
     re.IGNORECASE,
 )
 _UPDATE_TP_EXTRACT = re.compile(
-    r'(?:t\.?p\.?\b|take\s*profit)(?:\s+to|\s*=|:)?\s*\$?([\d,.]+)',
+    r'(?:full\s+)?(?:t\.?p\.?\b|take\s*profit)(?:\s+at|\s+to|\s*=|:)?\s*\$?([\d,.]+)',
+    re.IGNORECASE,
+)
+# Discord embed update cards write "SL: $old -> $new"; capture the NEW value.
+_SL_ARROW = re.compile(
+    r'(?:s\.?l\.?|stop(?:\s+loss)?)\s*:\s*\$?[\d,.]+\s*[-=>→]+\s*\$?([\d,.]+)',
+    re.IGNORECASE,
+)
+_TP_ARROW = re.compile(
+    r'(?:t\.?p\.?\b|take\s*profit)\s*:\s*\$?[\d,.]+\s*[-=>→]+\s*\$?([\d,.]+)',
     re.IGNORECASE,
 )
 _SYMBOL_EXTRACT = re.compile(
@@ -571,9 +585,13 @@ def _try_update_regex(text: str, msg: dict) -> Optional[Signal]:
         return None
 
     symbol = _extract_symbol(text)
+    if symbol == "UNKNOWN-USDT":
+        return None  # no symbol visible; let the LLM try
 
-    new_sl_m = _UPDATE_SL_EXTRACT.search(text)
-    new_tp_m = _UPDATE_TP_EXTRACT.search(text)
+    # Arrow format ("SL: $old -> $new") takes priority — the plain extractor
+    # would grab the OLD value that sits before the arrow.
+    new_sl_m = _SL_ARROW.search(text) or _UPDATE_SL_EXTRACT.search(text)
+    new_tp_m = _TP_ARROW.search(text) or _UPDATE_TP_EXTRACT.search(text)
     new_sl = _to_float(new_sl_m.group(1)) if new_sl_m else None
     new_tp = _to_float(new_tp_m.group(1)) if new_tp_m else None
 
