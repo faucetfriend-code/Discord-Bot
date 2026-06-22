@@ -19,6 +19,7 @@ project logger. get_market_price() will use a registered PriceStream cache if pr
 
 import os
 import sys
+import time
 from typing import Optional
 
 from blofin import BloFinClient as _BloFinClient
@@ -157,20 +158,31 @@ def get_balance() -> Optional[float]:
 
 
 _instruments_cache: Optional[dict] = None
+_instruments_ts: float = 0.0
 
 
 def _load_instruments() -> dict:
-    """Fetch and cache all SWAP instrument specs, keyed by instId."""
-    global _instruments_cache
-    if _instruments_cache is None:
-        try:
-            resp = _get_client().public.get_instruments()
-            data = resp.get("data", []) or []
-            _instruments_cache = {d["instId"]: d for d in data if d.get("instId")}
+    """Fetch and cache all SWAP instrument specs, keyed by instId.
+
+    The cache has a TTL (INSTRUMENT_CACHE_TTL_MIN, default 360 = 6h) so symbols
+    newly listed mid-session are picked up without restarting the bot. On a
+    refresh failure the previous good cache is kept rather than blanked."""
+    global _instruments_cache, _instruments_ts
+    ttl = float(os.getenv("INSTRUMENT_CACHE_TTL_MIN", "360")) * 60
+    if _instruments_cache is not None and (time.time() - _instruments_ts) < ttl:
+        return _instruments_cache
+    try:
+        resp = _get_client().public.get_instruments()
+        data = resp.get("data", []) or []
+        loaded = {d["instId"]: d for d in data if d.get("instId")}
+        if loaded:                       # only swap in a non-empty fetch
+            _instruments_cache = loaded
+            _instruments_ts = time.time()
             log.info(f"Loaded {len(_instruments_cache)} BloFin instrument specs")
-        except Exception as e:
-            log.error(f"Failed to load instruments: {e}")
-            _instruments_cache = {}
+    except Exception as e:
+        log.error(f"Failed to load instruments: {e}")
+    if _instruments_cache is None:       # first load failed outright
+        _instruments_cache = {}
     return _instruments_cache
 
 
@@ -383,6 +395,59 @@ def get_account_summary() -> Optional[dict]:
 # Order placement & management
 # ---------------------------------------------------------------------------
 
+class OrderRejected(Exception):
+    """
+    Raised when BloFin accepts the HTTP call (200) but rejects the order itself.
+
+    A non-zero business `code` (or per-order `sCode`), or a success code with no
+    `ordId`, means the order never reached the book - insufficient balance, symbol
+    delisted on this endpoint, bad price, etc. Treating that as success would record
+    a phantom position the exchange never opened.
+    """
+
+    def __init__(self, code, msg, resp=None):
+        self.code = str(code)
+        self.msg = str(msg or "")
+        self.resp = resp
+        super().__init__(f"order rejected (code {self.code}): {self.msg}")
+
+
+def _order_id_from_resp(resp: dict) -> str:
+    """Pull the exchange order id out of a place-order response, or '' if absent."""
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("ordId", "") or "")
+
+
+def _validate_order_resp(resp: dict) -> str:
+    """
+    Confirm BloFin actually accepted the order; return its order id on success.
+
+    The HTTP layer can return 200 with a non-zero business `code` - that is a
+    rejection, not a success. We also check the per-order `sCode` (BloFin echoes
+    a status per order) and require a non-empty `ordId`. Raises OrderRejected on
+    any of these, so the caller never records an unfilled order as "executed".
+    """
+    if not isinstance(resp, dict):
+        raise OrderRejected("unknown", f"unexpected response type: {type(resp).__name__}", resp)
+    code = str(resp.get("code", "0"))
+    if code != "0":
+        raise OrderRejected(code, resp.get("msg", ""), resp)
+    data = resp.get("data")
+    first = data[0] if isinstance(data, list) and data else data
+    if isinstance(first, dict):
+        scode = str(first.get("sCode", "0") or "0")
+        if scode != "0":
+            raise OrderRejected(scode, first.get("sMsg") or resp.get("msg", ""), resp)
+    ord_id = _order_id_from_resp(resp)
+    if not ord_id:
+        raise OrderRejected(code, resp.get("msg", "") or "no ordId in response", resp)
+    return ord_id
+
+
 def place_order(signal, size: float) -> dict:
     """
     Place a limit order with TP and SL attached.
@@ -407,6 +472,7 @@ def place_order(signal, size: float) -> dict:
         sl_trigger_px=str(signal.sl),
     )
     log.info(f"Order response: {resp}")
+    _validate_order_resp(resp)  # raises OrderRejected on a non-zero code / missing ordId
     return resp
 
 
@@ -434,6 +500,7 @@ def place_market_order(signal, size: float) -> dict:
     client = _get_client()
     resp = client.trading.place_order(**params)
     log.info(f"Market order response: {resp}")
+    _validate_order_resp(resp)  # raises OrderRejected on a non-zero code / missing ordId
     return resp
 
 

@@ -17,6 +17,8 @@ import math
 import os
 import queue as _queue
 import re
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -607,7 +609,10 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
             resp = bf.place_market_order(signal, size)
         else:
             resp = bf.place_order(signal, size)
-        order_id = resp.get("data", {}).get("ordId", "") or str(resp)
+        # place_*_order has already validated the response and guarantees a real
+        # ordId here (it raises OrderRejected otherwise) - never fall back to a
+        # stringified error dict, which would make later amend/close impossible.
+        order_id = bf._order_id_from_resp(resp)
         log.info(f"Order placed: {order_id} @ {applied_lev}x")
 
         pos = pt.Position(
@@ -628,6 +633,15 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         pt.open_position(pos)
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome="executed", order_id=order_id)
+    except bf.OrderRejected as e:
+        # The exchange refused the order (insufficient balance, delisted symbol,
+        # bad price, ...). No position was opened - do NOT insert one, and log a
+        # distinct outcome so it's never mistaken for a fill.
+        log.error(f"[{analyst}] Order REJECTED for {signal.symbol}: {e}")
+        _alert(f"Order rejected for {signal.symbol} (code {e.code}): {e.msg}",
+               "error", key=f"order_rejected_{signal.symbol}")
+        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                               outcome=f"rejected:{e.code}:{e.msg}")
     except Exception as e:
         log.error(f"Order failed: {e}")
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
@@ -769,14 +783,26 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
     )
 
     # Mirror the result into the per-bot virtual balance and every subscribed
-    # user's paper portfolio (R-multiple scaling; see accounts.py).
-    try:
-        engine_bal = bf.get_balance() or float(os.getenv("ENGINE_BASELINE_BALANCE", "1000"))
-        risk_amount = engine_bal * float(os.getenv("RISK_PCT", "0.01"))
-        accounts.settle_trade(position.analyst, net_total, risk_amount,
-                              trade_id=trade_id, symbol=position.symbol)
-    except Exception as e:
-        log.warning(f"Virtual account settle failed for {position.symbol}: {e}")
+    # user's paper portfolio (R-multiple scaling; see accounts.py). Retry once,
+    # then alert loudly — a silent drop here desyncs followers' paper portfolios
+    # from the bot they track, with no other signal that it happened.
+    engine_bal = bf.get_balance() or float(os.getenv("ENGINE_BASELINE_BALANCE", "1000"))
+    risk_amount = engine_bal * float(os.getenv("RISK_PCT", "0.01"))
+    for attempt in (1, 2):
+        try:
+            accounts.settle_trade(position.analyst, net_total, risk_amount,
+                                  trade_id=trade_id, symbol=position.symbol)
+            break
+        except Exception as e:
+            if attempt == 1:
+                log.warning(f"Virtual account settle failed for {position.symbol} "
+                            f"(attempt 1): {e} — retrying")
+            else:
+                log.error(f"Virtual account settle FAILED for {position.symbol} after "
+                          f"retry: {e} — follower portfolios may be out of sync")
+                _alert(f"Virtual account settle failed for {position.symbol} "
+                       f"(trade {trade_id}): {e}", "error",
+                       key=f"settle_failed_{trade_id}")
 
     verdict = "WIN" if won else "LOSS"
     arrow = f"+{step}" if won else f"-{step}"
@@ -1377,6 +1403,11 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
 
         entry_price = bf.get_market_price(signal.symbol)
         decision = block or ("pending_confirm" if confirm_on else "enter")
+        # Would the confirmation-on-turn strategy arm on this row? It does when the
+        # signal isn't blocked and there's a live anchor price to revert from. Logged
+        # independently of RSI_CONFIRM_ENABLED so the shadow row records the live
+        # intent (the analyzer separately reconstructs the outcome from candles).
+        confirm_would_fire = (block is None) and (entry_price is not None)
         # Fetch the symbol's own 1H ADX regime and BTC 4H macro regime for the
         # shadow row.  Shadow-only (measure-then-tune) — not a gate yet.
         adx_period = int(os.getenv("ADX_PERIOD", "14"))
@@ -1390,6 +1421,7 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         _shadow_strategy(signal, entry_price or signal.alert_price,
                          {"f_strength": f_strength, "f_chase": f_chase,
                           "f_regime": f_regime, "repeat_n": repeat_n,
+                          "confirm_would_fire": confirm_would_fire,
                           "adx_value": adx_val or "", "adx_regime": adx_regime_str or "",
                           "btc_adx_regime": btc_adx_label,
                           "decision": decision})
@@ -1705,6 +1737,17 @@ def main():
     last_resolve = time.time()
     last_recon = time.time()
     recon_interval = float(os.getenv("EXCHANGE_RECON_MIN", "15")) * 60
+    # Bring a dead real-time listener back up rather than living in sweep-only mode.
+    last_listener_retry = 0.0
+    listener_retry_interval = float(os.getenv("LISTENER_RETRY_SEC", "120"))
+    # Refresh shadow-outcome analysis so improvement tracking never goes stale.
+    # last_shadow=0 forces a run on the first loop iteration (fresh on every start).
+    last_shadow = 0.0
+    shadow_interval = float(os.getenv("SHADOW_ANALYZE_HOURS", "24")) * 3600
+    # Track consecutive main-loop failures so a persistent fault backs off + alerts
+    # instead of silently spinning (a single transient error still just continues).
+    consec_errors = 0
+    max_consec_errors = int(os.getenv("MAX_CONSEC_LOOP_ERRORS", "5"))
 
     while True:
         try:
@@ -1724,10 +1767,24 @@ def main():
                 except _queue.Empty:
                     pass  # no new message — proceed to maintenance checks
             else:
-                # Listener dead or unavailable — fall back to periodic sweep
-                _alert("Real-time listener is down — running in sweep-only fallback mode",
-                       "warning", key="listener_down")
-                time.sleep(resolve_interval)
+                # Listener is down (start failed, or its thread exited after the
+                # CDP socket couldn't be reconnected). Try to bring a FRESH one up
+                # on a cooldown so a transient Chrome/CDP drop self-heals, instead
+                # of being stuck in the slower sweep-only mode indefinitely.
+                now = time.time()
+                if now - last_listener_retry >= listener_retry_interval:
+                    last_listener_retry = now
+                    try:
+                        listener = dr.NotificationListener(seen_ids, server_filter)
+                        listener.start()
+                        log.info("Real-time listener restarted after being down")
+                    except Exception as e:
+                        listener = None
+                        log.warning(f"Listener restart failed: {e} — sweep-only for now")
+                        _alert("Real-time listener is down — running in sweep-only fallback mode",
+                               "warning", key="listener_down")
+                if not (listener and listener.is_alive):
+                    time.sleep(resolve_interval)
 
             # Fast cadence: mark-to-market PnL + TP/SL/scale-out off cached prices,
             # arm any POI watch whose level price has reached, and fill/expire any
@@ -1748,6 +1805,22 @@ def main():
                 _reconcile_with_exchange(dry_run)
                 last_recon = time.time()
 
+            # Periodically refresh the shadow-outcome analysis so the improvement
+            # tracking stays current. Launched DETACHED (it only reads the shadow
+            # CSV + public candles, ~30-60s of network) so it never blocks position
+            # management. Failures here are non-fatal to trading.
+            if time.time() - last_shadow >= shadow_interval:
+                last_shadow = time.time()
+                try:
+                    subprocess.Popen(
+                        [sys.executable, "analyze_shadow.py"],
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    log.info("Shadow analysis refresh launched (detached)")
+                except Exception as e:
+                    log.warning(f"Shadow analysis launch failed: {e}")
+
             # Periodic sweep: re-inject observer + full inbox scan.
             if time.time() - last_sweep >= sweep_interval:
                 log.info("Periodic sweep: re-injecting observer and scanning inbox")
@@ -1760,6 +1833,8 @@ def main():
                     _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
                 last_sweep = time.time()
 
+            consec_errors = 0  # a full clean iteration clears the failure streak
+
         except KeyboardInterrupt:
             log.info("Shutting down.")
             if listener:
@@ -1768,7 +1843,15 @@ def main():
                 price_stream.stop()
             break
         except Exception as e:
-            log.error(f"Main loop error: {e}")
+            consec_errors += 1
+            log.error(f"Main loop error (#{consec_errors}): {e}", exc_info=True)
+            if consec_errors >= max_consec_errors:
+                _alert(f"Main loop has failed {consec_errors} times in a row "
+                       f"(latest: {e}) — bot may need attention",
+                       "error", key="main_loop_failing")
+            # Back off so a persistent fault doesn't spin the CPU or spam the log;
+            # grows with the streak, capped at 30s. Transient blips stay near-zero.
+            time.sleep(min(consec_errors * 2, 30))
 
 
 if __name__ == "__main__":

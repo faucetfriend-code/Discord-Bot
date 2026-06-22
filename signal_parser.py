@@ -43,7 +43,10 @@ def _get_llm() -> OpenAI:
     global _llm_client
     if _llm_client is None:
         base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
-        _llm_client = OpenAI(base_url=base_url, api_key="local")
+        # Bound the call: if LM Studio is down/hung, the parser must fail fast
+        # rather than blocking the whole signal pipeline. Covers connect + read.
+        timeout = float(os.getenv("LOCAL_LLM_TIMEOUT_SEC", "10"))
+        _llm_client = OpenAI(base_url=base_url, api_key="local", timeout=timeout)
     return _llm_client
 
 
