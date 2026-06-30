@@ -139,17 +139,26 @@ class PriceStream:
                 continue
             except (websocket.WebSocketConnectionClosedException,
                     ConnectionResetError, ConnectionAbortedError, OSError) as e:
-                if not self._stopped:
-                    log.warning(f"Price stream closed ({e}) — reconnecting")
-                    self._reconnect()
-                return
+                if self._stopped:
+                    return
+                # Routine on the demo endpoint (idle drops) — DEBUG, not WARNING,
+                # so it doesn't flood the log. REST fallback covers the gap.
+                log.debug(f"Price stream closed ({e}) — reconnecting")
+                if not self._reconnect():
+                    return
+                continue
             except Exception as e:
                 if not self._stopped:
                     log.debug(f"Price stream recv error: {e}")
                     time.sleep(2)
 
-    def _reconnect(self):
-        """Re-open the socket and re-subscribe after a drop (exponential backoff)."""
+    def _reconnect(self) -> bool:
+        """Re-open the socket and re-subscribe after a drop (exponential backoff).
+
+        Returns True once reconnected (caller resumes its recv loop), False if
+        exhausted. Iterative — never calls _recv_loop(), so repeated drops over a
+        long run cannot grow the stack.
+        """
         for attempt in range(1, 7):
             wait = 5 * attempt
             time.sleep(wait)
@@ -158,9 +167,9 @@ class PriceStream:
                 resubscribe = list(self._subscribed)
                 self._subscribed.clear()
                 self.ensure(resubscribe)
-                log.info("Price stream reconnected")
-                self._recv_loop()
-                return
+                log.debug("Price stream reconnected")
+                return True
             except Exception as e:
                 log.debug(f"Price stream reconnect {attempt} failed: {e}")
         log.warning("Price stream could not reconnect — REST fallback remains active")
+        return False

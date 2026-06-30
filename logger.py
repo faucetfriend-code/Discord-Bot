@@ -1,5 +1,6 @@
 import csv
 import logging
+import logging.handlers
 import os
 import sqlite3
 import sys
@@ -46,12 +47,29 @@ class _LocalFormatter(logging.Formatter):
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Rotating file handler so bot.log never grows unbounded over long unattended
+# runs. Defaults: 10 MB per file, 5 backups (bot.log + bot.log.1..5 = ~60 MB cap).
+# Override via LOG_MAX_MB / LOG_BACKUP_COUNT in .env.
+try:
+    _log_max_bytes = int(float(os.getenv("LOG_MAX_MB", "10")) * 1024 * 1024)
+except (TypeError, ValueError):
+    _log_max_bytes = 10 * 1024 * 1024
+try:
+    _log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+except (TypeError, ValueError):
+    _log_backup_count = 5
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(Path(__file__).parent / "bot.log", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            Path(__file__).parent / "bot.log",
+            maxBytes=_log_max_bytes,
+            backupCount=_log_backup_count,
+            encoding="utf-8",
+        ),
     ],
 )
 log = logging.getLogger("discord_bot")

@@ -528,6 +528,25 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     log.info(f"[{analyst}] NEW {order_label} {signal.side.upper()} {signal.symbol} "
              f"entry={signal.entry} sl={signal.sl} tp={signal.tp}")
 
+    # Per-source exposure cap. In hedge mode the global MAX_OPEN_POSITIONS and the
+    # one-position-per-symbol rule are intentionally relaxed (rm.validate) so every
+    # source can test its own signals in parallel. The downside: a single chatty
+    # source (e.g. RSI Extreme firing several alerts at once) can open an unbounded
+    # number of concurrent positions. MAX_OPEN_PER_SOURCE bounds each source's open
+    # count without re-coupling the sources. Default 0 = unlimited (preserves the
+    # current data-gathering behaviour); set it (e.g. 5) to cap runaway exposure,
+    # recommended before live trading.
+    if _hedge_mode():
+        per_src_cap = int(os.getenv("MAX_OPEN_PER_SOURCE", "0"))
+        if per_src_cap > 0:
+            src_open = sum(1 for p in open_positions if p.analyst == analyst_key)
+            if src_open >= per_src_cap:
+                log.warning(f"[{analyst}] {signal.symbol} skipped - {analyst_key} already "
+                            f"has {src_open} open (max {per_src_cap}/source)")
+                _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                                       outcome=f"rejected:max_per_source({per_src_cap})")
+                return
+
     ok, reason = rm.validate(signal, open_positions, hedge_mode=_hedge_mode())
     if not ok:
         log.warning(f"Signal rejected: {reason}")
@@ -869,6 +888,27 @@ def _resolve_open_positions(dry_run: bool = True):
         # Mark-to-market: update unrealized PnL on the remaining size each sweep.
         unreal = _pnl_usdt(pos.entry, price, pos.size, cv, pos.side)
         pt.update_unrealized(pos.order_id, price, unreal)
+
+        # Runner time-stop: a position that has rested far past its useful life
+        # (e.g. a TP1 runner ratcheted to break-even that never reached its final
+        # target) ties up a slot and drifts from the original signal thesis. Once
+        # it exceeds RUNNER_MAX_AGE_HOURS, close it at market. Win/loss follows
+        # whether any TP was banked (tps_hit>=1 -> protected at BE or better ->
+        # win). Set RUNNER_MAX_AGE_HOURS=0 to disable.
+        max_age_h = float(os.getenv("RUNNER_MAX_AGE_HOURS", "120"))
+        if max_age_h > 0:
+            try:
+                age_h = (now_local() - datetime.fromisoformat(pos.opened_at)).total_seconds() / 3600
+            except Exception:
+                age_h = 0.0
+            if age_h >= max_age_h:
+                won = pos.tps_hit >= 1
+                log.info(f"[{pos.analyst}] {pos.symbol} time-stop after {age_h:.0f}h "
+                         f"(limit {max_age_h:.0f}h, tps_hit={pos.tps_hit}) - closing @ {price}")
+                if not dry_run:
+                    _live_close_remaining(pos)
+                _settle_position(pos, price, "time_stop", won=won, dry_run=dry_run)
+                continue
 
         ladder = pos.tps or ([pos.tp] if pos.tp else [])
         n = len(ladder)
@@ -1832,6 +1872,34 @@ def main():
                 for msg in sweep_msgs:
                     _handle_msg(msg, dry_run, whitelist, bot_state, seen_ids)
                 last_sweep = time.time()
+
+                # Stale-selector escalation. If several consecutive sweeps parse
+                # ZERO cards the inbox DOM has likely changed (or the tab is wedged)
+                # and signals are being silently missed. Force a hard re-open +
+                # observer re-inject, and fire a single de-duped alert. Clears
+                # automatically once a sweep parses cards again (alert key resets
+                # via _alert's de-dupe when the condition stops recurring).
+                health = dr.inbox_health()
+                bot_state["inbox_consec_stale"] = health["consec_stale_polls"]
+                bot_state["inbox_last_card_ts"] = health["last_card_seen_ts"]
+                stale_n = int(os.getenv("STALE_SWEEP_ALERT_N", "3"))
+                if health["consec_stale_polls"] >= stale_n:
+                    log.warning(
+                        f"Inbox blind for {health['consec_stale_polls']} consecutive "
+                        f"sweeps - forcing full re-open + observer re-inject"
+                    )
+                    try:
+                        dr.ensure_discord_open()
+                        dr.open_inbox()
+                        if listener:
+                            listener.reinject()
+                    except Exception as e:
+                        log.warning(f"Forced inbox recovery failed: {e}")
+                    _alert(
+                        "Inbox selectors appear stale across multiple sweeps - "
+                        "signals may be missed; check the Discord tab",
+                        "error", key="inbox_stale",
+                    )
 
             consec_errors = 0  # a full clean iteration clears the failure streak
 

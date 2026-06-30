@@ -399,6 +399,32 @@ def _dump_inbox_panel_html() -> str:
     return str(result or "eval_returned_none")
 
 
+# ---------------------------------------------------------------------------
+# Inbox health tracking (sweep path)
+# ---------------------------------------------------------------------------
+# A sweep that parses zero cards means EITHER the selectors broke (the inbox
+# DOM changed and we're now blind) OR the panel genuinely failed to open. Both
+# are "we can't see signals" states. We count consecutive blind sweeps and the
+# last time a sweep successfully parsed at least one card, so bot.py can force a
+# hard recovery and fire a de-duped alert before signals go silently missing.
+_consec_stale_polls = 0
+_last_card_seen_ts: float | None = None
+
+
+def inbox_health() -> dict:
+    """Health of the sweep-path inbox scrape.
+
+    Returns:
+        consec_stale_polls: consecutive sweeps that parsed zero cards.
+        last_card_seen_ts:  epoch of the last sweep that parsed >=1 card
+                            (None if none yet this run).
+    """
+    return {
+        "consec_stale_polls": _consec_stale_polls,
+        "last_card_seen_ts": _last_card_seen_ts,
+    }
+
+
 def poll_inbox(seen_ids: set[str], server_filter: str = "") -> list[dict]:
     """
     Opens the inbox, scrapes notification cards, and returns all unseen messages.
@@ -410,10 +436,13 @@ def poll_inbox(seen_ids: set[str], server_filter: str = "") -> list[dict]:
 
     Each returned dict: {id, author, content, time, image_url, server}
     """
+    global _consec_stale_polls, _last_card_seen_ts
+
     ensure_discord_open()
 
     if not open_inbox():
         log.warning("Failed to open Discord inbox — skipping poll")
+        _consec_stale_polls += 1
         return []
 
     time.sleep(1.0)  # allow panel animation to settle
@@ -422,7 +451,12 @@ def poll_inbox(seen_ids: set[str], server_filter: str = "") -> list[dict]:
     if not messages:
         log.warning("No notifications found — selectors may be stale. Dumping panel HTML for diagnosis:")
         log.warning(_dump_inbox_panel_html())
+        _consec_stale_polls += 1
         return []
+
+    # Parsed at least one card -> selectors are healthy this sweep.
+    _consec_stale_polls = 0
+    _last_card_seen_ts = time.time()
 
     sf = server_filter.lower().strip()
 
@@ -561,9 +595,16 @@ class NotificationListener:
             _socket.timeout,
             TimeoutError,
         )
+        # Consecutive non-fatal recv errors. A socket that keeps raising the same
+        # error (WinError 10054 "forcibly closed", "Connection timed out") is
+        # effectively dead — recv() would spin forever logging once per 2s. We
+        # rate-limit the log and force a reconnect once it crosses the threshold,
+        # instead of grinding on a corpse socket (the historical churn source).
+        consec_errs = 0
         while not self._stopped:
             try:
                 raw = self._ws.recv()
+                consec_errs = 0
                 data = json.loads(raw)
                 if data.get("method") == "Runtime.bindingCalled":
                     p = data.get("params", {})
@@ -576,6 +617,7 @@ class NotificationListener:
             except _timeout_types:
                 # No CDP event in the recv window — normal during quiet periods.
                 # Send a lightweight keepalive so Chrome doesn't drop the connection.
+                consec_errs = 0
                 try:
                     self._cdp("Runtime.evaluate", {
                         "expression": "1",
@@ -589,19 +631,39 @@ class NotificationListener:
                 # The socket is gone (Chrome closed the tab, network reset, WinError
                 # 10054, etc.). recv() would keep raising forever — so RECONNECT,
                 # don't just sleep-and-retry on a dead socket.
-                if not self._stopped:
-                    log.warning(f"CDP listener connection lost ({e}) — reconnecting")
-                    self._reconnect()
-                return
+                if self._stopped:
+                    return
+                log.warning(f"CDP listener connection lost ({e}) — reconnecting")
+                if not self._reconnect():
+                    return
+                consec_errs = 0
+                continue
             except Exception as e:
-                if not self._stopped:
-                    log.warning(f"CDP listener recv error: {e}")
-                    time.sleep(2)
+                if self._stopped:
+                    return
+                consec_errs += 1
+                # Rate-limit: log the first, then every 50th, to avoid log floods.
+                if consec_errs == 1 or consec_errs % 50 == 0:
+                    log.warning(f"CDP listener recv error (x{consec_errs}): {e}")
+                if consec_errs >= 5:
+                    # Socket is wedged — stop spinning and rebuild it.
+                    log.warning("CDP listener: repeated recv errors — forcing reconnect")
+                    if not self._reconnect():
+                        return
+                    consec_errs = 0
+                    continue
+                time.sleep(2)
 
-    def _reconnect(self):
+    def _reconnect(self) -> bool:
+        """Rebuild the CDP socket and re-inject the observer.
+
+        Returns True if a fresh connection was established (caller resumes its
+        recv loop), False if all attempts were exhausted. Iterative by design —
+        it never calls _recv_loop(), so reconnect cycles cannot grow the stack.
+        """
         for attempt in range(1, 7):
             wait = 5 * attempt
-            log.info(f"CDP reconnect attempt {attempt}/6 in {wait}s…")
+            log.info(f"CDP reconnect attempt {attempt}/6 in {wait}s...")
             time.sleep(wait)
             try:
                 ws_url = _get_discord_ws_url()
@@ -615,8 +677,8 @@ class NotificationListener:
                 time.sleep(1.0)
                 self._do_inject()
                 log.info("CDP listener reconnected successfully")
-                self._recv_loop()   # re-enter the loop on the same thread
-                return
+                return True
             except Exception as e:
                 log.warning(f"Reconnect attempt {attempt} failed: {e}")
         log.error("CDP listener could not reconnect after 6 attempts")
+        return False
