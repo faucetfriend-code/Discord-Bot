@@ -14,10 +14,18 @@ It also simulates the proposed-but-disabled CONFIRMATION-ON-TURN entry (wait for
 price to revert RSI_CONFIRM_REVERT_PCT within RSI_CONFIRM_WINDOW_MIN before
 entering) on the same data, so the two entry styles can be compared per signal.
 
+An ALTERNATE EXIT model is simulated on the same entries (report-only, live
+exits unchanged until it proves out):
+  rsi_extreme : TP1/BE ratchet moved to +3.75% (0.75R) - 9/41 losers in the
+                Jun'26 sample ran +0.75R..1R before stopping full -1R
+  oraclealgo  : SL widened to 2.0% - tests whether the 1.5% stop is noise-tight
+                                              (RSI_ALT_TP_PCTS / ORACLE_ALT_SL_PCT)
+
 Output: shadow_outcomes.csv (one row per shadow signal, original columns +
-outcome/R-multiple/MFE/MAE/confirm columns) and a console tuning report:
+outcome/R-multiple/MFE/MAE/confirm/alt-exit columns) and a console tuning report:
 would-be win rate & expectancy overall, per filter verdict, confirmation vs
-immediate entry, and repeat-alert buckets.
+immediate entry, current vs alternate exits, decision-gate vetoes, and
+repeat-alert buckets.
 
 Usage:  python analyze_shadow.py [--horizon-hours 72] [--csv strategy_shadow.csv]
 
@@ -157,6 +165,11 @@ def main():
     ora_tps = [float(p) for p in os.getenv("ORACLE_TP_PCTS", "0.02,0.04").split(",") if p.strip()]
     c_revert = float(os.getenv("RSI_CONFIRM_REVERT_PCT", "0.005"))
     c_window = float(os.getenv("RSI_CONFIRM_WINDOW_MIN", "30"))
+    # Alternate exit models, simulated on the SAME entries as the main outcome
+    # so the comparison isolates the exit change.
+    rsi_alt_tps = [float(p) for p in
+                   os.getenv("RSI_ALT_TP_PCTS", "0.0375,0.10").split(",") if p.strip()]
+    ora_alt_sl = float(os.getenv("ORACLE_ALT_SL_PCT", "0.02"))
 
     rows = list(csv.DictReader(open(args.csv, encoding="utf-8")))
     if not rows:
@@ -207,7 +220,7 @@ def main():
         entry = float(r["entry_price"]) if r.get("entry_price") else None
         res = {"outcome": "no_entry_price", "ret_pct": "", "r_mult": "", "mfe_pct": "",
                "mae_pct": "", "hours": ""}
-        cf_fired, cf = "", {}
+        cf_fired, cf, alt = "", {}, {}
         candles = []
         if entry:
             candles = fetch_candles(r["symbol"], start, end)
@@ -219,6 +232,9 @@ def main():
                                                    c_revert, c_window, sl_pct, tps)
                     cf_fired = "yes" if fired else "no"
                     cf = cres or {}
+                    alt = simulate(r["side"], entry, candles, rsi_sl, rsi_alt_tps)
+                else:
+                    alt = simulate(r["side"], entry, candles, ora_alt_sl, ora_tps)
             else:
                 res = {"outcome": "no_data", "ret_pct": "", "r_mult": "", "mfe_pct": "",
                        "mae_pct": "", "hours": ""}
@@ -227,6 +243,8 @@ def main():
         out["confirm_fired"] = cf_fired
         out["confirm_outcome"] = cf.get("outcome", "")
         out["confirm_r"] = round(cf["r_mult"], 3) if cf.get("r_mult") is not None and cf else ""
+        out["alt_outcome"] = alt.get("outcome", "")
+        out["alt_r"] = round(alt["r_mult"], 3) if alt and alt.get("r_mult") is not None else ""
         out_rows.append(out)
         print(f"  {r['ts'][:16]} {r['source'][:6]:6} {r['symbol']:13} {r['side']:4} "
               f"-> {out['outcome']:12} R={out['r_mult'] if out['r_mult']!='' else '—'}")
@@ -273,6 +291,25 @@ def main():
     print("  BTC 4H ranging (macro): ", stats([x for x in rsi
                                                if str(x.get("btc_adx_regime","")).endswith(
                                                    ("ranging_calm","indecisive"))]))
+
+    def alt_stats(rs):
+        return stats([dict(r_mult=x["alt_r"]) for x in rs
+                      if isinstance(x.get("alt_r"), (int, float))])
+
+    print("\n=== Exit-model comparison (same entries, alternate exits; report-only) ===")
+    print(f"  RSI current  (TP1 @ +{rsi_tps[0]*100:g}% = {rsi_tps[0]/rsi_sl:.2f}R):",
+          stats(rsi))
+    print(f"  RSI alt      (TP1 @ +{rsi_alt_tps[0]*100:g}% = {rsi_alt_tps[0]/rsi_sl:.2f}R):",
+          alt_stats(rsi))
+    print(f"  Oracle current (SL {ora_sl*100:g}%):", stats(ora))
+    print(f"  Oracle alt     (SL {ora_alt_sl*100:g}%):", alt_stats(ora))
+
+    print("\n=== Gate vetoes (what each decision reason would have done) ===")
+    for src, subset in (("rsi", rsi), ("oracle", ora)):
+        reasons = sorted({str(x.get("decision") or "?") for x in subset})
+        for d in reasons:
+            print(f"  {src:6s} {d:16s}", stats([x for x in subset
+                                                if str(x.get("decision") or "?") == d]))
 
     print("\n=== OracleAlgo (simulated as if every 1H signal entered) ===")
     print("  ALL 1H signals:     ", stats(ora))

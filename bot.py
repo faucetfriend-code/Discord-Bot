@@ -1361,6 +1361,17 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         _shadow("low_confluence")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_low_confluence")
         return
+    # Typed-signal gate (2026-07-02): only structure breaks (MSS/BOS) earn an
+    # entry. Untyped alerts (Supertrend/Delta/unparsed) ran -11.0R/19 in shadow;
+    # they still count toward confluence above and are shadow-logged here.
+    allowed_types = {t.strip().upper()
+                     for t in os.getenv("ORACLE_ENTRY_TYPES", "").split(",") if t.strip()}
+    if allowed_types and (signal.oracle_signal_type or "").upper() not in allowed_types:
+        log.info(f"[OracleAlgo] 1H {signal.side} type "
+                 f"'{signal.oracle_signal_type or '?'}' not in ORACLE_ENTRY_TYPES - skipping")
+        _shadow("untyped_signal")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_untyped_signal")
+        return
 
     start, lo, hi, _step = _leverage_params()
     leverage = pt.get_analyst_leverage("OracleAlgo", start, lo, hi)
@@ -1430,6 +1441,15 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         regime_on = os.getenv("RSI_REGIME_GATE", "false").lower() == "true"
         confirm_on = os.getenv("RSI_CONFIRM_ENABLED", "false").lower() == "true"
         first_only = os.getenv("RSI_FIRST_ALERT_ONLY", "true").lower() == "true"
+        sell_gate_on = os.getenv("RSI_SELL_REGIME_GATE", "false").lower() == "true"
+
+        # Symbol 1H ADX regime and BTC 4H macro regime. Fetched before the
+        # decision so RSI_SELL_REGIME_GATE can act on it; both are also
+        # annotated on the shadow row either way.
+        adx_period = int(os.getenv("ADX_PERIOD", "14"))
+        adx_val, adx_regime_str = mr.get_adx_regime(signal.symbol, "1h", adx_period)
+        btc_dir, _, btc_htf_str = mr.get_btc_htf_regime("4h", adx_period)
+        btc_adx_label = f"{btc_dir}_{btc_htf_str}" if btc_dir and btc_htf_str else ""
 
         block = None
         if first_only and repeat_n > 1:
@@ -1440,6 +1460,10 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
             block = "over_chased"
         elif regime_on and f_regime is False:
             block = "counter_regime"
+        elif sell_gate_on and signal.side == "sell" and btc_htf_str == "trending_strong":
+            # Shadow analysis (2026-07-02): overbought shorts while BTC's 4H ADX
+            # says trending_strong ran -0.26 avgR; outside it ~breakeven.
+            block = "sell_regime"
 
         entry_price = bf.get_market_price(signal.symbol)
         decision = block or ("pending_confirm" if confirm_on else "enter")
@@ -1448,12 +1472,6 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         # independently of RSI_CONFIRM_ENABLED so the shadow row records the live
         # intent (the analyzer separately reconstructs the outcome from candles).
         confirm_would_fire = (block is None) and (entry_price is not None)
-        # Fetch the symbol's own 1H ADX regime and BTC 4H macro regime for the
-        # shadow row.  Shadow-only (measure-then-tune) — not a gate yet.
-        adx_period = int(os.getenv("ADX_PERIOD", "14"))
-        adx_val, adx_regime_str = mr.get_adx_regime(signal.symbol, "1h", adx_period)
-        btc_dir, _, btc_htf_str = mr.get_btc_htf_regime("4h", adx_period)
-        btc_adx_label = f"{btc_dir}_{btc_htf_str}" if btc_dir and btc_htf_str else ""
         # Shadow row uses the live price when BloFin has one, else the price quoted
         # in the alert itself — so unlisted symbols still get a backtestable entry.
         # Blocked repeats are shadow-logged too: the analyzer keeps simulating their
