@@ -45,8 +45,13 @@ def _get_llm() -> OpenAI:
         base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
         # Bound the call: if LM Studio is down/hung, the parser must fail fast
         # rather than blocking the whole signal pipeline. Covers connect + read.
-        timeout = float(os.getenv("LOCAL_LLM_TIMEOUT_SEC", "10"))
-        _llm_client = OpenAI(base_url=base_url, api_key="local", timeout=timeout)
+        # qwen3.5 emits a <think> block before the JSON, so one generation can
+        # legitimately run tens of seconds - keep the timeout generous but cap
+        # retries so the worst case stays bounded (default client retries 2x,
+        # which turned a slow call into a 3x retry storm).
+        timeout = float(os.getenv("LOCAL_LLM_TIMEOUT_SEC", "45"))
+        _llm_client = OpenAI(base_url=base_url, api_key="local",
+                             timeout=timeout, max_retries=1)
     return _llm_client
 
 
@@ -145,6 +150,14 @@ _CLOSE_KEYWORDS = re.compile(
     r'(?!\s+(?:long|short|buy|sell))',  # not "close long" (that's a new entry direction)
     re.IGNORECASE,
 )
+
+# An explicit trade-closed announcement: "Trade Closed — BTC/USDT SHORT ...
+# Breakeven" cards, or an edited signal card re-tagged "[CLOSED]". Must beat
+# the UPDATE fast-path (such cards often mention "breakeven"/"TP hit", which
+# would otherwise classify them as a no-op UPDATE) AND the close-path's
+# entry-price veto (a [CLOSED] card still quotes the original Entry$).
+_TRADE_CLOSED = re.compile(
+    r'\b(?:trade|position)\s+closed\b|\[\s*closed\s*\]', re.IGNORECASE)
 
 # DCA / averaging analysts (e.g. Ajmal) post position-management updates:
 #   "New average entry: $1.9895"  → shifts the entry basis (PnL/SL/TP measured from here)
@@ -584,6 +597,8 @@ def _try_rsi_extreme(text: str, msg: dict) -> Optional[Signal]:
 
 def _try_update_regex(text: str, msg: dict) -> Optional[Signal]:
     """Fast-path: detect common update phrases and extract new SL/TP if present."""
+    if _TRADE_CLOSED.search(text):
+        return None  # "Trade Closed ... Breakeven" is a CLOSE, not an SL update
     if not _UPDATE_KEYWORDS.search(text):
         return None
 
@@ -635,6 +650,8 @@ def _try_position_update(text: str, msg: dict) -> Optional[Signal]:
     Returns None if the text isn't one of these management messages, OR if it's
     actually a fresh entry setup that merely quotes an avg entry (let NEW handle it).
     """
+    if _TRADE_CLOSED.search(text):
+        return None  # a closed-trade recap may quote fills — it's still a CLOSE
     avg = _AVG_ENTRY.search(text)
     info = _POSITION_INFO.search(text)
     if not avg and not info:
@@ -653,20 +670,24 @@ def _try_position_update(text: str, msg: dict) -> Optional[Signal]:
 
 def _try_close_regex(text: str, msg: dict) -> Optional[Signal]:
     """Fast-path: detect explicit close/exit phrases."""
-    # "4H close under X" / "close below X" is stop-loss phrasing, NOT a close
-    # instruction — strip those occurrences before testing for a genuine close
-    # keyword (otherwise a new setup's soft-stop note hijacks the close path).
-    probe = _CLOSE_UNDER_SL.sub(" ", text)
-    if not _CLOSE_KEYWORDS.search(probe):
-        return None
-    # A new-entry directional call ("Market long BLESS", "shorting ETH") is an
-    # OPEN, not a close — even when its stop note mentions a candle "close".
-    if re.search(r'\bmarket\s+(?:long|short|buy|sell)\b|\b(?:long|short)ing\b',
-                 text, re.IGNORECASE):
-        return None
-    # Only treat as CLOSE if there's no entry price (otherwise it's a new signal direction)
-    if re.search(r'entr(?:y|:)[\s:]*[\d,.]+', text, re.IGNORECASE):
-        return None
+    # An explicit "Trade Closed" / "[CLOSED]" announcement is ALWAYS a close —
+    # skip the vetoes below (a [CLOSED] recap card still quotes its Entry$).
+    if not _TRADE_CLOSED.search(text):
+        # "4H close under X" / "close below X" is stop-loss phrasing, NOT a close
+        # instruction — strip those occurrences before testing for a genuine close
+        # keyword (otherwise a new setup's soft-stop note hijacks the close path).
+        probe = _CLOSE_UNDER_SL.sub(" ", text)
+        if not _CLOSE_KEYWORDS.search(probe):
+            return None
+        # A new-entry directional call ("Market long BLESS", "shorting ETH") is an
+        # OPEN, not a close — even when its stop note mentions a candle "close".
+        if re.search(r'\bmarket\s+(?:long|short|buy|sell)\b|\b(?:long|short)ing\b',
+                     text, re.IGNORECASE):
+            return None
+        # Only treat as CLOSE if there's no entry price (otherwise it's a new signal
+        # direction). Allow an optional $ — embed text concatenates "Entry$62,615.00".
+        if re.search(r'entr(?:y|:)[\s:]*\$?[\d,.]+', text, re.IGNORECASE):
+            return None
 
     symbol = _extract_symbol(text)
 
@@ -679,7 +700,7 @@ def _try_close_regex(text: str, msg: dict) -> Optional[Signal]:
 
 def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
     """Ask local Qwen to classify the message and extract all signal fields."""
-    model = os.getenv("LOCAL_LLM_MODEL", "qwen3.5-9b")
+    model = os.getenv("LOCAL_LLM_MODEL", "qwen/qwen3.5-9b")
     prompt = (
         "You are a trading signal classifier. Analyse the message below and return ONLY "
         "a raw JSON object (no markdown, no explanation) with these exact keys:\n"
@@ -706,7 +727,9 @@ def _llm_parse(text: str, msg: dict) -> Optional[Signal]:
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            # qwen3.5 spends tokens on its <think> block BEFORE the JSON; a
+            # tight cap truncates mid-thought and the JSON never arrives.
+            max_tokens=int(os.getenv("LOCAL_LLM_MAX_TOKENS", "1000")),
             temperature=0.0,
         )
         raw = response.choices[0].message.content.strip()
@@ -855,7 +878,8 @@ def _vision_parse(image_url: str, task: str = "trade") -> dict:
                     ],
                 },
             ],
-            max_tokens=160,
+            # Same thinking-budget headroom as the text path (see _llm_parse).
+            max_tokens=int(os.getenv("LOCAL_VISION_MAX_TOKENS", "700")),
             temperature=0.0,
         )
         raw = response.choices[0].message.content.strip()

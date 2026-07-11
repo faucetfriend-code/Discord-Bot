@@ -8,6 +8,7 @@ __pycache__/
 
 # Runtime data
 bot.log
+bot.log.*
 bot.db
 signals_log.csv
 

@@ -893,8 +893,9 @@ def _resolve_open_positions(dry_run: bool = True):
         # (e.g. a TP1 runner ratcheted to break-even that never reached its final
         # target) ties up a slot and drifts from the original signal thesis. Once
         # it exceeds RUNNER_MAX_AGE_HOURS, close it at market. Win/loss follows
-        # whether any TP was banked (tps_hit>=1 -> protected at BE or better ->
-        # win). Set RUNNER_MAX_AGE_HOURS=0 to disable.
+        # the ACTUAL exit PnL (won=None lets _settle_position decide) — a
+        # profitable trade timed out with no TP hit must not dock the analyst's
+        # leverage score. Set RUNNER_MAX_AGE_HOURS=0 to disable.
         max_age_h = float(os.getenv("RUNNER_MAX_AGE_HOURS", "120"))
         if max_age_h > 0:
             try:
@@ -902,12 +903,11 @@ def _resolve_open_positions(dry_run: bool = True):
             except Exception:
                 age_h = 0.0
             if age_h >= max_age_h:
-                won = pos.tps_hit >= 1
                 log.info(f"[{pos.analyst}] {pos.symbol} time-stop after {age_h:.0f}h "
                          f"(limit {max_age_h:.0f}h, tps_hit={pos.tps_hit}) - closing @ {price}")
                 if not dry_run:
                     _live_close_remaining(pos)
-                _settle_position(pos, price, "time_stop", won=won, dry_run=dry_run)
+                _settle_position(pos, price, "time_stop", won=None, dry_run=dry_run)
                 continue
 
         ladder = pos.tps or ([pos.tp] if pos.tp else [])
@@ -1372,6 +1372,18 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         _shadow("untyped_signal")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_untyped_signal")
         return
+    # Macro-regime gate (2026-07-09, n=33 MSS/BOS with regime data): structure
+    # breaks entered while BTC's 4H ADX is trending ran -8.1R (21% WR); in
+    # ranging/indecisive macro they ran +1.9R (50% WR). Weakest-evidence gate —
+    # revisit at the next sweep.
+    regime_gate = os.getenv("ORACLE_REGIME_GATE", "false").lower() == "true"
+    if regime_gate and htf_regime in ("trending_moderate", "trending_strong"):
+        adx_note = f"{htf_adx:.1f}" if htf_adx else "?"
+        log.info(f"[OracleAlgo] 1H {signal.side} blocked: BTC 4H {htf_regime} "
+                 f"(ADX={adx_note}) — macro-regime gate")
+        _shadow("macro_trend")
+        _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_macro_trend")
+        return
 
     start, lo, hi, _step = _leverage_params()
     leverage = pt.get_analyst_leverage("OracleAlgo", start, lo, hi)
@@ -1442,6 +1454,7 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
         confirm_on = os.getenv("RSI_CONFIRM_ENABLED", "false").lower() == "true"
         first_only = os.getenv("RSI_FIRST_ALERT_ONLY", "true").lower() == "true"
         sell_gate_on = os.getenv("RSI_SELL_REGIME_GATE", "false").lower() == "true"
+        macro_gate_on = os.getenv("RSI_MACRO_TREND_GATE", "false").lower() == "true"
 
         # Symbol 1H ADX regime and BTC 4H macro regime. Fetched before the
         # decision so RSI_SELL_REGIME_GATE can act on it; both are also
@@ -1464,6 +1477,12 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
             # Shadow analysis (2026-07-02): overbought shorts while BTC's 4H ADX
             # says trending_strong ran -0.26 avgR; outside it ~breakeven.
             block = "sell_regime"
+        elif macro_gate_on and btc_htf_str in ("trending_moderate", "trending_strong"):
+            # Shadow analysis (2026-07-09, n=142): BOTH sides bleed while BTC's
+            # 4H ADX is trending (buys -0.25 avgR n=9, sells -0.36 avgR n=49);
+            # in ranging/indecisive macro the strategy is the whole edge
+            # (+0.20 avgR). Supersedes the sell-only gate when enabled.
+            block = "macro_trend"
 
         entry_price = bf.get_market_price(signal.symbol)
         decision = block or ("pending_confirm" if confirm_on else "enter")
