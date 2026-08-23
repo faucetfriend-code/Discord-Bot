@@ -24,8 +24,13 @@ python bot.py
 
 | Var | Default | Notes |
 |-----|---------|-------|
-| `DRY_RUN` | `true` | Set `false` to actually execute orders |
-| `BLOFIN_BASE_URL` | demo URL | Change to `https://openapi.blofin.com` for live |
+| `BLOFIN_BASE_URL` | demo URL | Demo endpoint = DEMO mode (real orders on the demo account); `https://openapi.blofin.com` = LIVE. The only demo/live switch. |
+| `PAPER_MODE` | `false` | `true` = PAPER mode: no exchange orders, in-process simulated fills (`DRYRUN-` ids) |
+| `DRY_RUN` | *(derived)* | Deprecated - derived as `mode != LIVE`, tags records only; a disagreeing value in `.env` is ignored with one startup warning |
+| `BLOFIN_BROKER_ID` | unset | brokerId on LIVE orders (default `dd3511977f23cc87`; `none` for Transaction-type keys). Never sent on demo |
+| `ATTACH_EXCHANGE_TP` | `false` | Attach the signal TP to the exchange entry order too (SL backstop is always attached) |
+| `FORCE_IPV4` | `true` | Pin outbound HTTPS to IPv4 (IP-whitelisted keys) |
+| `LIVE_EPOCH_START` | blank | ISO-8601 go-live moment; dashboard "Live" view starts here, earlier = Paper/Demo archive |
 | `POLL_INTERVAL` | `60` | Seconds between inbox polls |
 | `RISK_PCT` | `0.01` | 1% of balance risked per trade |
 | `MAX_OPEN_POSITIONS` | `3` | Max concurrent positions |
@@ -37,6 +42,7 @@ python bot.py
 | File | Role |
 |------|------|
 | `bot.py` | Main loop — orchestrates everything |
+| `exec_mode.py` | Resolves PAPER / DEMO / LIVE from `PAPER_MODE` + `BLOFIN_BASE_URL`; derives `dry_run`; pins the mode at startup |
 | `discord_reader.py` | agent-browser CDP → inbox notification cards |
 | `signal_parser.py` | Regex + Claude API → Signal dataclass |
 | `blofin_client.py` | BloFin SDK wrapper (balance, place_order) |
@@ -57,15 +63,20 @@ When new signal formats appear in dry-run logs, add regex patterns at the top of
 python preflight.py
 ```
 
-It verifies your LIVE keys authenticate, shows the live balance, and lists which
-recent signal symbols are tradeable on live vs demo. Only flip to live once it
-reads `VERDICT: GO`.
+With no flag it validates whichever mode `.env` resolves to (PAPER/DEMO ride
+the demo endpoint); `--live` forces the live endpoint + live keys, `--demo` the
+demo ones. It verifies the keys authenticate, shows the balance, and lists which
+recent signal symbols are tradeable there. Only flip to live once
+`python preflight.py --live` reads `VERDICT: GO`.
 
 Then:
 
 1. Change `BLOFIN_BASE_URL` in `.env` to `https://openapi.blofin.com`
-2. Set `DRY_RUN=false`
-3. Restart bot
+2. Restart bot
+
+`DRY_RUN` is derived from the URL now (see `exec_mode.py`); there is no second
+switch. Execution modes: PAPER (`PAPER_MODE=true`, simulated fills, no exchange
+orders), DEMO (demo URL, real orders on the demo account), LIVE (live URL).
 
 The bot auto-selects LIVE keys on the live endpoint (the `Demo-*` keys are only
 used on the demo endpoint). The startup health check confirms auth + balance.

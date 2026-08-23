@@ -1,0 +1,218 @@
+<title>Signal Bot Results</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F5F7FA; --surface:#FFFFFF; --ink:#1A202C; --muted:#5B6572; --line:#D9DEE5;
+  --accent:#2B6777; --accent-soft:#E3EEF1;
+  --gain:#2E7D4F; --gain-soft:#E4F2EA; --loss:#B23A3A; --loss-soft:#F6E4E4; --warn:#A86F0E; --warn-soft:#F8EED8;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14181E; --surface:#1C2129; --ink:#E7EAEF; --muted:#9AA4B2; --line:#2E3640;
+    --accent:#7FB6C6; --accent-soft:#22313A;
+    --gain:#6FC693; --gain-soft:#1E3328; --loss:#E07A7A; --loss-soft:#3A2323; --warn:#E0B15C; --warn-soft:#3A3020;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14181E; --surface:#1C2129; --ink:#E7EAEF; --muted:#9AA4B2; --line:#2E3640;
+  --accent:#7FB6C6; --accent-soft:#22313A;
+  --gain:#6FC693; --gain-soft:#1E3328; --loss:#E07A7A; --loss-soft:#3A2323; --warn:#E0B15C; --warn-soft:#3A3020;
+}
+body{background:var(--bg);color:var(--ink);font-family:"Source Sans 3",system-ui,sans-serif;font-size:17px;line-height:1.55;margin:0;padding:2.5rem 1.25rem 5rem}
+main{max-width:78ch;margin:0 auto;display:flex;flex-direction:column;gap:2.75rem}
+h1,h2,h3{font-family:"Source Serif 4",Georgia,serif;text-wrap:balance;margin:0;line-height:1.2}
+h1{font-size:2.3rem;font-weight:600}
+h2{font-size:1.5rem;font-weight:600;padding-bottom:.4rem;border-bottom:2px solid var(--accent)}
+h3{font-size:1.15rem;font-weight:600;margin-top:.5rem}
+p,li{max-width:68ch}
+section{display:flex;flex-direction:column;gap:1rem}
+.eyebrow{font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.meta{color:var(--muted);font-size:.95rem;display:flex;flex-direction:column;gap:.2rem}
+code,.mono{font-family:"JetBrains Mono",ui-monospace,monospace;font-size:.88em}
+code{background:var(--accent-soft);padding:.05em .35em;border-radius:3px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.8rem}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:.9rem 1rem;display:flex;flex-direction:column;gap:.25rem}
+.tile .v{font-family:"JetBrains Mono",monospace;font-size:1.55rem;font-weight:500;font-variant-numeric:tabular-nums}
+.tile .l{font-size:.8rem;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}
+.tile .s{font-size:.85rem;color:var(--muted)}
+.gain{color:var(--gain)} .loss{color:var(--loss)} .warn{color:var(--warn)}
+.chip{display:inline-block;font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.06em;padding:.12em .5em;border-radius:3px;font-weight:500;white-space:nowrap}
+.chip.keep{background:var(--gain-soft);color:var(--gain)}
+.chip.off{background:var(--loss-soft);color:var(--loss)}
+.chip.neutral{background:var(--warn-soft);color:var(--warn)}
+.chip.fix{background:var(--accent-soft);color:var(--accent)}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:.93rem}
+th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:.76rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
+td.n,th.n{text-align:right;font-family:"JetBrains Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+ol,ul{padding-left:1.3rem;display:flex;flex-direction:column;gap:.45rem;margin:0}
+.summary li{font-size:1.02rem}
+.callout{background:var(--surface);border-left:4px solid var(--accent);padding:.8rem 1rem;border-radius:0 6px 6px 0}
+.status{display:grid;grid-template-columns:auto 1fr;gap:.4rem .9rem;align-items:start}
+a{color:var(--accent)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<main>
+<header>
+  <div class="eyebrow">Discord Signal Bot · Paper &amp; shadow testing</div>
+  <h1>Signal Bot Results</h1>
+  <div class="meta">
+    <span>Window 2026-05-23 → 2026-08-22 · all trades <span class="mono">DRY_RUN</span> on BloFin demo · code <span class="mono">9b46cd8</span></span>
+    <span>Shadow outcomes refreshed 2026-08-22: 610 rows, 390 terminal, 0 regressions. Full write-up: <span class="mono">reports/FINAL-RESULTS-2026-08-22.md</span></span>
+  </div>
+</header>
+
+<section>
+  <div class="tiles">
+    <div class="tile"><span class="l">Paper book</span><span class="v gain">+21.1R</span><span class="s">+$202 · 140 trades · 47% WR</span></div>
+    <div class="tile"><span class="l">Sveezy alone</span><span class="v gain">+16.1R</span><span class="s">n=34 · the whole edge</span></div>
+    <div class="tile"><span class="l">RSI, current rules</span><span class="v gain">+6.0R</span><span class="s">n=81 since 07-10 · thin, not yet significant</span></div>
+    <div class="tile"><span class="l">OracleAlgo shadow</span><span class="v loss">−28.3R</span><span class="s">n=100 · never in profit</span></div>
+    <div class="tile"><span class="l">Go-live blockers</span><span class="v warn">3</span><span class="s">preflight · watchdog · sample size</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Summary</h2>
+  <ol class="summary">
+    <li><strong>The paper book is profitable, but one human analyst is the whole edge.</strong> Without Sveezy the remaining 106 trades net about +5R — break-even after 51 stop-outs.</li>
+    <li><strong>Both algo feeds lose in shadow over the full sample</strong> (RSI −18.5R, Oracle −28.3R). They look better in the paper book only because the live gates blocked most losing rows.</li>
+    <li><strong>Under today's RSI rules the feed is marginally positive:</strong> +6.0R over 81 gate-passing signals, +0.07R per trade, 54% WR. Positive, thin, not distinguishable from zero yet.</li>
+    <li><strong>Gates:</strong> <code>sell_regime</code> and Oracle <code>no_bias</code> clearly validated; confirmation-on-turn clearly negative (paired −12.7R, t=−2.56); <code>macro_trend</code> neutral.</li>
+    <li><strong>Not ready for live money — for operational reasons, not strategy.</strong> Preflight never recorded a GO, the watchdog has been dead since 08-07 and missed a 4-day capture outage, and only 22 trades exist since the attribution fix.</li>
+  </ol>
+</section>
+
+<section>
+  <h2>Rule verdicts</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Rule</th><th>Verdict</th><th class="n">n</th><th class="n">R</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Follow Sveezy Alerts</td><td><span class="chip keep">KEEP · SIZE UP</span></td><td class="n">34</td><td class="n gain">+16.1</td><td>56% WR, max DD $21. Raise <code>SVEEZY_ALERTS__RISK_PCT</code> to 0.015.</td></tr>
+      <tr><td><code>RSI_SELL_REGIME_GATE</code></td><td><span class="chip keep">KEEP</span></td><td class="n">34</td><td class="n loss">−18.5</td><td>Blocked rows ran 21% WR. Strongest single gate.</td></tr>
+      <tr><td>Oracle <code>no_bias</code> gate</td><td><span class="chip keep">KEEP</span></td><td class="n">58</td><td class="n loss">−16.0</td><td>Blocked rows; post-cutoff −15.3R on 32.</td></tr>
+      <tr><td><code>RSI_CONFIRM_ENABLED</code></td><td><span class="chip off">KEEP OFF</span></td><td class="n">137</td><td class="n loss">−12.7</td><td>Paired same-row, post-cutoff; better on 2 rows, worse on 10, t=−2.56.</td></tr>
+      <tr><td><code>RSI_FIRST_ALERT_ONLY</code></td><td><span class="chip off">KEEP OFF</span></td><td class="n">49</td><td class="n gain">+6.0</td><td>Gate would block a positive set; repeat alerts outperform firsts.</td></tr>
+      <tr><td><code>ORACLE_HTF_FALLBACK</code></td><td><span class="chip off">KEEP OFF</span></td><td class="n">21</td><td class="n loss">−13.0</td><td><code>htf_bear</code> 18% WR. Worst Oracle bucket.</td></tr>
+      <tr><td><code>RSI_MACRO_TREND_GATE</code></td><td><span class="chip neutral">NEUTRAL · NARROW</span></td><td class="n">35</td><td class="n">+0.5</td><td>Blocked set is flat. Strong-trend buckets −19.5R; moderate ~0. Narrow to <code>trending_strong</code>.</td></tr>
+      <tr><td>RSI alt exit (TP1 3.75%)</td><td><span class="chip neutral">NOT YET</span></td><td class="n">155</td><td class="n">−0.1</td><td>+9.4R all-time but −0.1R post-cutoff; wins on a few big saves, loses on 71 of 81 differing rows.</td></tr>
+      <tr><td>OracleAlgo feed</td><td><span class="chip off">TURN OFF</span></td><td class="n">100</td><td class="n loss">−28.3</td><td>Never in profit. If kept: <code>ORACLE_ENTRY_TYPES=MSS</code> + real bias TTL (stale-bear −14.3R, BOS −11.0R).</td></tr>
+      <tr><td>Soul Alerts</td><td><span class="chip fix">HALF SIZE</span></td><td class="n">50</td><td class="n loss">−0.4</td><td>Max DD $78, 36% WR — but 43/50 predate the attribution fix; post-fix 7 trades +$34.</td></tr>
+      <tr><td>Prestige Alerts</td><td><span class="chip keep">ROLE ADDED</span></td><td class="n">0</td><td class="n">—</td><td>Never subscribed, not silent: zero <code>@Prestige Alerts</code> pings ever reached the mentions inbox. Cards are standard text embeds; role added 2026-08-22, no code change needed.</td></tr>
+      <tr><td>Sherlock Alerts</td><td><span class="chip fix">PARSER FIXED</span></td><td class="n">31</td><td class="n">—</td><td>All 31 structured entries since May were classified as CLOSE (<code>4H CLOSE ABOVE $x</code> soft-stop leaked into the close detector). Fixed 2026-08-22; corpus diff clean on every other analyst. Needs restart + commit.</td></tr>
+      <tr><td><code>RSI_MAX_CHASE_PCT</code> = 1.00</td><td><span class="chip fix">SWEEP</span></td><td class="n">—</td><td class="n">—</td><td>Filter is inert at 100%. <code>f_chase</code> is logged per row — sweep offline before setting.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Where the RSI edge lives</h2>
+  <p>RSI Extreme only works when BTC's 4-hour trend is absent. Per-symbol ADX has no discriminating power (268 of 290 rows read <code>trending_strong</code>); BTC 4H regime is the only useful regime field.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Period</th><th>BTC 4H regime</th><th class="n">n</th><th class="n">WR</th><th class="n">Sum R</th></tr></thead>
+    <tbody>
+      <tr><td>All</td><td>Non-trending</td><td class="n">164</td><td class="n">55.5%</td><td class="n gain">+22.5</td></tr>
+      <tr><td>All</td><td>Trending</td><td class="n">126</td><td class="n">33.3%</td><td class="n loss">−41.0</td></tr>
+      <tr><td>Post 07-10</td><td>Non-trending</td><td class="n">83</td><td class="n">54.2%</td><td class="n gain">+5.5</td></tr>
+      <tr><td>Post 07-10</td><td>Trending</td><td class="n">72</td><td class="n">36.1%</td><td class="n loss">−18.0</td></tr>
+      <tr><td>Post 07-10</td><td>bull_trending_strong</td><td class="n">29</td><td class="n">24.1%</td><td class="n loss">−13.5</td></tr>
+      <tr><td>Post 07-10</td><td>bear_trending_moderate</td><td class="n">24</td><td class="n">50.0%</td><td class="n">+1.0</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Paper book by source</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Source</th><th class="n">n</th><th class="n">W/L</th><th class="n">Net $</th><th class="n">R</th><th class="n">Max DD $</th><th class="n">Post-fix</th></tr></thead>
+    <tbody>
+      <tr><td>Sveezy Alerts</td><td class="n">34</td><td class="n">19/15</td><td class="n gain">+159.81</td><td class="n gain">+16.14</td><td class="n">20.7</td><td class="n">6 · +7.2</td></tr>
+      <tr><td>RSI Extreme</td><td class="n">23</td><td class="n">13/10</td><td class="n gain">+34.42</td><td class="n gain">+3.53</td><td class="n">33.2</td><td class="n">1 · +12.4</td></tr>
+      <tr><td>Nurse-Neil Alerts</td><td class="n">4</td><td class="n">2/2</td><td class="n gain">+19.59</td><td class="n gain">+2.01</td><td class="n">—</td><td class="n">1 · +10.8</td></tr>
+      <tr><td>Ajmal Alerts</td><td class="n">3</td><td class="n">2/1</td><td class="n gain">+14.49</td><td class="n gain">+1.45</td><td class="n">—</td><td class="n">0</td></tr>
+      <tr><td>Wilsauce Alerts</td><td class="n">1</td><td class="n">1/0</td><td class="n">+1.66</td><td class="n">+0.18</td><td class="n">—</td><td class="n">1 · +1.7</td></tr>
+      <tr><td>Sherlock Alerts</td><td class="n">1</td><td class="n">0/1</td><td class="n">−0.85</td><td class="n">−0.09</td><td class="n">—</td><td class="n">1 · −0.9</td></tr>
+      <tr><td>OracleAlgo</td><td class="n">18</td><td class="n">9/9</td><td class="n">−1.33</td><td class="n">+0.10</td><td class="n">49.2</td><td class="n">5 · +42.4</td></tr>
+      <tr><td>Soul Alerts</td><td class="n">50</td><td class="n">18/32</td><td class="n loss">−7.81</td><td class="n loss">−0.44</td><td class="n">77.7</td><td class="n">7 · +34.2</td></tr>
+      <tr><td>Caleb Alerts</td><td class="n">6</td><td class="n">2/4</td><td class="n loss">−17.66</td><td class="n loss">−1.80</td><td class="n">—</td><td class="n">0</td></tr>
+      <tr><td><strong>Total</strong></td><td class="n">140</td><td class="n">66/74</td><td class="n gain">+202.32</td><td class="n gain">+21.08</td><td class="n">111.0</td><td class="n">22 · +107.7</td></tr>
+    </tbody>
+  </table></div>
+  <p>Close reasons: the ladder works — <code>tp1_final</code> +$441 (n=21) and <code>tp2_final</code> +$140 are 100% winners; <code>time_stop</code> at 120h is net positive (+$103, 55% WR); <code>sl</code> −$548 over 51 trades is the entire cost of doing business.</p>
+</section>
+
+<section>
+  <h2>What needs fixing</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Gap</th><th>Why it matters</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Preflight never verifiably run</td><td>Prints to stdout only; zero log mentions.</td><td>Run <code>preflight.py</code>, archive the output. <strong>Blocker.</strong></td></tr>
+      <tr><td>Watchdog dead since 08-07</td><td>A 4-day Chrome/CDP tab-loss storm (329 errors) went unwatched 08-17 → 08-20.</td><td>Run <code>watchdog.py</code> as a scheduled task. <strong>Blocker.</strong></td></tr>
+      <tr><td>CDP tab loss is the dominant failure</td><td>Silent signal loss.</td><td>Auto-reacquire the tab / relaunch Chrome after N failures; set <code>STALE_SWEEP_ALERT_N</code>.</td></tr>
+      <tr><td>Current-ruleset sample small</td><td>81 gate-pass RSI rows, 22 post-fix paper trades.</td><td>Keep running dry to ~150 rows with sum R &gt; 0 at t &gt; 1.5.</td></tr>
+      <tr><td>Shadow <code>no_data</code> decay</td><td>29% of rows unmeasurable: Gate.io keeps ~34 days of candles, analyzer runs daily.</td><td><code>SHADOW_ANALYZE_HOURS=6</code>.</td></tr>
+      <tr><td>No per-analyst shadow log</td><td>Analyst trades have no counterfactuals.</td><td>Log analyst entries with <code>source=&lt;analyst&gt;</code>.</td></tr>
+      <tr><td><code>analyst_stats</code> out of sync with <code>trades</code></td><td>Soul 20/35 vs 18/32, RSI 15/14 vs 13/10 — this table drives leverage.</td><td>Rebuild by replaying <code>trades</code>.</td></tr>
+      <tr><td>3 trades with <code>won</code> ≠ PnL sign</td><td>Leverage ladder can step the wrong way.</td><td>Derive <code>won</code> from net PnL everywhere.</td></tr>
+      <tr><td><code>HEDGE_MODE</code> bypasses <code>MAX_OPEN_POSITIONS</code></td><td>Live, this is your exposure cap.</td><td>Set <code>MAX_OPEN_PER_SOURCE</code> per live source.</td></tr>
+      <tr><td>8 example keys unset in <code>.env</code></td><td>Behaviour depends on code defaults.</td><td>Pin <code>RUNNER_MAX_AGE_HOURS</code>, <code>LOG_MAX_MB</code>, etc.</td></tr>
+      <tr><td>Shadow CSVs uncommitted</td><td>Git history is the only recovery path.</td><td>Commit after every analyzer run.</td></tr>
+      <tr><td>LM Studio is a silent dependency</td><td>Lane no-ops when down; 57% lifetime parse success.</td><td>Periodic re-probe + alert; cloud fallback for live.</td></tr>
+      <tr><td>Sherlock entries misclassified as CLOSE</td><td>31 structured entries silently dropped since May; his real record is unknown.</td><td>Fixed in <code>signal_parser.py</code> 2026-08-22 — restart the bot and commit; re-run <code>tools/parser_corpus_diff.py</code> on every parser change.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Go-live checklist</h2>
+  <div class="callout status">
+    <span class="chip keep">DONE</span><span>Bot running post-gate code, clean since 08-20 restart (0 errors).</span>
+    <span class="chip keep">DONE</span><span>qwen3.5 vision fallback seen working (last 2026-08-21 09:48).</span>
+    <span class="chip neutral">PARTIAL</span><span>≥1 week clean data under current gates — 6 weeks of shadow, but 22 post-fix paper trades and a 4-day outage inside the window.</span>
+    <span class="chip off">OPEN</span><span>Oracle regime gate verified or Oracle off → turn OracleAlgo off.</span>
+    <span class="chip off">OPEN</span><span>Run <code>preflight.py</code> with a new BloFin account (old live keys fail 152408); archive a GO.</span>
+    <span class="chip off">OPEN</span><span>Start the watchdog; <code>python watchdog.py --test-alert</code>.</span>
+    <span class="chip off">OPEN</span><span>Enable BloFin long/short position mode by hand (required by <code>HEDGE_MODE</code>, not automated).</span>
+    <span class="chip off">OPEN</span><span>Live source set: Sveezy + RSI Extreme + Soul (half size); everything else <code>__ENABLED=false</code>.</span>
+    <span class="chip off">OPEN</span><span>Exposure caps per source; sane <code>LEVERAGE_MAX</code> (Sveezy is at 115x on paper).</span>
+    <span class="chip off">OPEN</span><span>Kill-switch rehearsal on demo; start live at <code>RISK_PCT=0.005</code> for 30 trades.</span>
+  </div>
+</section>
+
+<section>
+  <h2>Proposed config changes</h2>
+  <p>Nothing has been applied. Every row below is a recommendation for you to make by hand.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Key</th><th>Current</th><th>Recommended</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><code>ORACLEALGO__ENABLED</code></td><td>on</td><td><code>false</code></td><td>−28.3R / n=100</td></tr>
+      <tr><td><code>SVEEZY_ALERTS__RISK_PCT</code></td><td>0.01</td><td><code>0.015</code></td><td>+16.1R, max DD $21</td></tr>
+      <tr><td><code>SOUL_ALERTS__RISK_PCT</code></td><td>0.01</td><td><code>0.005</code></td><td>max DD $78; recheck at 30 post-fix trades</td></tr>
+      <tr><td>Discord role (not <code>.env</code>)</td><td>Prestige missing</td><td>hold <code>@Prestige Alerts</code></td><td>0 pings ever captured; added 08-22</td></tr>
+      <tr><td><code>signal_parser.py</code> (code)</td><td>Sherlock entries → CLOSE</td><td>restart bot to load the fix</td><td>31 entries misclassified; corpus diff clean</td></tr>
+      <tr><td><code>RSI_MACRO_TREND_GATE</code></td><td>moderate+strong</td><td>strong only</td><td>moderate ~flat, strong −19.5R</td></tr>
+      <tr><td><code>RSI_MAX_CHASE_PCT</code></td><td>1.00</td><td>sweep, then set</td><td>inert today</td></tr>
+      <tr><td><code>SHADOW_ANALYZE_HOURS</code></td><td>24</td><td><code>6</code></td><td>29% rows lost to retention</td></tr>
+      <tr><td><code>MAX_OPEN_PER_SOURCE</code></td><td>unset</td><td>per live source</td><td>hedge mode bypasses global cap</td></tr>
+      <tr><td><code>RUNNER_MAX_AGE_HOURS</code></td><td>unset (120)</td><td><code>120</code> explicit</td><td>time_stop +$103</td></tr>
+      <tr><td><code>RSI_CONFIRM_ENABLED</code></td><td>false</td><td>keep false</td><td>paired −12.7R, t=−2.56</td></tr>
+      <tr><td><code>RSI_FIRST_ALERT_ONLY</code></td><td>false</td><td>keep false</td><td>would block +6.0R</td></tr>
+      <tr><td><code>ORACLE_HTF_FALLBACK</code></td><td>false</td><td>keep false</td><td>htf_* −13R</td></tr>
+      <tr><td><code>RSI_TP_PCTS</code></td><td>0.05,0.10</td><td>keep</td><td>alt ladder −0.1R post-cutoff</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>How to read the numbers</h2>
+  <ul>
+    <li><strong>Shadow R</strong> = return ÷ the strategy's fixed stop (RSI 5%, Oracle 1.5%); a full stop is exactly −1. Gate.io 5m candles, 72h horizon, conservative on intra-candle ambiguity.</li>
+    <li><strong>Paper R</strong> = per-trade structural R from the parsed stop. The two R units are never added together.</li>
+    <li><strong>Paired tests</strong> compare two entry/exit rules on the same signal row. Comparing <code>decision</code> buckets against each other is confounded by time (June, July and August each ran a different gate set) and is used here only to price what a gate blocked.</li>
+    <li><strong>"Current ruleset"</strong> = RSI rows since 2026-07-10 that passed every live gate (<code>enter</code> + <code>pending_confirm</code>); the latter would be immediate entries under today's config.</li>
+  </ul>
+</section>
+</main>

@@ -13,6 +13,7 @@ Public interface (everything below is safe to call from anywhere):
   init_db(), open_position(), close_position(), apply_partial(), get_open_positions(),
   find_open_by_symbol(), update_position_sl_tp(), update_unrealized(),
   get_analyst_leverage(), record_outcome(), add_realized_pnl(), get_all_analyst_stats(),
+  derive_won(), replay_ladder(),
   mark_seen(), get_seen_ids(), set_state(), get_state()
 
 Reusable standalone: yes. Only dependency is the stdlib `sqlite3` plus
@@ -450,6 +451,37 @@ def prune_seen(keep: int = 5000):
 # Adaptive per-analyst leverage
 # ---------------------------------------------------------------------------
 
+def derive_won(net_pnl: float) -> bool:
+    """Single source of truth for the win/loss flag: a trade is a win only if
+    its realized PnL after fees and funding is positive. Every settlement path
+    derives `won` from this unless it has a documented reason to override, so
+    the flag can never disagree with `net_pnl` (the leverage ladder steps on
+    `won`, so a wrong flag moves leverage the wrong way)."""
+    return float(net_pnl) > 0
+
+
+def step_leverage(current: int, won: bool, step: int, lo: int, hi: int) -> int:
+    """One rung of the adaptive ladder: +step on a win, -step on a loss,
+    clamped to [lo, hi]. Pure; record_outcome persists the result."""
+    new_lev = int(current) + int(step) if won else int(current) - int(step)
+    return max(int(lo), min(int(hi), new_lev))
+
+
+def replay_ladder(outcomes, start: int, lo: int, hi: int, step: int) -> dict:
+    """Replay a sequence of win/loss outcomes (in closed_at order) from `start`
+    and return {"leverage", "wins", "losses"}. Leverage is path-dependent, so
+    this is the only defensible way to rebuild analyst_stats from the trades
+    blotter (see tools/rebuild_analyst_stats.py)."""
+    lev = max(int(lo), min(int(hi), int(start)))
+    wins = losses = 0
+    for won in outcomes:
+        won = bool(won)
+        lev = step_leverage(lev, won, step, lo, hi)
+        wins += 1 if won else 0
+        losses += 0 if won else 1
+    return {"leverage": lev, "wins": wins, "losses": losses}
+
+
 def get_analyst_leverage(analyst: str, start: int, lo: int, hi: int) -> int:
     """
     Return the current leverage for an analyst, clamped to [lo, hi].
@@ -486,8 +518,7 @@ def record_outcome(analyst: str, won: bool, step: int, lo: int, hi: int) -> int:
     cur_lev = int(row[0]) if row else int((lo + hi) // 2)
     wins = (row[1] if row else 0) + (1 if won else 0)
     losses = (row[2] if row else 0) + (0 if won else 1)
-    new_lev = cur_lev + step if won else cur_lev - step
-    new_lev = max(int(lo), min(int(hi), new_lev))
+    new_lev = step_leverage(cur_lev, won, step, lo, hi)
     con.execute(
         "INSERT INTO analyst_stats (analyst, leverage, wins, losses, updated_at) "
         "VALUES (?, ?, ?, ?, ?) "

@@ -25,7 +25,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import net_prefs  # pin outbound HTTPS to IPv4 (BloFin IP whitelist) before any client
+net_prefs.force_ipv4()
+
 import accounts  # virtual bot/user paper accounts
+import exec_mode  # PAPER / DEMO / LIVE resolution (derived from .env)
+import live_epoch
 import logger as _logger_mod
 import position_tracker as pt
 import discord_reader as dr
@@ -37,10 +42,119 @@ import dashboard
 import market_regime as mr
 from price_stream import PriceStream
 from logger import log, now_local
+import llm_probe
+from cdp_recovery import CdpRecovery, TransitionAlert
+
+# LM Studio up/down tracker: seeded by the startup probe, re-probed in main().
+_llm_state = llm_probe.LlmProbeState()
 
 _logger_mod.init_db()
 pt.init_db()
 accounts.init_db()
+
+
+# ---------------------------------------------------------------------------
+# .env hot-reload
+# ---------------------------------------------------------------------------
+# Every os.getenv() call in this module lives inside a function (nothing is
+# frozen at import time except the loop-local variables main() derives once).
+# So re-running load_dotenv(override=True) whenever the file's mtime changes
+# makes almost every setting live on its next read, with no restart needed.
+
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+try:
+    _env_mtime = os.stat(_ENV_PATH).st_mtime
+except OSError:
+    _env_mtime = None
+
+# Substrings (case-insensitive) that mark an env var name as credential-shaped.
+# Any key matching one of these has its value redacted on BOTH sides of a
+# reload log line - it must never reach bot.log.
+# NOTE: "URL" is deliberately NOT in this list. It would mask BLOFIN_BASE_URL,
+# which is the single most important value to see change in the log (it is what
+# switches the bot between the demo and live endpoints). WEBHOOK/INVITE are
+# listed explicitly instead, so ALERT_WEBHOOK_URL is redacted without hiding it.
+_REDACT_NAME_PARTS = ("SECRET", "KEY", "PASSPHRASE", "PASSWORD", "TOKEN", "API",
+                      "WEBHOOK", "INVITE")
+
+# Consumed once at startup by objects that are already constructed (BloFin
+# client, PriceStream, exchange position-mode setup). Changing these in .env
+# cannot take effect without a process restart.
+_RESTART_ONLY_VARS = (
+    "BLOFIN_BASE_URL",
+    "PAPER_MODE",
+    "HEDGE_MODE",
+    "BloFinAPI",
+    "Demo-BloFinAPI",
+    "Blofin_secret_key",
+    "Demo-Blofin_secret_key",
+    "Passphrase",
+    "Demo-Passphrase",
+)
+
+
+def _redact(key: str, value: str) -> str:
+    """Mask `value` if `key` looks like a credential (case-insensitive)."""
+    if any(part in key.upper() for part in _REDACT_NAME_PARTS):
+        return "<redacted>"
+    return value
+
+
+def _maybe_reload_env() -> bool:
+    """Re-read .env into os.environ if the file changed on disk since last check.
+
+    Meant to be called once per main-loop iteration. The common case (mtime
+    unchanged) is a single cheap os.stat() call. On a real change, snapshots
+    os.environ before and after load_dotenv(override=True) and logs one line
+    per changed key, with credential-shaped values redacted on both sides.
+
+    A missing or briefly locked .env (e.g. an editor mid-save) is handled by
+    returning False rather than raising - this must never be able to take
+    down the main loop, which is what manages open positions.
+
+    Returns:
+        True if a reload was applied (and os.environ may have changed),
+        False otherwise.
+    """
+    global _env_mtime
+    try:
+        mtime = os.stat(_ENV_PATH).st_mtime
+    except OSError:
+        return False
+
+    if _env_mtime is not None and mtime == _env_mtime:
+        return False
+
+    before = dict(os.environ)
+    try:
+        load_dotenv(_ENV_PATH, override=True)
+    except OSError:
+        return False  # vanished/locked between stat() and read - retry next loop
+    _env_mtime = mtime
+    after = dict(os.environ)
+
+    changed = {k for k in after if after.get(k) != before.get(k)}
+    changed |= {k for k in before if k not in after}
+    if not changed:
+        return False
+
+    for key in sorted(changed):
+        old = _redact(key, before.get(key, "<unset>"))
+        new = _redact(key, after.get(key, "<unset>"))
+        log.info(f"ENV RELOAD: {key}: {old} -> {new}")
+
+    # Compare case-insensitively: Windows upper-cases os.environ keys, so the
+    # mixed-case BloFin var names above would never match a literal lookup.
+    _restart_upper = {v.upper() for v in _RESTART_ONLY_VARS}
+    restart_only = sorted(k for k in changed if k.upper() in _restart_upper)
+    if restart_only:
+        log.warning(
+            "ENV RELOAD: these changed in .env but need a bot RESTART to take "
+            f"effect (already in use by constructed objects): {', '.join(restart_only)}"
+        )
+    # New reload generation - a fixed override should re-warn if it breaks again.
+    _BAD_CFG_WARNED.clear()
+    return True
 
 
 def _get_whitelist() -> list[str]:
@@ -62,33 +176,243 @@ def _find_existing(symbol: str, source_key: str):
     return pt.find_open_by_symbol(symbol, source_key if _hedge_mode() else None)
 
 
-def _leverage_params() -> tuple[int, int, int, int]:
-    """Return (start, lo, hi, step) for the adaptive per-analyst leverage system."""
-    start = int(os.getenv("LEVERAGE_START", "75"))
-    lo = int(os.getenv("LEVERAGE_MIN", "50"))
-    hi = int(os.getenv("LEVERAGE_MAX", "125"))
-    step = int(os.getenv("LEVERAGE_STEP", "10"))
+# ---------------------------------------------------------------------------
+# Per-source config resolver
+# ---------------------------------------------------------------------------
+# Every signal source ("Sveezy Alerts", "RSI Extreme", "OracleAlgo", ...) may
+# override selected settings via "<SRC_KEY>__<SETTING>" env vars, e.g.
+# SVEEZY_ALERTS__RISK_PCT=0.02. Falls back to the plain global "<SETTING>" (or
+# an explicit different global name - see MAX_OPEN below), then to the
+# caller-supplied default, so behaviour is unchanged until an override is set.
+# Reads os.environ live on every call (never caches), so per-source overrides
+# stay hot-reloadable exactly like every other setting via _maybe_reload_env.
+
+# Malformed overrides must never raise inside the trading path - they log one
+# warning and fall back to the default. Cleared on every applied .env reload
+# (see _maybe_reload_env) so a fixed value stops warning and a reintroduced
+# typo warns again.
+_BAD_CFG_WARNED: set[str] = set()
+
+# The full set of settings that are per-source-overridable (used to build the
+# startup/reload override summary in _log_source_overrides).
+_PER_SOURCE_SETTINGS = (
+    "ENABLED", "RISK_PCT", "MAX_OPEN",
+    "LEVERAGE_START", "LEVERAGE_MIN", "LEVERAGE_MAX", "LEVERAGE_STEP",
+    "RSI_EXTREME_ENABLED", "RSI_FILTERS_ENABLED", "RSI_MIN_STRENGTH",
+    "RSI_MAX_CHASE_PCT", "RSI_REGIME_GATE", "RSI_SELL_REGIME_GATE",
+    "RSI_MACRO_TREND_GATE", "RSI_FIRST_ALERT_ONLY", "RSI_CONFIRM_ENABLED",
+    "ORACLEALGO_ENABLED", "ORACLE_BIAS_TTL_HOURS", "ORACLE_CONFLUENCE_N",
+    "ORACLE_ENTRY_TYPES", "ORACLE_REGIME_GATE", "ORACLE_HTF_FALLBACK",
+    "ORACLE_PULLBACK_PCT",
+)
+
+
+def _src_key(source: str | None) -> str:
+    """Normalize a source display name into an env-var-safe key.
+
+    Uppercases, collapses every run of non-alphanumeric characters to a
+    single underscore, and strips leading/trailing underscores. Examples:
+    "Sveezy Alerts" -> "SVEEZY_ALERTS", "OracleAlgo" -> "ORACLEALGO",
+    "Nurse-Neil Alerts" -> "NURSE_NEIL_ALERTS". Empty/None input returns "".
+    """
+    if not source:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]+", "_", source).strip("_").upper()
+
+
+def _warn_bad_cfg(key: str, raw: str, default) -> None:
+    """Log once per malformed config value per .env reload generation."""
+    if key in _BAD_CFG_WARNED:
+        return
+    _BAD_CFG_WARNED.add(key)
+    log.warning(f"Config: {key}={raw!r} is not valid - using default {default!r}")
+
+
+def _src_cfg_resolved_key(source: str | None, name: str,
+                          global_name: str | None = None) -> str:
+    """Return the env var name that actually supplies this setting.
+
+    Checks "<SRC_KEY>__<name>" first (only when `source` normalizes to a
+    non-empty key and that exact var is present in os.environ), else falls
+    back to `global_name` (defaults to `name` itself - the common case where
+    the per-source override and the global setting share a name; MAX_OPEN /
+    MAX_OPEN_PER_SOURCE is the one exception, where they differ).
+    """
+    global_name = name if global_name is None else global_name
+    if source:
+        key = _src_key(source)
+        if key:
+            override_key = f"{key}__{name}"
+            if override_key in os.environ:
+                return override_key
+    return global_name
+
+
+def _src_cfg(source: str | None, name: str, default: str,
+            global_name: str | None = None) -> str:
+    """Resolve a per-source-overridable string setting.
+
+    Checks "<SRC_KEY>__<name>" then the global "<name>" (or `global_name` if
+    given), then `default`. `source` may be None/empty (global lookup only).
+    Reads os.environ at call time - never caches - so it stays live with the
+    .env hot-reload.
+    """
+    resolved_key = _src_cfg_resolved_key(source, name, global_name)
+    return os.environ.get(resolved_key, default)
+
+
+def _src_cfg_float(source: str | None, name: str, default: float,
+                   global_name: str | None = None) -> float:
+    """Like `_src_cfg` but parses as float; a malformed value warns once (per
+    reload generation) and falls back to `default` instead of raising."""
+    resolved_key = _src_cfg_resolved_key(source, name, global_name)
+    raw = os.environ.get(resolved_key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        _warn_bad_cfg(resolved_key, raw, default)
+        return default
+
+
+def _src_cfg_int(source: str | None, name: str, default: int,
+                 global_name: str | None = None) -> int:
+    """Like `_src_cfg` but parses as int; a malformed value warns once (per
+    reload generation) and falls back to `default` instead of raising."""
+    resolved_key = _src_cfg_resolved_key(source, name, global_name)
+    raw = os.environ.get(resolved_key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        _warn_bad_cfg(resolved_key, raw, default)
+        return default
+
+
+def _src_cfg_bool(source: str | None, name: str, default: bool,
+                  global_name: str | None = None) -> bool:
+    """Like `_src_cfg` but parses as bool.
+
+    Matches the `.lower() == "true"` convention used throughout bot.py,
+    extended to also accept "1"/"yes"/"on" (case-insensitive) as truthy; any
+    other present value is False.
+    """
+    resolved_key = _src_cfg_resolved_key(source, name, global_name)
+    raw = os.environ.get(resolved_key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def _log_source_overrides() -> None:
+    """Print effective per-source overrides for every source that has at
+    least one "<SRC>__<SETTING>" var set in the environment (see _src_cfg).
+    Sources with no overrides print nothing - keeps the startup log readable.
+    """
+    by_source: dict[str, list[str]] = {}
+    for env_key, value in os.environ.items():
+        if "__" not in env_key:
+            continue
+        src_name, _, setting = env_key.partition("__")
+        if setting in _PER_SOURCE_SETTINGS:
+            by_source.setdefault(src_name, []).append(f"{setting}={value}")
+    for src_name in sorted(by_source):
+        log.info(f"  Override [{src_name}]: " + ", ".join(sorted(by_source[src_name])))
+
+
+def _leverage_params(source: str | None = None) -> tuple[int, int, int, int]:
+    """Return (start, lo, hi, step) for the adaptive leverage system, honoring
+    any <SRC>__LEVERAGE_* overrides for `source` (falls back to the globals)."""
+    start = _src_cfg_int(source, "LEVERAGE_START", 75)
+    lo = _src_cfg_int(source, "LEVERAGE_MIN", 50)
+    hi = _src_cfg_int(source, "LEVERAGE_MAX", 125)
+    step = _src_cfg_int(source, "LEVERAGE_STEP", 10)
     return start, lo, hi, step
+
+
+def _base_name_pattern(base: str) -> str:
+    """Regex for a base analyst name that treats hyphens and spaces as
+    interchangeable, so whitelist "Nurse-Neil" matches author "Nurse Neil"."""
+    parts = [re.escape(p) for p in re.split(r'[-\s]+', base) if p]
+    return r'[-\s]+'.join(parts)
+
+
+def _strip_analyst_mentions(content: str, names_lower) -> str:
+    """Remove "@Name" / "@Base" role-mention spans for whitelisted analysts.
+
+    A mention is how a NON-author claims someone else's key: engagement spam
+    reading "@Caleb Alerts" was being attributed to Caleb, and an analyst
+    quoting a peer handed their own signal to that peer. Only whitelist names
+    are stripped -- a generic "@word" pattern would eat real message text.
+    """
+    out = content
+    for nl in names_lower:
+        base = re.sub(r'\s*alerts\s*$', '', nl).strip()
+        for token in [t for t in (nl, base) if t]:
+            out = re.sub(r'@\s*' + _base_name_pattern(token), ' ', out)
+    return out
+
+
+def _matches_name(nl: str, author: str, haystack: str) -> bool:
+    """The three matching tiers for ONE lowercased whitelist name.
+
+    Shared by _canonical_analyst and _is_whitelisted so the resolver and the
+    gate cannot drift apart -- they have done so twice, and each time it split
+    an analyst's trades across two keys.
+    """
+    # Tier 1: exact full name.
+    if nl in haystack:
+        return True
+    # Tier 2: base name (everything before " alerts"). Start-of-word anchor
+    # only, because Discord embed textContent concatenates fields, as in
+    # "Signal by SveezyEntry$62,615.00".
+    base = re.sub(r'\s*alerts\s*$', '', nl).strip()
+    if len(base) >= 4 and re.search(r'(?<!\w)' + _base_name_pattern(base), haystack):
+        return True
+    # Tier 3: any significant word of the name in the AUTHOR field. Author
+    # only, never content.
+    for word in re.split(r'[-\s]+', nl):
+        if len(word) >= 4 and word != 'alerts' and word in author:
+            return True
+    return False
+
+
+def _resolve_analyst(msg: dict, whitelist: list[str]):
+    """Return the matching whitelist name for a message, or None.
+
+    Two passes, author first. A name found in the AUTHOR field is the
+    strongest evidence of who posted, so it must beat a name merely mentioned
+    in the body -- otherwise whitelist ORDER decides, and the first-listed
+    analyst wins every message that mentions them. Measured over 2,776 real
+    messages, that mis-attributed 10 posts to the wrong analyst (Sveezy's own
+    post booked to Soul) and 7 spam posts to analysts who never wrote them.
+
+    The body remains a fallback because embed textContent sometimes carries
+    the author name when the author element is empty; mentions are stripped
+    from it so a third party cannot claim someone else's key.
+    """
+    author = msg.get("author", "").lower()
+    content = msg.get("content", "").lower()
+    for name in whitelist:
+        if _matches_name(name.lower(), author, author):
+            return name
+    hay = author + " " + _strip_analyst_mentions(content, [n.lower() for n in whitelist])
+    for name in whitelist:
+        if _matches_name(name.lower(), author, hay):
+            return name
+    return None
 
 
 def _canonical_analyst(msg: dict, whitelist: list[str]) -> str:
     """
     Resolve the canonical analyst name for a message (e.g. "Soul Alerts"),
-    using the same matching tiers as the whitelist gate. This is the key used
-    for performance attribution, so it must be stable across the entry signal
-    and the later outcome resolution. Falls back to the raw author.
+    using the same matching as the whitelist gate. This is the key used for
+    performance attribution, so it must be stable across the entry signal and
+    the later outcome resolution. Falls back to the raw author.
     """
-    author = msg.get("author", "").lower()
-    content = msg.get("content", "").lower()
-    haystack = author + " " + content
-    for name in whitelist:
-        nl = name.lower()
-        if nl in haystack:
-            return name
-        base = re.sub(r'\s*alerts\s*$', '', nl).strip()
-        if len(base) >= 4 and re.search(r'(?<!\w)' + re.escape(base), haystack):
-            return name
-    return msg.get("author", "") or "unknown"
+    return _resolve_analyst(msg, whitelist) or msg.get("author", "") or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +441,7 @@ def _shadow_strategy(signal: sp.Signal, entry_price, decisions: dict):
         log.debug(f"shadow log failed: {e}")
 
 
-def _rsi_filter_verdicts(signal: sp.Signal) -> tuple:
+def _rsi_filter_verdicts(signal: sp.Signal, source_key: str = "RSI Extreme") -> tuple:
     """Evaluate the three RSI quality filters WITHOUT enforcing them. Returns
     (f_strength, f_chase, f_regime) — each True (pass) / False (block) / None
     (no data to decide, never blocks).
@@ -128,8 +452,8 @@ def _rsi_filter_verdicts(signal: sp.Signal) -> tuple:
                  already below -RSI_MAX_CHASE_PCT (knife), or an overbought-short when it's
                  already above +RSI_MAX_CHASE_PCT.
       regime   — the BTC bias must not oppose the fade (no oversold-long while bias=bear)."""
-    min_strength = float(os.getenv("RSI_MIN_STRENGTH", "80"))
-    max_chase = float(os.getenv("RSI_MAX_CHASE_PCT", "0.12"))
+    min_strength = _src_cfg_float(source_key, "RSI_MIN_STRENGTH", 80.0)
+    max_chase = _src_cfg_float(source_key, "RSI_MAX_CHASE_PCT", 0.12)
 
     f_strength = None
     if signal.rsi_value is not None:
@@ -347,6 +671,247 @@ def _check_pending_entries(dry_run: bool):
 
 
 # ---------------------------------------------------------------------------
+# Resting limit orders on the exchange (DEMO/LIVE)
+# ---------------------------------------------------------------------------
+# A LIMIT entry placed on BloFin is NOT a position until it fills. It rests here
+# (strategy_state JSON list, key "resting_orders" - same persistence as the
+# PAPER pending queue) and _check_resting_orders() polls the exchange:
+#   * filled (fully, or partially >= 50% of target / >= minSize once it leaves
+#     the book)      -> open the DB position at the ACTUAL avg fill + filled size
+#   * cancelled / expired on the exchange                       -> log + drop
+#   * stale (LIMIT_STALE_PCT drift / LIMIT_STALE_HOURS age)      -> cancel + drop
+#     (any partial fill that already exists is adopted as a position so it is
+#     never left unmanaged on the exchange)
+#   * vanished from pending + history + fills for RESTING_MAX_MISSES polls -> drop
+_RESTING_KEY = "resting_orders"
+_last_resting_check = 0.0
+# Partial fill rule: once this fraction of the target size is filled while the
+# order still rests, cancel the remainder and manage what we have. Below it the
+# order keeps resting (the attached exchange SL backstops the filled part).
+RESTING_PARTIAL_TAKE_FRAC = 0.5
+RESTING_MAX_MISSES = 3
+
+
+def _load_resting() -> list:
+    raw = pt.get_state(_RESTING_KEY)
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+        return items if isinstance(items, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def _save_resting(items: list) -> None:
+    pt.set_state(_RESTING_KEY, json.dumps(items))
+
+
+def _has_resting(symbol: str, analyst_key: str) -> bool:
+    return any(it.get("symbol") == symbol and it.get("analyst_key") == analyst_key
+               for it in _load_resting())
+
+
+def _add_resting(signal: sp.Signal, order_id: str, size: float, leverage: int,
+                 analyst_key: str, tp_ladder: list) -> dict:
+    """Persist a limit entry that is now resting on the exchange."""
+    rec = {
+        "order_id": str(order_id),
+        "symbol": signal.symbol,
+        "side": signal.side,
+        "source": signal.source,
+        "analyst_key": analyst_key,
+        "entry": signal.entry,
+        "sl": signal.sl,
+        "tp": signal.tp,
+        "tps": list(tp_ladder or []),
+        "size": size,
+        "leverage": leverage,
+        "placed_at": now_local().isoformat(),
+        "created_price": bf.get_market_price(signal.symbol),
+        "raw_text": signal.raw_text,
+        "soft_stop": bool(signal.soft_stop),
+        "filled_size": 0.0,
+        "misses": 0,
+    }
+    items = _load_resting()
+    items.append(rec)
+    _save_resting(items)
+    log.info(f"LIMIT resting on exchange: {signal.symbol} {signal.side} @ {signal.entry} "
+             f"orderId={order_id} size={size} [{analyst_key}]")
+    return rec
+
+
+def _open_filled(rec: dict, filled: float, avg_price: float) -> None:
+    """Turn a (partially) filled resting order into a managed DB position."""
+    entry = avg_price if avg_price and avg_price > 0 else float(rec["entry"])
+    if entry != rec["entry"]:
+        log.info(f"[{rec['analyst_key']}] {rec['symbol']} limit filled @ {entry} "
+                 f"(limit {rec['entry']})")
+    pos = pt.Position(
+        symbol=rec["symbol"], side=rec["side"], entry=entry,
+        sl=rec["sl"], tp=rec["tp"], size=filled, order_id=rec["order_id"],
+        opened_at=now_local().isoformat(), analyst=rec["analyst_key"],
+        tps=list(rec.get("tps") or []), orig_size=filled,
+        soft_stop=bool(rec.get("soft_stop")), leverage=int(rec.get("leverage") or 0),
+    )
+    pt.open_position(pos)
+    log.info(f"[{rec['analyst_key']}] {rec['symbol']} {rec['side'].upper()} OPEN "
+             f"{filled} @ {entry} (limit fill, orderId={rec['order_id']})")
+    _logger_mod.log_signal(rec["analyst_key"], rec.get("raw_text", ""),
+                           outcome=f"executed (limit fill @ {entry}, size {filled})",
+                           order_id=rec["order_id"])
+
+
+def _min_size(symbol: str) -> float:
+    specs = bf.get_contract_specs(symbol)
+    try:
+        return float((specs or {}).get("min_size") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _resting_stale_reason(rec: dict, price: float | None) -> str | None:
+    """Same two triggers as the PAPER queue: drift past LIMIT_STALE_PCT since
+    placement, or age beyond LIMIT_STALE_HOURS. Either threshold 0 disables it."""
+    stale_pct = float(os.getenv("LIMIT_STALE_PCT", "0.10"))
+    stale_hours = float(os.getenv("LIMIT_STALE_HOURS", "48"))
+    ref0 = float(rec["entry"])
+    created_price = rec.get("created_price")
+    try:
+        age_h = (now_local() - datetime.fromisoformat(rec["placed_at"])).total_seconds() / 3600
+    except Exception:
+        age_h = 0.0
+
+    def _away(p):
+        return (p - ref0) / ref0 if rec["side"] == "buy" else (ref0 - p) / ref0
+
+    if stale_pct > 0 and created_price and price is not None:
+        drift = _away(price) - _away(created_price)
+        if drift > stale_pct:
+            return f"price ran {drift * 100:.1f}% further from limit since placed"
+    if stale_hours > 0 and age_h > stale_hours:
+        return f"aged {age_h:.0f}h"
+    return None
+
+
+def _drop_resting(rec: dict, outcome: str, why: str) -> None:
+    log.info(f"[{rec['analyst_key']}] resting limit {rec['symbol']} {rec['side']} "
+             f"orderId={rec['order_id']} dropped - {why}")
+    _logger_mod.log_signal(rec["analyst_key"], rec.get("raw_text", ""),
+                           outcome=f"{outcome} {rec['symbol']}", order_id=rec["order_id"])
+
+
+def _settle_resting(rec: dict, price: float | None) -> bool:
+    """Process one resting order against the exchange. Returns True to KEEP it
+    resting, False when it has been resolved (opened, cancelled or dropped)."""
+    st = bf.get_order_status(rec["symbol"], rec["order_id"])
+    if st is None:
+        return True  # cannot see the exchange right now - try again next tick
+    filled = float(st.get("filled_size") or 0.0)
+    avg = float(st.get("avg_price") or 0.0)
+    target = float(rec.get("size") or 0.0)
+    min_sz = _min_size(rec["symbol"])
+    state = st.get("state", "unknown")
+
+    if st.get("pending"):
+        rec["misses"] = 0
+        rec["filled_size"] = filled
+        # Partial fill rule while it still rests.
+        if filled > 0 and target > 0 and filled >= RESTING_PARTIAL_TAKE_FRAC * target:
+            log.info(f"[{rec['analyst_key']}] {rec['symbol']} limit {filled}/{target} filled "
+                     f"(>= {RESTING_PARTIAL_TAKE_FRAC:.0%}) - cancelling remainder")
+            if not bf.cancel_order(rec["symbol"], rec["order_id"]):
+                return True  # cancel refused (maybe just filled) - re-check next tick
+            f2, a2 = bf.get_fills_for_order(rec["symbol"], rec["order_id"])
+            if f2 > filled:
+                filled, avg = f2, a2
+            _open_filled(rec, filled, avg)
+            return False
+        reason = _resting_stale_reason(rec, price)
+        if reason is None:
+            return True
+        log.info(f"[{rec['analyst_key']}] resting limit on {rec['symbol']} stale ({reason}, "
+                 f"limit {rec['entry']}) - cancelling orderId={rec['order_id']}")
+        if not bf.cancel_order(rec["symbol"], rec["order_id"]):
+            return True
+        f2, a2 = bf.get_fills_for_order(rec["symbol"], rec["order_id"])
+        if f2 > filled:
+            filled, avg = f2, a2
+        if filled > 0 and filled >= min_sz:
+            log.warning(f"[{rec['analyst_key']}] {rec['symbol']} stale limit had {filled} "
+                        f"filled - adopting it as a position")
+            _open_filled(rec, filled, avg)
+        _logger_mod.log_signal(rec["analyst_key"], rec.get("raw_text", ""),
+                               outcome=f"limit_stale {rec['symbol']}", order_id=rec["order_id"])
+        return False
+
+    # Gone from the book.
+    if filled <= 0 and state == "unknown":
+        rec["misses"] = int(rec.get("misses") or 0) + 1
+        if rec["misses"] < RESTING_MAX_MISSES:
+            return True
+        _drop_resting(rec, "limit_vanished",
+                      f"not in orders-pending/history/fills after {rec['misses']} polls")
+        return False
+    if filled > 0 and filled >= min_sz:
+        _open_filled(rec, filled, avg)
+        return False
+    if filled > 0:
+        log.warning(f"[{rec['analyst_key']}] {rec['symbol']} orderId={rec['order_id']} "
+                    f"{state} with dust fill {filled} < minSize {min_sz} - not tracking")
+    _drop_resting(rec, "limit_cancelled_external", f"exchange state={state}, filled={filled}")
+    return False
+
+
+def _check_resting_orders(force: bool = False) -> None:
+    """Poll every resting exchange limit (DEMO/LIVE only), throttled to
+    RESTING_CHECK_SEC. `force` bypasses the throttle (startup / reconcile)."""
+    global _last_resting_check
+    if not exec_mode.calls_exchange():
+        return
+    items = _load_resting()
+    if not items:
+        return
+    every = float(os.getenv("RESTING_CHECK_SEC", "30"))
+    if not force and time.time() - _last_resting_check < every:
+        return
+    _last_resting_check = time.time()
+    keep = []
+    for rec in items:
+        try:
+            price = bf.get_market_price(rec["symbol"])
+            if _settle_resting(rec, price):
+                keep.append(rec)
+        except Exception as e:
+            log.error(f"resting order check failed for {rec.get('symbol')} "
+                      f"orderId={rec.get('order_id')}: {e}")
+            keep.append(rec)
+    _save_resting(keep)
+
+
+def _confirm_market_fill(signal: sp.Signal, order_id: str, size: float,
+                         tries: int = 3, wait_s: float = 2.0) -> tuple[float, float]:
+    """After a market entry: (avg_fill_price, filled_size) from the exchange.
+    Bounded: `tries` polls `wait_s` apart (~6s worst case). Falls back to the
+    signal price / requested size with a warning when nothing confirms."""
+    inst = signal.symbol if "-USDT" in signal.symbol else f"{signal.symbol}-USDT"
+    for i in range(tries):
+        st = bf.get_order_status(signal.symbol, order_id)
+        if st and float(st.get("filled_size") or 0) > 0 and float(st.get("avg_price") or 0) > 0:
+            return float(st["avg_price"]), float(st["filled_size"])
+        for p in bf.get_live_positions():
+            if p.get("symbol") == inst and p.get("side") == signal.side \
+                    and float(p.get("avg_price") or 0) > 0:
+                return float(p["avg_price"]), float(p.get("size") or size)
+        if i < tries - 1:
+            time.sleep(wait_s)
+    log.warning(f"{signal.symbol} market order {order_id}: fill not confirmed after "
+                f"{tries} tries - recording entry at signal price {signal.entry}")
+    return float(signal.entry), size
+
+
+# ---------------------------------------------------------------------------
 # Per-type handlers
 # ---------------------------------------------------------------------------
 
@@ -384,6 +949,15 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     # trade reads "[RSI Extreme]" / "[OracleAlgo]" (its attribution key) rather
     # than the raw notification author, and matches positions.analyst in the DB.
     analyst = analyst_key
+
+    # Per-source kill switch. Measurement is unaffected: the RSI/Oracle paths
+    # already shadow-log before calling _process_new, and log_signal below
+    # still records this signal either way - only order placement stops.
+    if not _src_cfg_bool(analyst_key, "ENABLED", True):
+        log.info(f"[{analyst}] {signal.symbol} source disabled (ENABLED=false) - skipping")
+        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                               outcome="source_disabled")
+        return
 
     # If this analyst flagged a POI that's now armed, use it to fill a vague entry.
     _apply_armed_watch(signal, analyst_key)
@@ -537,7 +1111,8 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
     # current data-gathering behaviour); set it (e.g. 5) to cap runaway exposure,
     # recommended before live trading.
     if _hedge_mode():
-        per_src_cap = int(os.getenv("MAX_OPEN_PER_SOURCE", "0"))
+        per_src_cap = _src_cfg_int(analyst_key, "MAX_OPEN", 0,
+                                   global_name="MAX_OPEN_PER_SOURCE")
         if per_src_cap > 0:
             src_open = sum(1 for p in open_positions if p.analyst == analyst_key)
             if src_open >= per_src_cap:
@@ -554,11 +1129,21 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
                                outcome=f"rejected:{reason}")
         return
 
-    # Dry-run limit-fill fidelity: a limit entry price hasn't reached yet rests in
-    # the pending queue (no expiry) and opens only when price trades through it —
+    # A limit from this source already resting on the exchange for this symbol
+    # is not in open_positions (it is not a position yet) - do not stack another.
+    if exec_mode.calls_exchange() and _has_resting(signal.symbol, analyst_key):
+        log.warning(f"[{analyst}] {signal.symbol} skipped - a limit is already resting "
+                    f"on the exchange for this source")
+        _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                               outcome="rejected:limit_already_resting")
+        return
+
+    # PAPER limit-fill fidelity: a limit entry price hasn't reached yet rests in
+    # the pending queue (no expiry) and opens only when price trades through it -
     # instead of the old behaviour of recording an instant fill at the ideal price.
-    # (Live places a real resting limit order on the exchange, so this is dry-run only.)
-    if dry_run and not signal.is_market_order and signal.entry is not None:
+    # (DEMO and LIVE place a real resting limit order on the exchange, so this is
+    # PAPER only - no simulated-fill shortcut when the exchange is in the loop.)
+    if not exec_mode.calls_exchange() and not signal.is_market_order and signal.entry is not None:
         live = bf.get_market_price(signal.symbol)
         reached = live is not None and (
             (live <= signal.entry) if signal.side == "buy" else (live >= signal.entry))
@@ -599,15 +1184,18 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         return
 
     log.info(f"Balance ${balance:.2f} | Size {size} {signal.symbol} | "
-             f"[{analyst_key}] Leverage {leverage}x cross | DRY_RUN={dry_run}")
+             f"[{analyst_key}] Leverage {leverage}x cross | "
+             f"mode={exec_mode.mode().value} dry_run={dry_run}")
 
     if len(tp_ladder) > 1:
         log.info(f"[{analyst}] {signal.symbol} scale-out ladder: {tp_ladder} "
                  f"(partial close + SL ratchet at each target)")
 
-    if dry_run:
-        # Record a virtual position so the outcome resolver can track it and
-        # adapt the analyst's leverage exactly as it would in live mode.
+    if not exec_mode.calls_exchange():
+        # PAPER: record a virtual position so the outcome resolver can track it
+        # and adapt the analyst's leverage exactly as it would in live mode.
+        # (DEMO falls through to the real order path below - the demo exchange
+        # orderId becomes the position's order_id.)
         order_id = f"DRYRUN-{signal.symbol}-{int(time.time())}"
         pt.open_position(pt.Position(
             symbol=signal.symbol, side=signal.side, entry=signal.entry,
@@ -634,18 +1222,30 @@ def _process_new(signal: sp.Signal, open_positions: list, dry_run: bool,
         order_id = bf._order_id_from_resp(resp)
         log.info(f"Order placed: {order_id} @ {applied_lev}x")
 
+        if not signal.is_market_order:
+            # A resting limit is not a position yet: park it and let
+            # _check_resting_orders open the DB position at the real fill.
+            _add_resting(signal, order_id, size, leverage, analyst_key, tp_ladder)
+            _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
+                                   outcome="limit_resting", order_id=order_id)
+            return
+
+        fill_px, fill_sz = _confirm_market_fill(signal, order_id, size)
+        if fill_px != signal.entry:
+            log.info(f"[{analyst}] {signal.symbol} market filled @ {fill_px} "
+                     f"(signal {signal.entry}), size {fill_sz}")
         pos = pt.Position(
             symbol=signal.symbol,
             side=signal.side,
-            entry=signal.entry,
+            entry=fill_px,
             sl=signal.sl,
             tp=signal.tp,
-            size=size,
+            size=fill_sz,
             order_id=order_id,
             opened_at=now_local().isoformat(),
             analyst=analyst_key,
             tps=tp_ladder,
-            orig_size=size,
+            orig_size=fill_sz,
             soft_stop=signal.soft_stop,
             leverage=leverage,
         )
@@ -674,7 +1274,9 @@ def _process_update(signal: sp.Signal, position: pt.Position, dry_run: bool):
     future PnL and win/loss are measured from the new entry). Messages with no
     numeric changes (e.g. "Limit Entry Reached") are acknowledged as a clean no-op.
     """
-    analyst = signal.analyst
+    # Prefer the position's canonical key, matching _process_close; signal.analyst
+    # is the raw Discord author and would split these rows from their trades.
+    analyst = position.analyst or signal.analyst
     changes = []
     if signal.new_sl is not None:
         changes.append(f"SL→{signal.new_sl}")
@@ -699,7 +1301,7 @@ def _process_update(signal: sp.Signal, position: pt.Position, dry_run: bool):
                                outcome=outcome, order_id=position.order_id)
         return
 
-    if dry_run:
+    if not _exchange_backed(position):
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome="dry_run_update", order_id=position.order_id)
         return
@@ -707,7 +1309,8 @@ def _process_update(signal: sp.Signal, position: pt.Position, dry_run: bool):
     inst_id = signal.symbol if "-USDT" in signal.symbol else f"{signal.symbol}-USDT"
     try:
         bf.amend_order(inst_id, position.order_id,
-                       new_sl=signal.new_sl, new_tp=signal.new_tp)
+                       new_sl=signal.new_sl, new_tp=signal.new_tp,
+                       side=position.side)
         pt.update_position_sl_tp(position.order_id, signal.new_sl, signal.new_tp)
         _logger_mod.log_signal(analyst, signal.raw_text, signal=signal,
                                outcome="amended", order_id=position.order_id)
@@ -763,13 +1366,13 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
     realized PnL + a durable trade-blotter row, and adapt the analyst's leverage.
     `position.realized_pnl`/`fees_accum` carry the GROSS PnL and exit fees already
     banked on earlier scale-out slices; this adds the final slice plus the one-off
-    entry fee and the funding paid over the hold. If `won` is not given it's
-    inferred from exit vs entry (scale-outs pass it — any banked TP = net win).
+    entry fee and the funding paid over the hold. `won` defaults to None, which
+    means "derive from the realized PnL after fees" (pt.derive_won) - the only
+    definition that keeps the flag consistent with `net_pnl` and therefore moves
+    the leverage ladder the right way. Pass an explicit bool ONLY with a
+    documented reason; every current caller leaves it None.
     """
-    start, lo, hi, step = _leverage_params()
-    if won is None:
-        won = exit_price >= position.entry if position.side == "buy" \
-            else exit_price <= position.entry
+    start, lo, hi, step = _leverage_params(position.analyst)
 
     specs = bf.get_contract_specs(position.symbol)
     cv = specs["contract_value"] if specs else 0.0
@@ -786,6 +1389,8 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
     gross_total = (position.realized_pnl or 0.0) + final_gross
     fees_total = (position.fees_accum or 0.0) + final_exit_fee + entry_fee
     net_total = gross_total - fees_total - funding
+    if won is None:
+        won = pt.derive_won(net_total)
 
     # Only the increment not already credited during partials goes to the tally.
     pt.add_realized_pnl(position.analyst, final_gross - final_exit_fee - entry_fee - funding)
@@ -806,7 +1411,7 @@ def _settle_position(position: pt.Position, exit_price: float, reason: str,
     # then alert loudly — a silent drop here desyncs followers' paper portfolios
     # from the bot they track, with no other signal that it happened.
     engine_bal = bf.get_balance() or float(os.getenv("ENGINE_BASELINE_BALANCE", "1000"))
-    risk_amount = engine_bal * float(os.getenv("RISK_PCT", "0.01"))
+    risk_amount = engine_bal * _src_cfg_float(position.analyst, "RISK_PCT", 0.01)
     for attempt in (1, 2):
         try:
             accounts.settle_trade(position.analyst, net_total, risk_amount,
@@ -842,7 +1447,7 @@ def _process_close(signal: sp.Signal, position: pt.Position, dry_run: bool):
 
     price = bf.get_market_price(position.symbol)
 
-    if not dry_run:
+    if _exchange_backed(position):
         inst_id = position.symbol if "-USDT" in position.symbol else f"{position.symbol}-USDT"
         position_side = "long" if position.side == "buy" else "short"
         try:
@@ -875,7 +1480,7 @@ def _resolve_open_positions(dry_run: bool = True):
         was already banked (stop sits at BE or a prior TP), otherwise a loss.
 
     Single-TP positions (RSI, plain analyst calls) are just full-close-at-TP.
-    Works in dry-run (virtual sizes) and live (reduce-only orders + SL amend).
+    Works in PAPER (virtual sizes) and DEMO/LIVE (reduce-only orders + SL amend).
     """
     for pos in pt.get_open_positions():
         price = bf.get_market_price(pos.symbol)
@@ -893,7 +1498,7 @@ def _resolve_open_positions(dry_run: bool = True):
         # (e.g. a TP1 runner ratcheted to break-even that never reached its final
         # target) ties up a slot and drifts from the original signal thesis. Once
         # it exceeds RUNNER_MAX_AGE_HOURS, close it at market. Win/loss follows
-        # the ACTUAL exit PnL (won=None lets _settle_position decide) — a
+        # the ACTUAL net PnL after fees (won=None lets _settle_position derive it) - a
         # profitable trade timed out with no TP hit must not dock the analyst's
         # leverage score. Set RUNNER_MAX_AGE_HOURS=0 to disable.
         max_age_h = float(os.getenv("RUNNER_MAX_AGE_HOURS", "120"))
@@ -905,7 +1510,7 @@ def _resolve_open_positions(dry_run: bool = True):
             if age_h >= max_age_h:
                 log.info(f"[{pos.analyst}] {pos.symbol} time-stop after {age_h:.0f}h "
                          f"(limit {max_age_h:.0f}h, tps_hit={pos.tps_hit}) - closing @ {price}")
-                if not dry_run:
+                if _exchange_backed(pos):
                     _live_close_remaining(pos)
                 _settle_position(pos, price, "time_stop", won=None, dry_run=dry_run)
                 continue
@@ -933,11 +1538,12 @@ def _resolve_open_positions(dry_run: bool = True):
                     continue
                 log.info(f"[{pos.analyst}] {pos.symbol} soft stop CONFIRMED — 1h closed "
                          f"{close_px} beyond SL {pos.sl}")
-            won = pos.tps_hit >= 1  # banked >=TP1 → net win; raw stop with none → loss
+            # won=None: derived from net PnL after fees. A trail stop at
+            # break-even can still net negative once fees/funding are counted.
             reason = "trail_stop" if pos.tps_hit >= 1 else "sl"
-            if not dry_run:
+            if _exchange_backed(pos):
                 _live_close_remaining(pos)
-            _settle_position(pos, price, reason, won=won, dry_run=dry_run)
+            _settle_position(pos, price, reason, won=None, dry_run=dry_run)
             continue
 
         # 2) Next take-profit target hit?
@@ -952,9 +1558,9 @@ def _resolve_open_positions(dry_run: bool = True):
 
         # Final target → close the remainder.
         if new_hit >= n:
-            if not dry_run:
+            if _exchange_backed(pos):
                 _live_close_remaining(pos)
-            _settle_position(pos, price, f"tp{new_hit}_final", won=True, dry_run=dry_run)
+            _settle_position(pos, price, f"tp{new_hit}_final", won=None, dry_run=dry_run)
             continue
 
         # Intermediate target → partial close + ratchet SL.
@@ -966,19 +1572,19 @@ def _resolve_open_positions(dry_run: bool = True):
 
         # Too small to split (or rounding wiped the chunk) → take it all here as a win.
         if chunk <= 0 or remaining <= 0:
-            if not dry_run:
+            if _exchange_backed(pos):
                 _live_close_remaining(pos)
-            _settle_position(pos, price, f"tp{new_hit}_nosplit", won=True, dry_run=dry_run)
+            _settle_position(pos, price, f"tp{new_hit}_nosplit", won=None, dry_run=dry_run)
             continue
 
         new_sl = pos.entry if new_hit == 1 else ladder[new_hit - 2]
         sl_label = "break-even" if new_hit == 1 else f"TP{new_hit - 1}"
 
-        if not dry_run:
+        if _exchange_backed(pos):
             try:
                 bf.reduce_position(pos.symbol, pos.side, chunk)
                 inst = pos.symbol if "-USDT" in pos.symbol else f"{pos.symbol}-USDT"
-                bf.amend_order(inst, pos.order_id, new_sl=new_sl)
+                bf.amend_order(inst, pos.order_id, new_sl=new_sl, side=pos.side)
             except Exception as e:
                 log.error(f"Scale-out order/amend failed for {pos.symbol}: {e}")
 
@@ -1020,6 +1626,13 @@ def _reconcile_on_startup(dry_run: bool):
     log.info(f"Startup reconciliation complete — {still_open} position(s) still open")
 
 
+def _exchange_backed(pos: pt.Position) -> bool:
+    """True when this position has a real order on the exchange we should act
+    on: the bot is in DEMO/LIVE and the order id is not a simulated DRYRUN- one
+    (a PAPER-era position still open in the DB keeps resolving in-process)."""
+    return exec_mode.calls_exchange() and live_epoch.is_live_position(pos.order_id)
+
+
 def _live_close_remaining(pos: pt.Position):
     """Market-close whatever remains of a live position (reduce-only)."""
     inst = pos.symbol if "-USDT" in pos.symbol else f"{pos.symbol}-USDT"
@@ -1042,23 +1655,34 @@ def _refresh_account(bot_state: dict):
 
 def _reconcile_with_exchange(dry_run: bool):
     """
-    LIVE only: keep the local DB in sync with what BloFin actually holds.
+    DEMO/LIVE: keep the local DB in sync with what BloFin actually holds.
       • A position open in our DB but ABSENT on the exchange was closed/liquidated
         externally — settle it locally at its real exit (last fill price if we can
         read one, else the current market price).
       • A position on the exchange but ABSENT from our DB is a manual/external trade
         — log a loud warning but do NOT adopt it (the bot only manages its own).
-    No-op in dry-run (there are no real exchange positions to reconcile against).
+    Runs in DEMO and LIVE (both hold real exchange positions); no-op in PAPER.
+    Simulated DRYRUN- positions left over from a PAPER run are skipped - they
+    never existed on the exchange, so their absence there means nothing.
     """
-    if dry_run:
+    if not exec_mode.calls_exchange():
         return
+    # Settle resting limits FIRST so "order vanished + position appeared" is
+    # adopted as a fill here, never flagged below as an external trade.
+    _check_resting_orders(force=True)
     live = bf.get_live_positions()
     if live is None:
         return
     live_syms = {p["symbol"] for p in live}
     db_open = pt.get_open_positions()
     db_syms = set()
+    # Anything still resting (incl. a sub-50% partial fill) is ours, not external.
+    for rec in _load_resting():
+        sym = rec["symbol"]
+        db_syms.add(sym if "-USDT" in sym else f"{sym}-USDT")
     for pos in db_open:
+        if not _exchange_backed(pos):
+            continue
         inst = pos.symbol if "-USDT" in pos.symbol else f"{pos.symbol}-USDT"
         db_syms.add(inst)
         if inst not in live_syms:
@@ -1115,8 +1739,9 @@ def _try_create_watch(msg: dict, whitelist: list[str], whitelist_lower: set[str]
                           direction=poi["direction"], level=level, note=poi["note"]))
     log.info(f"[{analyst_key}] POI watch created: {symbol} "
              f"{poi['direction'] or 'lean?'} level={level or 'chart/none'}")
-    _logger_mod.log_signal(msg.get("author", ""), msg.get("content", ""),
-                           outcome=f"poi_watch {symbol} @{level or '—'}")
+    _logger_mod.log_signal(analyst_key, msg.get("content", ""),
+                           outcome=f"poi_watch {symbol} @{level or '—'}",
+                           author=msg.get("author", ""))
     return True
 
 
@@ -1169,34 +1794,21 @@ def _is_whitelisted(msg: dict, whitelist_lower: set[str]) -> bool:
     """
     Return True if the message is from a whitelisted analyst.
 
-    Three match tiers (any one is sufficient):
-      1. Full name   — "sveezy alerts" anywhere in author+content  (real-time path
-                       where @Sveezy Alerts role mention is in the content text)
-      2. Base name   — the part before " alerts" as a whole word, e.g. "sveezy"
-                       (poll path where embed says "Signal by Sveezy")
-      3. Author word — any 4+ char word from the analyst name found in the author
-                       field alone (handles "Sveezy ✅ | Unity" style usernames)
-    """
-    author = msg.get("author", "").lower()
-    content = msg.get("content", "").lower()
-    haystack = author + " " + content
+    Delegates to _resolve_analyst so the gate and the attribution key are
+    decided by exactly one implementation. Keeping two copies of these tiers
+    is what let them drift apart twice before, and each drift split an
+    analyst's trades across two keys.
 
-    for name in whitelist_lower:
-        # Tier 1: exact full name
-        if name in haystack:
-            return True
-        # Tier 2: base name (everything before " alerts").
-        # Use a start-of-word anchor only (not end) because Discord's embed
-        # textContent sometimes concatenates fields: "Signal by SveezyEntry..."
-        base = re.sub(r'\s*alerts\s*$', '', name).strip()
-        if len(base) >= 4:
-            if re.search(r'(?<!\w)' + re.escape(base), haystack):
-                return True
-        # Tier 3: any significant word from the name found in author field
-        for word in name.split():
-            if len(word) >= 4 and word != 'alerts' and word in author:
-                return True
-    return False
+    Match tiers, tried against the AUTHOR field first and only then against
+    the body with analyst @-mentions stripped:
+      1. Full name   - "sveezy alerts"
+      2. Base name   - the part before " alerts" as a whole word, e.g. "sveezy"
+                       (poll path where embed says "Signal by Sveezy")
+      3. Author word - any 4+ char word from the analyst name found in the
+                       author field alone (handles "Sveezy | Unity" usernames
+                       that carry an emoji between the name and the server tag)
+    """
+    return _resolve_analyst(msg, list(whitelist_lower)) is not None
 
 
 _ORACLE_BIAS_KEY = "btc_oracle_bias"
@@ -1224,7 +1836,7 @@ def _get_oracle_bias(ignore_ttl: bool = False) -> str | None:
         return None
     if ignore_ttl:
         return bias
-    ttl_h = float(os.getenv("ORACLE_BIAS_TTL_HOURS", "8"))
+    ttl_h = _src_cfg_float("OracleAlgo", "ORACLE_BIAS_TTL_HOURS", 8.0)
     if ttl_h > 0 and ts:
         try:
             age_h = (now_local() - datetime.fromisoformat(ts)).total_seconds() / 3600
@@ -1239,7 +1851,7 @@ def _oracle_confluence(signal: sp.Signal) -> tuple[bool, int]:
     """Record this 1H signal in the rolling confluence buffer and report whether
     >= ORACLE_CONFLUENCE_N DISTINCT aligned signal types have fired within
     ORACLE_CONFLUENCE_WINDOW_MIN. Returns (ok, distinct_aligned_count)."""
-    n = int(os.getenv("ORACLE_CONFLUENCE_N", "1"))
+    n = _src_cfg_int("OracleAlgo", "ORACLE_CONFLUENCE_N", 1)
     window = float(os.getenv("ORACLE_CONFLUENCE_WINDOW_MIN", "45"))
     raw = pt.get_state(_ORACLE_CONFLUENCE_KEY)
     try:
@@ -1273,7 +1885,7 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         market fill. SL/TP (1.5% stop + 2%/4% scale-out) set in _process_new.
     """
     content = msg.get("content", "")
-    if os.getenv("ORACLEALGO_ENABLED", "true").lower() != "true":
+    if not _src_cfg_bool("OracleAlgo", "ORACLEALGO_ENABLED", True):
         log.info(f"[OracleAlgo] {signal.side.upper()} {signal.symbol} {signal.signal_tf} — disabled, skipping")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_disabled")
         return
@@ -1302,7 +1914,7 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     # --- 1H signal: entry if aligned with a fresh bias and confluence clears ---
     bias = _get_oracle_bias()
     entry_price = bf.get_market_price(signal.symbol)
-    confluence_on = int(os.getenv("ORACLE_CONFLUENCE_N", "1")) > 1
+    confluence_on = _src_cfg_int("OracleAlgo", "ORACLE_CONFLUENCE_N", 1) > 1
     ok_conf, distinct = _oracle_confluence(signal)
 
     # BTC 4H ADX regime — annotates shadow rows and serves as a fallback bias
@@ -1311,7 +1923,7 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     adx_period = int(os.getenv("ADX_PERIOD", "14"))
     htf_dir, htf_adx, htf_regime = mr.get_btc_htf_regime("4h", adx_period)
     btc_adx_label = f"{htf_dir}_{htf_regime}" if htf_dir and htf_regime else ""
-    htf_fallback = os.getenv("ORACLE_HTF_FALLBACK", "true").lower() == "true"
+    htf_fallback = _src_cfg_bool("OracleAlgo", "ORACLE_HTF_FALLBACK", True)
     htf_trending = bool(htf_dir and htf_regime in ("trending_moderate", "trending_strong"))
 
     # Pre-compute the btc_bias shadow annotation.  Three cases:
@@ -1357,7 +1969,7 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         return
     if confluence_on and not ok_conf:
         log.info(f"[OracleAlgo] 1H {signal.side} confluence {distinct}/"
-                 f"{os.getenv('ORACLE_CONFLUENCE_N')} not met — waiting")
+                 f"{_src_cfg('OracleAlgo', 'ORACLE_CONFLUENCE_N', '1')} not met - waiting")
         _shadow("low_confluence")
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_low_confluence")
         return
@@ -1365,7 +1977,8 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     # entry. Untyped alerts (Supertrend/Delta/unparsed) ran -11.0R/19 in shadow;
     # they still count toward confluence above and are shadow-logged here.
     allowed_types = {t.strip().upper()
-                     for t in os.getenv("ORACLE_ENTRY_TYPES", "").split(",") if t.strip()}
+                     for t in _src_cfg("OracleAlgo", "ORACLE_ENTRY_TYPES", "").split(",")
+                     if t.strip()}
     if allowed_types and (signal.oracle_signal_type or "").upper() not in allowed_types:
         log.info(f"[OracleAlgo] 1H {signal.side} type "
                  f"'{signal.oracle_signal_type or '?'}' not in ORACLE_ENTRY_TYPES - skipping")
@@ -1376,7 +1989,7 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
     # breaks entered while BTC's 4H ADX is trending ran -8.1R (21% WR); in
     # ranging/indecisive macro they ran +1.9R (50% WR). Weakest-evidence gate —
     # revisit at the next sweep.
-    regime_gate = os.getenv("ORACLE_REGIME_GATE", "false").lower() == "true"
+    regime_gate = _src_cfg_bool("OracleAlgo", "ORACLE_REGIME_GATE", False)
     if regime_gate and htf_regime in ("trending_moderate", "trending_strong"):
         adx_note = f"{htf_adx:.1f}" if htf_adx else "?"
         log.info(f"[OracleAlgo] 1H {signal.side} blocked: BTC 4H {htf_regime} "
@@ -1385,11 +1998,11 @@ def _process_oraclealgo(signal: sp.Signal, msg: dict, dry_run: bool):
         _logger_mod.log_signal("OracleAlgo", content, signal=signal, outcome="oracle_macro_trend")
         return
 
-    start, lo, hi, _step = _leverage_params()
+    start, lo, hi, _step = _leverage_params("OracleAlgo")
     leverage = pt.get_analyst_leverage("OracleAlgo", start, lo, hi)
 
     # Optional pullback-limit entry: wait for a better fill instead of market.
-    pullback_pct = float(os.getenv("ORACLE_PULLBACK_PCT", "0") or "0")
+    pullback_pct = _src_cfg_float("OracleAlgo", "ORACLE_PULLBACK_PCT", 0.0)
     if pullback_pct > 0 and entry_price:
         _shadow("pending_pullback")
         _enqueue_pending(signal, "pullback", pullback_pct, leverage, "OracleAlgo",
@@ -1410,14 +2023,19 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
     """
     whitelist_lower = {name.lower() for name in whitelist}
     signal = sp.parse(msg)
-    analyst = msg.get("author", "unknown")
+    # Canonical key for every log line and signal record in this router, so
+    # chatter/exit rows land on the same analyst as their trades. Falls back to
+    # the raw author when nothing in the whitelist matches, which is what we
+    # want for genuinely non-whitelisted posters.
+    analyst = _canonical_analyst(msg, whitelist)
 
     if signal is None:
         # Not a tradeable signal — see if it's a POI "future area of interest" watch.
         if _try_create_watch(msg, whitelist, whitelist_lower):
             return
         log.debug(f"[{analyst}] No trade signal detected")
-        _logger_mod.log_signal(analyst, msg.get("content", ""), outcome="no_signal")
+        _logger_mod.log_signal(analyst, msg.get("content", ""), outcome="no_signal",
+                               author=msg.get("author", ""))
         return
 
     log.info(f"[{analyst}] Classified as {signal.message_type.value.upper()} | {signal.symbol}")
@@ -1426,7 +2044,7 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
     # adaptive-leverage track record under the "RSI Extreme" key. Handled here,
     # before the analyst whitelist (the RSI bot is not a whitelisted analyst).
     if signal.source == "rsi_extreme":
-        if os.getenv("RSI_EXTREME_ENABLED", "true").lower() != "true":
+        if not _src_cfg_bool("RSI Extreme", "RSI_EXTREME_ENABLED", True):
             log.info(f"[RSI] {signal.side.upper()} {signal.symbol} — RSI strategy disabled, skipping")
             _logger_mod.log_signal("RSI Extreme", msg.get("content", ""), signal=signal,
                                    outcome="rsi_disabled")
@@ -1448,13 +2066,13 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
 
         # Quality filters. They only BLOCK when their flag is on; otherwise the
         # verdict is shadow-logged and the trade proceeds (measure-then-tune).
-        f_strength, f_chase, f_regime = _rsi_filter_verdicts(signal)
-        filters_on = os.getenv("RSI_FILTERS_ENABLED", "false").lower() == "true"
-        regime_on = os.getenv("RSI_REGIME_GATE", "false").lower() == "true"
-        confirm_on = os.getenv("RSI_CONFIRM_ENABLED", "false").lower() == "true"
-        first_only = os.getenv("RSI_FIRST_ALERT_ONLY", "true").lower() == "true"
-        sell_gate_on = os.getenv("RSI_SELL_REGIME_GATE", "false").lower() == "true"
-        macro_gate_on = os.getenv("RSI_MACRO_TREND_GATE", "false").lower() == "true"
+        f_strength, f_chase, f_regime = _rsi_filter_verdicts(signal, "RSI Extreme")
+        filters_on = _src_cfg_bool("RSI Extreme", "RSI_FILTERS_ENABLED", False)
+        regime_on = _src_cfg_bool("RSI Extreme", "RSI_REGIME_GATE", False)
+        confirm_on = _src_cfg_bool("RSI Extreme", "RSI_CONFIRM_ENABLED", False)
+        first_only = _src_cfg_bool("RSI Extreme", "RSI_FIRST_ALERT_ONLY", True)
+        sell_gate_on = _src_cfg_bool("RSI Extreme", "RSI_SELL_REGIME_GATE", False)
+        macro_gate_on = _src_cfg_bool("RSI Extreme", "RSI_MACRO_TREND_GATE", False)
 
         # Symbol 1H ADX regime and BTC 4H macro regime. Fetched before the
         # decision so RSI_SELL_REGIME_GATE can act on it; both are also
@@ -1509,7 +2127,7 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
                                    outcome=f"rsi_blocked:{block}")
             return
 
-        start, lo, hi, _step = _leverage_params()
+        start, lo, hi, _step = _leverage_params("RSI Extreme")
         leverage = pt.get_analyst_leverage("RSI Extreme", start, lo, hi)
 
         # Confirmation-on-turn: don't knife-catch — wait for price to start
@@ -1550,7 +2168,7 @@ def _process_message(msg: dict, dry_run: bool, whitelist: list[str]):
             log.info(f"{signal.symbol} already open for {analyst_key} — routing NEW as UPDATE (safety net)")
             _process_update(signal, existing, dry_run)
         else:
-            start, lo, hi, _step = _leverage_params()
+            start, lo, hi, _step = _leverage_params(analyst_key)
             leverage = pt.get_analyst_leverage(analyst_key, start, lo, hi)
             _process_new(signal, open_positions, dry_run, leverage, analyst_key)
 
@@ -1649,6 +2267,53 @@ def _log_strategy_config():
     log.info(f"  Strategy shadow log [{on('STRATEGY_SHADOW_LOG')}] → strategy_shadow.csv")
     log.info(f"  Vision: model '{os.getenv('LOCAL_VISION_MODEL','(none)')}' | "
              f"max level deviation {float(os.getenv('VISION_MAX_DEVIATION_PCT','0.5'))*100:.0f}%")
+    _log_source_overrides()
+
+
+def _probe_llm():
+    """Periodic LM Studio re-probe: WARN on every transition, alert on down."""
+    base = os.getenv("LOCAL_LLM_BASE_URL", "").strip()
+    if not base:
+        return
+    edge = _llm_state.update(llm_probe.probe_models(base))
+    if edge == "down":
+        log.warning(f"LM Studio went DOWN at {base} - LLM/vision fallback parsers "
+                    "are silently disabled until it is back")
+        _alert(f"LM Studio not reachable at {base} - LLM/vision fallback off",
+               "warning", key="llm_down")
+    elif edge == "up":
+        log.warning(f"LM Studio is back UP at {base} - LLM/vision fallback re-enabled")
+
+
+def _cdp_recover(decision, listener, seen_ids: set, server_filter: str):
+    """Act on a CdpRecovery decision: re-discover the Discord tab via /json
+    (opening a fresh tab if it is gone) and re-attach the real-time listener.
+    Returns the (possibly new) listener, or None if re-attach failed."""
+    if decision.info:
+        log.warning(decision.info)
+    try:
+        found = dr.ensure_discord_open()
+        if not found and decision.open_tab:
+            if dr.open_discord_tab():
+                log.warning("CDP recovery: opened a new Discord tab via Target.createTarget")
+            else:
+                log.warning("CDP recovery: could not open a new Discord tab")
+        dr.open_inbox()
+    except Exception as e:
+        log.warning(f"CDP recovery: tab re-discovery failed: {e}")
+    if listener:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+    try:
+        fresh = dr.NotificationListener(seen_ids, server_filter)
+        fresh.start()
+        log.warning("CDP recovery: real-time listener re-attached")
+        return fresh
+    except Exception as e:
+        log.warning(f"CDP recovery: listener re-attach failed: {e}")
+        return None
 
 
 def _startup_health_check(dry_run: bool) -> bool:
@@ -1666,8 +2331,9 @@ def _startup_health_check(dry_run: bool) -> bool:
     else:
         n_inst = len(bf._load_instruments())
         log.info(f"  [ OK ] BloFin: balance ${bal:.2f}, {n_inst} instruments listed")
-        if bal <= 0 and not dry_run:
-            log.warning("  [WARN] Live balance is $0 — fund the account before trading")
+        if bal <= 0 and exec_mode.calls_exchange():
+            log.warning(f"  [WARN] {exec_mode.mode().value} balance is $0 - fund the "
+                        "account before trading")
 
     # LM Studio + models
     base = os.getenv("LOCAL_LLM_BASE_URL", "").strip()
@@ -1676,12 +2342,14 @@ def _startup_health_check(dry_run: bool) -> bool:
             import requests
             data = requests.get(base + "/models", timeout=6).json()
             loaded = [d.get("id", "") for d in data.get("data", [])]
+            _llm_state.seed(True)
             log.info(f"  [ OK ] LM Studio reachable — loaded: {loaded}")
             for var, label in (("LOCAL_LLM_MODEL", "text"), ("LOCAL_VISION_MODEL", "vision")):
                 m = os.getenv(var, "").strip()
                 if m and not any(m in x for x in loaded):
                     log.warning(f"  [WARN] {label} model '{m}' not loaded — that path is disabled")
         except Exception as e:
+            _llm_state.seed(False)
             log.warning(f"  [WARN] LM Studio not reachable at {base} ({e}) — LLM/vision fallback off")
 
     # Chrome CDP + Discord tab
@@ -1713,7 +2381,10 @@ def main():
     real-time notifications drive trades, a fast timer manages open positions
     (PnL + TP/SL/scale-out), and a slow timer re-scans the inbox as a safety net.
     """
-    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    # Execution mode is derived from BLOFIN_BASE_URL / PAPER_MODE (exec_mode.py);
+    # dry_run is only a record-tagging flag now (everything not LIVE is dry_run=1).
+    mode = exec_mode.freeze()  # pinned for the process; see exec_mode.mode()
+    dry_run = exec_mode.is_dry_run()
     # SWEEP_INTERVAL: how often to re-inject the observer and do a full inbox scan.
     # This is the only remaining periodic operation; real-time delivery is via the listener.
     sweep_interval = int(os.getenv("POLL_INTERVAL", 300))
@@ -1726,6 +2397,7 @@ def main():
     bot_state = {
         "started_at": now_local().isoformat(),
         "dry_run": dry_run,
+        "exec_mode": mode.value,
         "poll_count": 0,
         "last_poll_at": None,
         "last_poll_found": 0,
@@ -1740,8 +2412,12 @@ def main():
     log.info("Dashboard running at http://localhost:5050")
 
     log.info("=" * 60)
-    log.info(f"Discord Signal Bot starting — DRY_RUN={dry_run}")
-    log.info(f"BloFin base: {os.getenv('BLOFIN_BASE_URL')}")
+    log.info("Discord Signal Bot starting")
+    log.info(exec_mode.banner())
+    log.info(f"BloFin base: {os.getenv('BLOFIN_BASE_URL')} | dry_run tag={dry_run}")
+    dr_warn = exec_mode.dry_run_warning()
+    if dr_warn:
+        log.warning(dr_warn)
     log.info(f"Analysts ({len(whitelist)}): {', '.join(whitelist)}")
     log.info(f"Server filter: '{server_filter or 'none'}'")
     log.info(f"Sweep interval: {sweep_interval}s")
@@ -1794,7 +2470,11 @@ def main():
     # Reconcile open positions FIRST — settle/scale anything that moved while
     # the bot was offline, before processing any new inbox signals.
     _reconcile_on_startup(dry_run)
-    # Then (live only) align the DB with the exchange's actual positions.
+    # Then (DEMO/LIVE only) settle any limit that filled/cancelled while we were
+    # down and align the DB with the exchange's actual positions.
+    resting_n = len(_load_resting())
+    if resting_n:
+        log.info(f"Reconciling {resting_n} resting limit order(s) against the exchange...")
     _reconcile_with_exchange(dry_run)
 
     # Startup sweep — catch any messages that arrived while the bot was offline
@@ -1817,6 +2497,14 @@ def main():
     # Bring a dead real-time listener back up rather than living in sweep-only mode.
     last_listener_retry = 0.0
     listener_retry_interval = float(os.getenv("LISTENER_RETRY_SEC", "120"))
+    # Bounded Chrome/CDP self-recovery (tab loss / stale inbox) + edge-only alerts.
+    cdp_recovery = CdpRecovery.from_env()
+    listener_down_edge = TransitionAlert()
+    inbox_stale_edge = TransitionAlert()
+    stale_n = int(os.getenv("STALE_SWEEP_ALERT_N", "3"))
+    # Periodic LM Studio re-probe so a dead LLM/vision fallback is never silent.
+    last_llm_probe = time.time()
+    llm_probe_interval = llm_probe.probe_interval_sec()
     # Refresh shadow-outcome analysis so improvement tracking never goes stale.
     # last_shadow=0 forces a run on the first loop iteration (fresh on every start).
     last_shadow = 0.0
@@ -1828,11 +2516,78 @@ def main():
 
     while True:
         try:
+            if _maybe_reload_env():
+                try:
+                    new_mode = exec_mode.resolve_exec_mode()
+                    new_sweep_interval = int(os.getenv("POLL_INTERVAL", 300))
+                    new_resolve_interval = int(os.getenv("RESOLVE_INTERVAL", 10))
+                    new_whitelist = _get_whitelist()
+                    new_server_filter = os.getenv("DISCORD_SERVER_FILTER", "")
+                    new_recon_interval = (
+                        float(os.getenv("EXCHANGE_RECON_MIN", "15")) * 60
+                    )
+                    new_listener_retry_interval = float(
+                        os.getenv("LISTENER_RETRY_SEC", "120")
+                    )
+                    new_shadow_interval = (
+                        float(os.getenv("SHADOW_ANALYZE_HOURS", "24")) * 3600
+                    )
+                    new_max_consec_errors = int(
+                        os.getenv("MAX_CONSEC_LOOP_ERRORS", "5")
+                    )
+                except (ValueError, TypeError) as e:
+                    log.error(
+                        f"ENV RELOAD: malformed value in .env ({e}) - keeping the "
+                        "previous settings until this is fixed"
+                    )
+                else:
+                    if new_mode is not mode:
+                        # The BloFin client/keys/price stream were built for the
+                        # startup endpoint - switching execution mode hot would
+                        # send orders with mismatched credentials. Keep running
+                        # as started; the operator restarts to apply.
+                        log.warning("=" * 60)
+                        log.warning(
+                            f"ENV RELOAD: execution mode would change "
+                            f"{mode.value} -> {new_mode.value} - IGNORED until "
+                            f"restart (still running as {mode.value})"
+                        )
+                        log.warning("=" * 60)
+                    dr_warn = exec_mode.dry_run_warning()
+                    if dr_warn:
+                        log.warning(f"ENV RELOAD: {dr_warn}")
+                    sweep_interval = new_sweep_interval
+                    resolve_interval = new_resolve_interval
+                    whitelist = new_whitelist
+                    server_filter = new_server_filter
+                    recon_interval = new_recon_interval
+                    listener_retry_interval = new_listener_retry_interval
+                    shadow_interval = new_shadow_interval
+                    max_consec_errors = new_max_consec_errors
+                    log.info("ENV RELOAD: loop settings re-derived from the new .env")
+
             discord_tab = bool(dr._get_discord_ws_url())
             bot_state["discord_tab"] = discord_tab
-            if not discord_tab:
-                _alert("Lost the Discord tab (Chrome/CDP issue) — signals not being received",
-                       "error", key="cdp_no_tab")
+            # One health observation per tick feeds the recovery state machine:
+            # healthy = tab present AND the inbox has not gone stale. It decides
+            # when to re-attach / open a tab / escalate, and alerts only on edges.
+            inbox_stale = dr.inbox_health()["consec_stale_polls"] >= stale_n
+            decision = cdp_recovery.observe(
+                ok=discord_tab and not inbox_stale,
+                now=time.time(),
+                tab_present=discord_tab,
+            )
+            if decision.alert:
+                _alert(decision.alert, decision.alert_level,
+                       key=decision.alert_key, cooldown=60)
+            if decision.reattach:
+                listener = _cdp_recover(decision, listener, seen_ids, server_filter)
+                last_listener_retry = time.time()
+            bot_state["cdp_recovery_state"] = cdp_recovery.state
+
+            if llm_probe_interval and time.time() - last_llm_probe >= llm_probe_interval:
+                last_llm_probe = time.time()
+                _probe_llm()
 
             if listener and listener.is_alive:
                 # Wake at least every resolve_interval to manage positions.
@@ -1855,11 +2610,16 @@ def main():
                         listener = dr.NotificationListener(seen_ids, server_filter)
                         listener.start()
                         log.info("Real-time listener restarted after being down")
+                        if listener_down_edge.update(False) == "up":
+                            log.warning("Real-time listener recovered - leaving sweep-only mode")
                     except Exception as e:
                         listener = None
                         log.warning(f"Listener restart failed: {e} — sweep-only for now")
-                        _alert("Real-time listener is down — running in sweep-only fallback mode",
-                               "warning", key="listener_down")
+                        # Alert once when we ENTER sweep-only mode, not per retry.
+                        if listener_down_edge.update(True) == "down":
+                            _alert("Real-time listener is down - running in sweep-only "
+                                   "fallback mode (auto-retrying)",
+                                   "warning", key="listener_down", cooldown=60)
                 if not (listener and listener.is_alive):
                     time.sleep(resolve_interval)
 
@@ -1870,15 +2630,17 @@ def main():
                 if price_stream:
                     watched = [w.symbol for w in pt.get_active_watches()]
                     pending = [it["symbol"] for it in _load_pending()]
+                    resting = [it["symbol"] for it in _load_resting()]
                     price_stream.ensure([p.symbol for p in pt.get_open_positions()]
-                                        + watched + pending)
+                                        + watched + pending + resting)
                 _resolve_open_positions(dry_run)
                 _check_watches()
                 _check_pending_entries(dry_run)
+                _check_resting_orders()
                 last_resolve = time.time()
 
-            # Periodic live reconciliation against the exchange (no-op in dry-run).
-            if not dry_run and time.time() - last_recon >= recon_interval:
+            # Periodic reconciliation against the exchange (DEMO/LIVE; no-op in PAPER).
+            if exec_mode.calls_exchange() and time.time() - last_recon >= recon_interval:
                 _reconcile_with_exchange(dry_run)
                 last_recon = time.time()
 
@@ -1920,7 +2682,8 @@ def main():
                 bot_state["inbox_consec_stale"] = health["consec_stale_polls"]
                 bot_state["inbox_last_card_ts"] = health["last_card_seen_ts"]
                 stale_n = int(os.getenv("STALE_SWEEP_ALERT_N", "3"))
-                if health["consec_stale_polls"] >= stale_n:
+                stale_now = health["consec_stale_polls"] >= stale_n
+                if stale_now:
                     log.warning(
                         f"Inbox blind for {health['consec_stale_polls']} consecutive "
                         f"sweeps - forcing full re-open + observer re-inject"
@@ -1932,11 +2695,17 @@ def main():
                             listener.reinject()
                     except Exception as e:
                         log.warning(f"Forced inbox recovery failed: {e}")
+                # Alert on the stale->healthy edges only (the CDP recovery state
+                # machine handles the bounded re-attach / new-tab / escalation).
+                stale_edge = inbox_stale_edge.update(stale_now)
+                if stale_edge == "down":
                     _alert(
                         "Inbox selectors appear stale across multiple sweeps - "
-                        "signals may be missed; check the Discord tab",
-                        "error", key="inbox_stale",
+                        "signals may be missed; auto-recovery engaged",
+                        "error", key="inbox_stale", cooldown=60,
                     )
+                elif stale_edge == "up":
+                    log.warning("Inbox sweep parsed cards again - stale condition cleared")
 
             consec_errors = 0  # a full clean iteration clears the failure streak
 

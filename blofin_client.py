@@ -11,6 +11,8 @@ Public interface:
   Read:  get_balance(), get_market_price(), get_contract_specs(), set_price_stream()
   Trade: place_order(), place_market_order(), amend_order(), reduce_position(),
          close_position_api(), set_leverage(), cancel_all_orders()
+Order endpoints are POSTed directly with the documented JSON bodies (the SDK's
+place_order splices unknown kwargs raw into the body and lacks amend/cancel-all).
 
 Reusable standalone: mostly — it depends on the `blofin` SDK, python-dotenv and the
 project logger. get_market_price() will use a registered PriceStream cache if present
@@ -28,6 +30,16 @@ from dotenv import load_dotenv
 from logger import log
 
 load_dotenv()
+
+# Pin outbound HTTPS to IPv4 before any BloFin request (IP-whitelisted keys).
+import net_prefs as _net_prefs  # noqa: E402
+
+_net_prefs.force_ipv4()
+
+# Last API/auth error seen by get_balance(): {"code": str, "msg": str} or None.
+# Lets preflight surface the real failure reason without changing the
+# Optional[float] contract every existing caller relies on.
+last_balance_error: Optional[dict] = None
 
 _client: Optional[_BloFinClient] = None
 
@@ -95,6 +107,63 @@ def _get_client() -> _BloFinClient:
     return _client
 
 
+# ---------------------------------------------------------------------------
+# Broker ID (Broker/MCP-type API keys reject orders without one: code 152012)
+# ---------------------------------------------------------------------------
+
+DEMO_BASE_URL = "https://demo-trading-openapi.blofin.com"
+LIVE_BASE_URL = "https://openapi.blofin.com"
+# Same default as BloFin's official MCP server (github.com/blofin/blofin-mcp).
+DEFAULT_BROKER_ID = "dd3511977f23cc87"
+
+_broker_id_logged = False
+
+
+def _active_base_url() -> str:
+    return os.getenv("BLOFIN_BASE_URL", DEMO_BASE_URL).strip().rstrip("/")
+
+
+def _is_live_url(base_url: str) -> bool:
+    return base_url.strip().rstrip("/") == LIVE_BASE_URL
+
+
+def _broker_id() -> Optional[str]:
+    """
+    Resolve the brokerId to send with order-creating requests, mirroring the
+    official BloFin MCP server:
+
+      demo endpoint                  -> None (demo never takes a brokerId)
+      BLOFIN_BROKER_ID == "none"     -> None (Transaction-type keys: 152011
+                                        if one is sent)
+      BLOFIN_BROKER_ID set           -> that value
+      unset, live endpoint           -> DEFAULT_BROKER_ID
+    """
+    if not _is_live_url(_active_base_url()):
+        return None
+    env = os.getenv("BLOFIN_BROKER_ID")
+    if env is not None:
+        val = env.strip()
+        if val.lower() == "none":
+            return None
+        if val:
+            return val
+    return DEFAULT_BROKER_ID
+
+
+def _with_broker_id(body: dict) -> dict:
+    """Return `body` with brokerId added when one resolves (logged once)."""
+    global _broker_id_logged
+    bid = _broker_id()
+    if bid is None:
+        return body
+    if not _broker_id_logged:
+        log.info(f"BloFin brokerId in use: {bid}")
+        _broker_id_logged = True
+    out = dict(body)
+    out["brokerId"] = bid
+    return out
+
+
 def _extract_usdt_available(resp: dict) -> Optional[float]:
     """
     Pull available USDT out of a BloFin balance response, or None if absent.
@@ -133,6 +202,8 @@ def get_balance() -> Optional[float]:
     A silent 0.0 previously caused every trade to size to zero for days when
     the credentials/endpoint were misconfigured.
     """
+    global last_balance_error
+    last_balance_error = None
     try:
         client = _get_client()
         # Primary: futures trading-account balance (correct margin balance for perps).
@@ -140,6 +211,7 @@ def get_balance() -> Optional[float]:
 
         code = str(resp.get("code", "0"))
         if code != "0":
+            last_balance_error = {"code": code, "msg": str(resp.get("msg", "unknown"))}
             log.error(
                 f"get_balance API error {code}: {resp.get('msg', 'unknown')} "
                 f"— check BloFin API key/secret/passphrase and BLOFIN_BASE_URL "
@@ -153,6 +225,7 @@ def get_balance() -> Optional[float]:
             return None
         return usdt
     except Exception as e:
+        last_balance_error = {"code": "exception", "msg": f"{type(e).__name__}: {e}"}
         log.error(f"get_balance failed: {e}")
         return None
 
@@ -391,6 +464,42 @@ def get_account_summary() -> Optional[dict]:
         return None
 
 
+def _get_account_mode(getter_name: str, field: str) -> Optional[str]:
+    """Shared body for get_position_mode / get_margin_mode: call the named
+    `client.trading` getter and return data[field] as a string, or None on any
+    API error (non-zero code, missing field, exception). Errors log at warning."""
+    try:
+        resp = getattr(_get_client().trading, getter_name)()
+        if not isinstance(resp, dict):
+            log.warning(f"{getter_name}: unexpected response type {type(resp).__name__}")
+            return None
+        code = str(resp.get("code", "0"))
+        if code != "0":
+            log.warning(f"{getter_name} API error {code}: {resp.get('msg', 'unknown')}")
+            return None
+        data = resp.get("data") or {}
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        value = data.get(field) if isinstance(data, dict) else None
+        if not value:
+            log.warning(f"{getter_name}: no '{field}' in response: {resp}")
+            return None
+        return str(value)
+    except Exception as e:
+        log.warning(f"{getter_name} failed: {e}")
+        return None
+
+
+def get_position_mode() -> Optional[str]:
+    """'long_short_mode' (hedge) or 'net_mode' for the account, or None on failure."""
+    return _get_account_mode("get_position_mode", "positionMode")
+
+
+def get_margin_mode() -> Optional[str]:
+    """'cross' or 'isolated' for the account, or None on failure."""
+    return _get_account_mode("get_margin_mode", "marginMode")
+
+
 # ---------------------------------------------------------------------------
 # Order placement & management
 # ---------------------------------------------------------------------------
@@ -413,13 +522,16 @@ class OrderRejected(Exception):
 
 
 def _order_id_from_resp(resp: dict) -> str:
-    """Pull the exchange order id out of a place-order response, or '' if absent."""
+    """Pull the exchange order id out of a place-order response, or '' if absent.
+
+    The documented Place Order response key is `orderId` (data is a list of
+    one dict). `ordId` is accepted too for older/alternate payloads."""
     data = resp.get("data") if isinstance(resp, dict) else None
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
         return ""
-    return str(data.get("ordId", "") or "")
+    return str(data.get("orderId") or data.get("ordId") or "")
 
 
 def _validate_order_resp(resp: dict) -> str:
@@ -427,9 +539,10 @@ def _validate_order_resp(resp: dict) -> str:
     Confirm BloFin actually accepted the order; return its order id on success.
 
     The HTTP layer can return 200 with a non-zero business `code` - that is a
-    rejection, not a success. We also check the per-order `sCode` (BloFin echoes
-    a status per order) and require a non-empty `ordId`. Raises OrderRejected on
-    any of these, so the caller never records an unfilled order as "executed".
+    rejection, not a success. Each entry of `data` also carries its own
+    `code`/`msg` (docs) - older payloads used `sCode`/`sMsg` - and we require a
+    non-empty `orderId`. Raises OrderRejected on any of these, so the caller
+    never records an unfilled order as "executed".
     """
     if not isinstance(resp, dict):
         raise OrderRejected("unknown", f"unexpected response type: {type(resp).__name__}", resp)
@@ -439,85 +552,257 @@ def _validate_order_resp(resp: dict) -> str:
     data = resp.get("data")
     first = data[0] if isinstance(data, list) and data else data
     if isinstance(first, dict):
-        scode = str(first.get("sCode", "0") or "0")
+        scode = str(first.get("code", first.get("sCode", "0")) or "0")
         if scode != "0":
-            raise OrderRejected(scode, first.get("sMsg") or resp.get("msg", ""), resp)
+            raise OrderRejected(scode, first.get("msg") or first.get("sMsg")
+                                or resp.get("msg", ""), resp)
     ord_id = _order_id_from_resp(resp)
     if not ord_id:
-        raise OrderRejected(code, resp.get("msg", "") or "no ordId in response", resp)
+        raise OrderRejected(code, resp.get("msg", "") or "no orderId in response", resp)
     return ord_id
+
+
+# Endpoints (documented at https://docs.blofin.com - Trading > REST API).
+ORDER_PATH = "/api/v1/trade/order"
+AMEND_ORDER_PATH = "/api/v1/trade/amend-order"
+CANCEL_BATCH_PATH = "/api/v1/trade/cancel-batch-orders"
+ORDERS_PENDING_PATH = "/api/v1/trade/orders-pending"
+TPSL_ORDER_PATH = "/api/v1/trade/order-tpsl"
+TPSL_AMEND_PATH = "/api/v1/trade/amend-tpsl"
+TPSL_CANCEL_PATH = "/api/v1/trade/cancel-tpsl"
+TPSL_PENDING_PATH = "/api/v1/trade/orders-tpsl-pending"
+CLOSE_POSITION_PATH = "/api/v1/trade/close-position"
+CANCEL_BATCH_MAX = 20
+MARKET_ORDER_PRICE = "-1"   # docs: -1 = execute the TP/SL leg at market
+
+
+def _post(path: str, body):
+    """Signed POST through the SDK transport. `body` is a dict or a JSON array."""
+    client = _get_client()
+    return _send_request("POST", path, client.auth, data=body, authenticate=True)
+
+
+def _get(path: str, params: Optional[dict] = None):
+    """Signed GET through the SDK transport."""
+    client = _get_client()
+    return _send_request("GET", path, client.auth, params=params or {},
+                         authenticate=True)
+
+
+def _inst(symbol: str) -> str:
+    return symbol if "-USDT" in symbol else f"{symbol}-USDT"
+
+
+_position_mode_cache: Optional[str] = None
+
+
+def _exchange_position_side(side: str) -> str:
+    """Map the bot's "buy"/"sell" to the positionSide BloFin expects.
+
+    Hedge (long_short_mode) accounts need "long"/"short"; one-way (net_mode)
+    accounts reject those and need "net". The account mode is read once per
+    process (read-only call) and falls back to long/short if unreadable, which
+    matches the bot's prior behaviour.
+    """
+    global _position_mode_cache
+    if _position_mode_cache is None:
+        _position_mode_cache = get_position_mode() or "long_short_mode"
+    if _position_mode_cache == "net_mode":
+        return "net"
+    return "long" if side == "buy" else "short"
+
+
+def _attach_exchange_tp() -> bool:
+    """The bot runs its own TP ladder (partial closes), so an exchange-side TP
+    would fight it by closing the whole position at signal.tp. Off unless
+    ATTACH_EXCHANGE_TP=true."""
+    return os.getenv("ATTACH_EXCHANGE_TP", "false").strip().lower() == "true"
+
+
+def _entry_body(signal, size: float, order_type: str) -> dict:
+    """Documented Place Order body for a new entry, SL backstop attached."""
+    body = {
+        "instId": _inst(signal.symbol),
+        "marginMode": "cross",
+        "positionSide": _exchange_position_side(signal.side),
+        "side": signal.side,
+        "orderType": order_type,
+        "size": str(size),
+        "reduceOnly": "false",
+    }
+    if order_type != "market":
+        body["price"] = str(signal.entry)
+    sl = getattr(signal, "sl", None)
+    if sl is not None:
+        body["slTriggerPrice"] = str(sl)
+        body["slOrderPrice"] = MARKET_ORDER_PRICE
+        body["slTriggerPriceType"] = "last"
+    tp = getattr(signal, "tp", None)
+    if tp is not None and _attach_exchange_tp():
+        body["tpTriggerPrice"] = str(tp)
+        body["tpOrderPrice"] = MARKET_ORDER_PRICE
+        body["tpTriggerPriceType"] = "last"
+    return _with_broker_id(body)
 
 
 def place_order(signal, size: float) -> dict:
     """
-    Place a limit order with TP and SL attached.
-    signal: Signal dataclass (symbol, side, entry, sl, tp)
-    size:   contract quantity already rounded to lot size
-    Returns the raw API response dict.
-    """
-    # Ensure inst_id is in BloFin format e.g. "BTC-USDT"
-    inst_id = signal.symbol if "-USDT" in signal.symbol else f"{signal.symbol}-USDT"
-    position_side = "long" if signal.side == "buy" else "short"
+    Place a limit entry with the stop-loss attached (executes at market when
+    the last price hits signal.sl). TP is attached only if ATTACH_EXCHANGE_TP
+    is true - the bot manages its own TP ladder.
 
-    client = _get_client()
-    resp = client.trading.place_order(
-        inst_id=inst_id,
-        margin_mode="cross",
-        position_side=position_side,
-        side=signal.side,
-        order_type="limit",
-        price=str(signal.entry),
-        size=str(size),
-        tp_trigger_px=str(signal.tp),
-        sl_trigger_px=str(signal.sl),
-    )
+    Body sent (docs "Place Order"): instId, marginMode, positionSide, side,
+    orderType=limit, price, size, reduceOnly="false", slTriggerPrice,
+    slOrderPrice="-1", slTriggerPriceType="last" [, tp*] [, brokerId].
+    Returns the raw API response dict; raises OrderRejected if not accepted.
+    """
+    body = _entry_body(signal, size, "limit")
+    resp = _post(ORDER_PATH, body)
     log.info(f"Order response: {resp}")
-    _validate_order_resp(resp)  # raises OrderRejected on a non-zero code / missing ordId
+    _validate_order_resp(resp)
     return resp
 
 
 def place_market_order(signal, size: float) -> dict:
     """
-    Place a market order (no limit price) with optional TP and SL.
-    Used for CMP / 'at market' signals where no entry price is specified.
+    Place a market entry (no `price` field) with the SL attached when the
+    signal carries one. Same body as place_order minus price, orderType=market.
     """
-    inst_id = signal.symbol if "-USDT" in signal.symbol else f"{signal.symbol}-USDT"
-    position_side = "long" if signal.side == "buy" else "short"
-
-    params: dict = dict(
-        inst_id=inst_id,
-        margin_mode="cross",
-        position_side=position_side,
-        side=signal.side,
-        order_type="market",
-        size=str(size),
-    )
-    if signal.tp is not None:
-        params["tp_trigger_px"] = str(signal.tp)
-    if signal.sl is not None:
-        params["sl_trigger_px"] = str(signal.sl)
-
-    client = _get_client()
-    resp = client.trading.place_order(**params)
+    body = _entry_body(signal, size, "market")
+    resp = _post(ORDER_PATH, body)
     log.info(f"Market order response: {resp}")
-    _validate_order_resp(resp)  # raises OrderRejected on a non-zero code / missing ordId
+    _validate_order_resp(resp)
     return resp
+
+
+def _ok(resp) -> bool:
+    if not isinstance(resp, dict) or str(resp.get("code", "1")) != "0":
+        return False
+    data = resp.get("data")
+    first = data[0] if isinstance(data, list) and data else data
+    if isinstance(first, dict) and str(first.get("code", "0") or "0") != "0":
+        return False
+    return True
+
+
+def _pending_tpsl(inst_id: str, position_side: Optional[str]) -> list[dict]:
+    """Untriggered TP/SL orders for an instrument (optionally one positionSide),
+    those carrying a stop-loss leg first."""
+    resp = _get(TPSL_PENDING_PATH, {"instId": inst_id, "limit": "100"})
+    rows = resp.get("data", []) if isinstance(resp, dict) else []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if position_side and (r.get("positionSide") or "").lower() != position_side:
+            continue
+        out.append(r)
+    out.sort(key=lambda r: 0 if r.get("slTriggerPrice") else 1)
+    return out
+
+
+def _place_tpsl(inst_id: str, position_side: str, close_side: str, size: str,
+                new_sl: Optional[float], new_tp: Optional[float]) -> dict:
+    body = {
+        "instId": inst_id,
+        "marginMode": "cross",
+        "positionSide": position_side,
+        "side": close_side,
+        "size": size,
+        "reduceOnly": "true",
+    }
+    if new_sl is not None:
+        body["slTriggerPrice"] = str(new_sl)
+        body["slOrderPrice"] = MARKET_ORDER_PRICE
+        body["slTriggerPriceType"] = "last"
+    if new_tp is not None:
+        body["tpTriggerPrice"] = str(new_tp)
+        body["tpOrderPrice"] = MARKET_ORDER_PRICE
+        body["tpTriggerPriceType"] = "last"
+    return _post(TPSL_ORDER_PATH, _with_broker_id(body))
 
 
 def amend_order(inst_id: str, order_id: str,
                 new_sl: Optional[float] = None,
-                new_tp: Optional[float] = None) -> dict:
-    """Amend SL and/or TP on an existing open order."""
-    params: dict = {"inst_id": inst_id, "ord_id": order_id}
-    if new_sl is not None:
-        params["new_sl_trigger_px"] = str(new_sl)
-    if new_tp is not None:
-        params["new_tp_trigger_px"] = str(new_tp)
+                new_tp: Optional[float] = None,
+                side: Optional[str] = None) -> dict:
+    """Move the SL (and/or TP) protecting a position, wherever it lives.
+
+    Three-step strategy, simplest object first:
+      1. POST /api/v1/trade/amend-order on the ENTRY order (newSlTriggerPrice /
+         newSlOrderPrice="-1", newTp*). Works while the entry is still live or
+         partially filled - the attached TP/SL is amended in place.
+      2. If that is rejected (entry already filled: the attached SL then exists
+         as a TP/SL order), GET /api/v1/trade/orders-tpsl-pending for instId
+         (+ positionSide when `side` is given) and POST /api/v1/trade/amend-tpsl
+         on the first row carrying a stop-loss leg. If amend-tpsl is rejected,
+         cancel that row (/trade/cancel-tpsl) and re-place it (/trade/order-tpsl).
+      3. If no pending TP/SL exists (e.g. the attached SL never landed), place a
+         fresh reduce-only TP/SL order via /api/v1/trade/order-tpsl sized to the
+         live position (size from GET positions).
+
+    `side` is the ORIGINAL position side ("buy"/"sell"); pass it so hedge-mode
+    accounts holding both a long and a short on one symbol amend the right one.
+    Returns the response of whichever step succeeded; {} when all failed.
+    Never raises.
+    """
+    if new_sl is None and new_tp is None:
+        return {}
+    inst_id = _inst(inst_id)
+    position_side = _exchange_position_side(side) if side else None
     try:
-        client = _get_client()
-        resp = client.trading.amend_order(**params)
+        body: dict = {"instId": inst_id, "orderId": str(order_id)}
+        if new_sl is not None:
+            body["newSlTriggerPrice"] = str(new_sl)
+            body["newSlOrderPrice"] = MARKET_ORDER_PRICE
+        if new_tp is not None:
+            body["newTpTriggerPrice"] = str(new_tp)
+            body["newTpOrderPrice"] = MARKET_ORDER_PRICE
+        resp = _post(AMEND_ORDER_PATH, body)
         log.info(f"Amend order response: {resp}")
-        return resp
+        if _ok(resp):
+            return resp
+        log.info(f"amend-order rejected ({resp.get('msg', resp)}); "
+                 f"falling back to the TP/SL order for {inst_id}")
+
+        rows = _pending_tpsl(inst_id, position_side)
+        if rows:
+            row = rows[0]
+            tpsl_id = str(row.get("tpslId", ""))
+            body = {"instId": inst_id, "tpslId": tpsl_id}
+            if new_sl is not None:
+                body["newSlTriggerPrice"] = str(new_sl)
+                body["newSlOrderPrice"] = MARKET_ORDER_PRICE
+            if new_tp is not None:
+                body["newTpTriggerPrice"] = str(new_tp)
+                body["newTpOrderPrice"] = MARKET_ORDER_PRICE
+            resp = _post(TPSL_AMEND_PATH, body)
+            log.info(f"Amend TP/SL response: {resp}")
+            if _ok(resp):
+                return resp
+            log.warning(f"amend-tpsl rejected ({resp.get('msg', resp)}); "
+                        f"cancelling and re-placing the TP/SL order")
+            cancel = _post(TPSL_CANCEL_PATH, [{"instId": inst_id, "tpslId": tpsl_id}])
+            log.info(f"Cancel TP/SL response: {cancel}")
+            ps = (row.get("positionSide") or position_side or "net").lower()
+            close_side = row.get("side") or ("sell" if ps == "long" else "buy")
+            resp = _place_tpsl(inst_id, ps, close_side, str(row.get("size", "")),
+                               new_sl, new_tp)
+            log.info(f"Re-place TP/SL response: {resp}")
+            return resp if _ok(resp) else {}
+
+        if side is None:
+            log.error(f"amend_order {inst_id}: no pending TP/SL order and no side "
+                      f"given to place a new one")
+            return {}
+        live = [p for p in get_live_positions()
+                if p["symbol"] == inst_id and p["side"] == side]
+        if not live:
+            log.error(f"amend_order {inst_id}: no live {side} position to protect")
+            return {}
+        close_side = "sell" if side == "buy" else "buy"
+        resp = _place_tpsl(inst_id, position_side or "net", close_side,
+                           str(live[0]["size"]), new_sl, new_tp)
+        log.info(f"New TP/SL order response: {resp}")
+        return resp if _ok(resp) else {}
     except Exception as e:
         log.error(f"amend_order failed: {e}")
         return {}
@@ -526,22 +811,25 @@ def amend_order(inst_id: str, order_id: str,
 def reduce_position(symbol: str, side: str, size: float) -> dict:
     """
     Partially close an open position with a reduce-only market order.
-    `side` is the ORIGINAL position side ("buy"/"sell"); we send the opposite.
+    `side` is the ORIGINAL position side ("buy"/"sell"); we send the opposite
+    side with the SAME positionSide (hedge mode: close a long = sell + long).
+
+    Body: instId, marginMode, positionSide, side, orderType=market, size,
+    reduceOnly="true" [, brokerId].
     """
-    inst_id = symbol if "-USDT" in symbol else f"{symbol}-USDT"
-    position_side = "long" if side == "buy" else "short"
+    inst_id = _inst(symbol)
     close_side = "sell" if side == "buy" else "buy"
     try:
-        client = _get_client()
-        resp = client.trading.place_order(
-            inst_id=inst_id,
-            margin_mode="cross",
-            position_side=position_side,
-            side=close_side,
-            order_type="market",
-            size=str(size),
-            reduce_only=True,
-        )
+        body = _with_broker_id({
+            "instId": inst_id,
+            "marginMode": "cross",
+            "positionSide": _exchange_position_side(side),
+            "side": close_side,
+            "orderType": "market",
+            "size": str(size),
+            "reduceOnly": "true",
+        })
+        resp = _post(ORDER_PATH, body)
         log.info(f"Reduce-only close {size} {inst_id} ({close_side}): {resp}")
         return resp
     except Exception as e:
@@ -550,14 +838,23 @@ def reduce_position(symbol: str, side: str, size: float) -> dict:
 
 
 def close_position_api(inst_id: str, position_side: str) -> dict:
-    """Market-close an entire open position."""
+    """Market-close an entire open position.
+
+    The SDK's close_positions() has no brokerId kwarg (and this module used
+    to call a non-existent `close_position`), so POST the documented body to
+    /api/v1/trade/close-position directly, signed through the SDK auth.
+    `position_side` is "long"/"short" from the bot; on a net_mode account it
+    is translated to "net".
+    """
     try:
-        client = _get_client()
-        resp = client.trading.close_position(
-            inst_id=inst_id,
-            margin_mode="cross",
-            position_side=position_side,
-        )
+        if _exchange_position_side("buy") == "net":
+            position_side = "net"
+        body = _with_broker_id({
+            "instId": _inst(inst_id),
+            "marginMode": "cross",
+            "positionSide": position_side,
+        })
+        resp = _post(CLOSE_POSITION_PATH, body)
         log.info(f"Close position response: {resp}")
         return resp
     except Exception as e:
@@ -565,10 +862,172 @@ def close_position_api(inst_id: str, position_side: str) -> dict:
         return {}
 
 
-def cancel_all_orders() -> dict:
-    """Cancel every open order on the account (emergency / cleanup helper)."""
+def _paged(path: str, params: dict, id_key: str) -> list[dict]:
+    """Walk a paginated GET (limit 100, `after` = last id) and return all rows."""
+    rows: list[dict] = []
+    after = None
+    for _ in range(50):
+        q = dict(params, limit="100")
+        if after:
+            q["after"] = after
+        resp = _get(path, q)
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        if not isinstance(data, list) or not data:
+            break
+        rows.extend(data)
+        if len(data) < 100:
+            break
+        after = str(data[-1].get(id_key, "") or "")
+        if not after:
+            break
+    return rows
+
+
+def _cancel_batches(path: str, items: list[dict], summary: dict, key: str) -> None:
+    for i in range(0, len(items), CANCEL_BATCH_MAX):
+        chunk = items[i:i + CANCEL_BATCH_MAX]
+        try:
+            resp = _post(path, chunk)
+        except Exception as e:
+            summary["errors"].append(f"{path}: {e}")
+            continue
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        if str(resp.get("code", "1")) != "0" and not data:
+            summary["errors"].append(f"{path}: {resp.get('msg', resp)}")
+            continue
+        for r in data if isinstance(data, list) else []:
+            if str(r.get("code", "0") or "0") == "0":
+                summary[key] += 1
+            else:
+                summary["errors"].append(f"{r.get('orderId') or r.get('tpslId')}: "
+                                         f"{r.get('msg', '')}")
+
+
+def cancel_all_orders(inst_id: Optional[str] = None) -> dict:
+    """Cancel every pending order AND every untriggered TP/SL order on the
+    account (optionally just one instrument). Emergency / cleanup helper.
+
+    Flow: GET /api/v1/trade/orders-pending -> POST /api/v1/trade/cancel-batch-orders
+    in batches of 20 ([{instId, orderId}, ...]); GET /api/v1/trade/orders-tpsl-pending
+    -> POST /api/v1/trade/cancel-tpsl in batches of 20 ([{instId, tpslId}, ...]).
+    Returns {orders_found, orders_cancelled, tpsl_found, tpsl_cancelled, errors}.
+    """
+    summary = {"orders_found": 0, "orders_cancelled": 0,
+               "tpsl_found": 0, "tpsl_cancelled": 0, "errors": []}
+    params = {"instId": _inst(inst_id)} if inst_id else {}
     try:
-        return _get_client().trading.cancel_all_orders()
+        orders = _paged(ORDERS_PENDING_PATH, params, "orderId")
+        summary["orders_found"] = len(orders)
+        items = [{"instId": o.get("instId", ""), "orderId": str(o.get("orderId", ""))}
+                 for o in orders if o.get("orderId")]
+        _cancel_batches(CANCEL_BATCH_PATH, items, summary, "orders_cancelled")
+
+        tpsl = _paged(TPSL_PENDING_PATH, params, "tpslId")
+        summary["tpsl_found"] = len(tpsl)
+        items = [{"instId": t.get("instId", ""), "tpslId": str(t.get("tpslId", ""))}
+                 for t in tpsl if t.get("tpslId")]
+        _cancel_batches(TPSL_CANCEL_PATH, items, summary, "tpsl_cancelled")
     except Exception as e:
         log.error(f"cancel_all_orders failed: {e}")
-        return {}
+        summary["errors"].append(str(e))
+    log.info(f"cancel_all_orders: {summary}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Order status (resting-limit lifecycle + market fill confirmation)
+# ---------------------------------------------------------------------------
+
+CANCEL_ORDER_PATH = "/api/v1/trade/cancel-order"
+ORDERS_HISTORY_PATH = "/api/v1/trade/orders-history"
+FILLS_HISTORY_PATH = "/api/v1/trade/fills-history"
+
+
+def _order_row_status(row: dict, pending: bool) -> dict:
+    """Normalise one orders-pending / orders-history row."""
+    return {
+        "state": str(row.get("state") or ("live" if pending else "unknown")),
+        "pending": pending,
+        "filled_size": float(row.get("filledSize", 0) or 0),
+        "avg_price": float(row.get("averagePrice", row.get("avgPx", 0)) or 0),
+        "size": float(row.get("size", 0) or 0),
+        "source": "orders-pending" if pending else "orders-history",
+    }
+
+
+def get_fills_for_order(symbol: str, order_id: str) -> tuple[float, float]:
+    """(filled_size, avg_fill_price) aggregated over GET /api/v1/trade/fills-history
+    rows for one orderId; (0.0, 0.0) when none. Never raises."""
+    inst_id = _inst(symbol)
+    try:
+        resp = _get(FILLS_HISTORY_PATH, {"instId": inst_id, "orderId": str(order_id),
+                                         "limit": "100"})
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        tot = notional = 0.0
+        for f in data if isinstance(data, list) else []:
+            if str(f.get("orderId", order_id)) != str(order_id):
+                continue
+            sz = float(f.get("fillSize", f.get("size", 0)) or 0)
+            px = float(f.get("fillPrice", f.get("price", 0)) or 0)
+            tot += sz
+            notional += sz * px
+        return (tot, notional / tot) if tot > 0 else (0.0, 0.0)
+    except Exception as e:
+        log.warning(f"get_fills_for_order({symbol}, {order_id}) failed: {e}")
+        return (0.0, 0.0)
+
+
+def get_order_status(symbol: str, order_id: str) -> Optional[dict]:
+    """Where is this entry order now?
+
+    Lookup order (cheapest/most authoritative first):
+      1. GET /api/v1/trade/orders-pending?instId=  -> still on the book
+         (state live / partially_filled, filledSize, averagePrice)
+      2. GET /api/v1/trade/orders-history?instId=&limit=100 -> done
+         (state filled / canceled / partially_filled, filledSize, averagePrice)
+      3. GET /api/v1/trade/fills-history?instId=&orderId= -> fills only
+         (state derived: "filled" when any fill exists)
+
+    Returns {state, pending, filled_size, avg_price, size, source}; state
+    "unknown" with pending=False when the order is in none of the three (API lag
+    or a very old order). None only when the FIRST call raised (transport/auth
+    error), so callers can tell "cannot see the exchange" from "order is gone".
+    """
+    inst_id = _inst(symbol)
+    oid = str(order_id)
+    try:
+        resp = _get(ORDERS_PENDING_PATH, {"instId": inst_id, "limit": "100"})
+    except Exception as e:
+        log.warning(f"get_order_status({symbol}, {oid}) orders-pending failed: {e}")
+        return None
+    data = resp.get("data", []) if isinstance(resp, dict) else []
+    for row in data if isinstance(data, list) else []:
+        if str(row.get("orderId", "")) == oid:
+            return _order_row_status(row, pending=True)
+    try:
+        resp = _get(ORDERS_HISTORY_PATH, {"instId": inst_id, "limit": "100"})
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        for row in data if isinstance(data, list) else []:
+            if str(row.get("orderId", "")) == oid:
+                return _order_row_status(row, pending=False)
+    except Exception as e:
+        log.warning(f"get_order_status({symbol}, {oid}) orders-history failed: {e}")
+    filled, avg = get_fills_for_order(symbol, oid)
+    if filled > 0:
+        return {"state": "filled", "pending": False, "filled_size": filled,
+                "avg_price": avg, "size": filled, "source": "fills-history"}
+    return {"state": "unknown", "pending": False, "filled_size": 0.0,
+            "avg_price": 0.0, "size": 0.0, "source": "none"}
+
+
+def cancel_order(symbol: str, order_id: str) -> bool:
+    """POST /api/v1/trade/cancel-order {instId, orderId}. True when the exchange
+    accepted the cancel (code 0 and, if present, per-order code 0). Never raises."""
+    body = {"instId": _inst(symbol), "orderId": str(order_id)}
+    try:
+        resp = _post(CANCEL_ORDER_PATH, body)
+    except Exception as e:
+        log.error(f"cancel_order({symbol}, {order_id}) failed: {e}")
+        return False
+    log.info(f"Cancel order response: {resp}")
+    return _ok(resp)

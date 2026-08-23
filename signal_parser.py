@@ -89,6 +89,20 @@ class Signal:
 # Regex — new entry patterns (ordered most-to-least specific)
 # ---------------------------------------------------------------------------
 _NEW_PATTERNS = [
+    # Sherlock format: "$ONDSUSDT LONG  Entry: MARKET PRICE ($9.26)  Stoploss: 4H CLOSE
+    # BELOW $8.61  DCA: $8.82  TP1: $9.72 (MOVE B.E)  TARGET: $12.94  RATING: 6/10".
+    # Fully anchored on the "Entry: MARKET|LIMIT PRICE ($x)" phrasing, so it is the
+    # most specific pattern and goes first. DCA/RATING are ignored; TP1 is the first
+    # rung and TARGET the final take-profit (handled in _build_new_signal).
+    # The "$" is optional and the ticker allows digits / up to 13 chars
+    # ("LAYERUSDT SHORT", "$BANANAS31USDT", "$VELODROMUSDT").
+    r'\$?(?P<sym>[A-Z][A-Z0-9]{1,12})\s+(?P<side>long|short)\b'
+    r'.*?entry\s*:\s*(?P<otype>market|limit)\s+price\s*\(\s*\$?(?P<entry>[\d,.]+)\s*\)'
+    r'.*?stop\s*loss\s*:\s*(?:\d+\s*[hmdw]\s+)?close[sd]?\s+(?:above|below|over|under)'
+    r'\s*\$?(?P<sl>[\d,.]+)'
+    r'(?:.*?\btp\s*1\s*:\s*\$?(?P<tp1>[\d,.]+))?'
+    r'(?:.*?\btarget\s*:\s*\$?(?P<tp>[\d,.]+))?',
+
     # Unity embed format: "BTC/USDT — LONG ... Entry $71,010 ... Stop Loss $68,000"
     # Most specific — tried first. Requires /USDT and dollar signs (embed always has them).
     # TP label numbers ("Take Profit 1 $72,000") are skipped via (?:[1-9]\s*)? before $.
@@ -225,8 +239,11 @@ _CMP_PATTERN = re.compile(
 )
 
 # "4H close under 0.0939", "close below 0.09" — stop loss phrasing without "SL:" keyword.
+# Also covers the short-side mirror ("4H CLOSE ABOVE $8.61") and a leading "$"
+# (Sherlock writes "Stoploss: 4H CLOSE BELOW $8.61"); without these the soft-stop
+# phrasing survives into the close-keyword probe and a NEW setup becomes a CLOSE.
 _CLOSE_UNDER_SL = re.compile(
-    r'close[sd]?\s+(?:under|below)\s*([\d,.]+)',
+    r'close[sd]?\s+(?:under|below|above|over)\s*\$?([\d,.]+)',
     re.IGNORECASE,
 )
 
@@ -415,11 +432,25 @@ def _build_new_signal(m: re.Match, msg: dict) -> Optional[Signal]:
         # tp group is optional in the 4th pattern — may be None
         tp_raw = gd.get("tp")
         tp = _to_float(tp_raw) if tp_raw is not None else None
+        # Sherlock format: TP1 is the first rung, TARGET the final TP. Keep the
+        # ladder nearest-first; a TP1 with no TARGET becomes the lone TP.
+        tp1_raw = gd.get("tp1")
+        tps = None
+        if tp1_raw is not None:
+            tp1 = _to_float(tp1_raw)
+            if tp is None:
+                tp = tp1
+            elif tp1 != tp:
+                tps = [tp1, tp]
         sig = Signal(
             message_type=MessageType.NEW,
-            symbol=symbol, side=side, entry=entry, sl=sl, tp=tp,
+            symbol=symbol, side=side, entry=entry, sl=sl, tp=tp, tps=tps,
             analyst=msg.get("author", ""), raw_text=msg.get("content", ""),
         )
+        # "Entry: MARKET PRICE ($x)" -> the analyst entered at market; keep the
+        # quoted price as the reference entry (same shape as a limit-fill replay).
+        if (gd.get("otype") or "").lower() == "market":
+            sig.is_market_order = True
         return _enrich_new(sig, msg.get("content", ""))
     except Exception as e:
         log.debug(f"Could not build new signal from regex match: {e}")
@@ -807,6 +838,42 @@ _VISION_PROMPTS = {
 }
 
 
+def _extract_json_blob(text: str) -> Optional[str]:
+    """Return the first top-level, brace-balanced {...} in `text`, or None.
+
+    Replaces the old non-nesting regex (which grabbed the first INNER object of
+    a nested reply). String-aware: braces inside quoted strings are ignored and
+    backslash escapes are honoured, so '{"n": "a } b"}' extracts whole.
+    """
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def _vision_parse(image_url: str, task: str = "trade") -> dict:
     """
     Download a chart screenshot from Discord (FULL-resolution via the cdn host —
@@ -822,6 +889,8 @@ def _vision_parse(image_url: str, task: str = "trade") -> dict:
     vision_model = os.getenv("LOCAL_VISION_MODEL", "").strip()
     if not vision_model:
         return {}
+    raw = ""          # last model reply, surfaced in the failure log
+    status = None     # last HTTP status seen on the image download
     try:
         # media.discordapp.net is Discord's RESIZING PROXY — it serves a small
         # thumbnail (e.g. 490x350) where the axis price tags are unreadable.
@@ -831,6 +900,7 @@ def _vision_parse(image_url: str, task: str = "trade") -> dict:
         r = _http.get(full_url, timeout=20)
         if r.status_code != 200:   # fall back to the original URL if the swap fails
             r = _http.get(image_url, timeout=20)
+        status = r.status_code
         r.raise_for_status()
         ct = r.headers.get("Content-Type", "image/png").split(";")[0].strip()
         content = r.content
@@ -891,12 +961,17 @@ def _vision_parse(image_url: str, task: str = "trade") -> dict:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            # Fallback: pull the first {...} blob from a verbose response
-            m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-            if not m:
-                log.debug(f"Vision parse: no JSON found in: {raw[:300]}")
+            # Fallback: pull the first top-level {...} blob (brace-balanced, so
+            # nested objects are taken whole) from a verbose response.
+            blob = _extract_json_blob(raw)
+            if not blob:
+                log.warning(
+                    f"Vision parse: no JSON blob in reply for {image_url[:70]} "
+                    f"(model={vision_model}, download_status={status}); "
+                    f"reply[:300]={raw[:300]!r}"
+                )
                 return {}
-            data = json.loads(m.group())
+            data = json.loads(blob)
 
         def _sf(k):
             v = data.get(k)
@@ -930,7 +1005,18 @@ def _vision_parse(image_url: str, task: str = "trade") -> dict:
         log.info(f"Vision parse result: {result}")
         return result
     except Exception as e:
-        log.debug(f"Vision parse failed: {e}")
+        # Surface the HTTP status when the failure came from the image download
+        # (requests.HTTPError) or the LLM API (openai.APIStatusError).
+        http_status = getattr(e, "status_code", None)
+        if http_status is None and getattr(e, "response", None) is not None:
+            http_status = getattr(e.response, "status_code", None)
+        if http_status is None:
+            http_status = status
+        log.warning(
+            f"Vision parse failed for {image_url[:70]}: "
+            f"{type(e).__name__}: {e} (http_status={http_status}); "
+            f"reply[:300]={raw[:300]!r}"
+        )
         return {}
 
 

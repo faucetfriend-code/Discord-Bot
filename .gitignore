@@ -10,7 +10,14 @@ __pycache__/
 bot.log
 bot.log.*
 bot.db
+bot.db.bak-*
 signals_log.csv
+signals_log.csv.bak-*
+
+# Watchdog runtime artifacts (regenerated on every run)
+watchdog.log
+watchdog_state.json
+watchdog_status.json
 
 # Chrome CDP isolated profile
 /chrome-cdp-profile/
@@ -18,3 +25,5 @@ C:/chrome-cdp-profile/
 tunnel.bat
 .tunnel.bat.un~
 tunnel.bat~
+.env.bak*
+reports/preflight-*.txt

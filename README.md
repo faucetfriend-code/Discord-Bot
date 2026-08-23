@@ -14,7 +14,7 @@ It runs **three strategies**, each tracked separately:
 
 Every source has its own **adaptive leverage** (starts at 75x, ratchets up on wins / down on losses within a 50–125x band based on its own track record) and **scale-out management** (partial closes at each TP target with the stop ratcheting to break-even then behind each prior TP). Positions are marked to market continuously and all PnL is tracked per strategy.
 
-Orders execute on BloFin perpetual futures. A Flask dashboard at `http://localhost:5050` shows a per-source scoreboard, open positions with live PnL and scale-out progress, performance, and a log tail. **`DRY_RUN=true` (the default) simulates everything** — virtual positions, PnL, leverage — so you can validate each strategy before risking a cent.
+Orders execute on BloFin perpetual futures. A Flask dashboard at `http://localhost:5050` shows a per-source scoreboard, open positions with live PnL and scale-out progress, performance, and a log tail. **The default configuration trades on the BloFin demo account** (real orders, play money) so every code path — fills, amends, closes, reconciliation — is exercised exactly as it will be live; flipping to real money changes only `BLOFIN_BASE_URL`. See [Execution modes](#execution-modes).
 
 ## Prerequisites
 
@@ -72,8 +72,13 @@ All configuration lives in `.env`. Copy `.env.example` as your starting point.
 | `BloFinAPI` | — | BloFin API key (required) |
 | `Blofin_secret_key` | — | BloFin secret key (required) |
 | `Passphrase` | — | BloFin API passphrase (required) |
-| `BLOFIN_BASE_URL` | demo URL | `https://demo-trading-openapi.blofin.com` for demo, `https://openapi.blofin.com` for live |
-| `DRY_RUN` | `true` | No real orders while `true`. Change to `false` only when ready for live execution. |
+| `BLOFIN_BASE_URL` | demo URL | `https://demo-trading-openapi.blofin.com` for DEMO, `https://openapi.blofin.com` for LIVE. **This is the only switch between demo and live.** |
+| `PAPER_MODE` | `false` | `true` = PAPER: never call the exchange for orders; fills are simulated in-process (`DRYRUN-` order ids). |
+| `DRY_RUN` | *(derived)* | **Deprecated.** Now derived: `mode != LIVE`. A value in `.env` is ignored and logged once at startup if it disagrees. |
+| `BLOFIN_BROKER_ID` | *(unset)* | brokerId on LIVE order requests (Broker/MCP keys need one; `none` for Transaction keys). Never sent on demo. |
+| `ATTACH_EXCHANGE_TP` | `false` | Also attach the signal TP to the exchange entry order (the bot runs its own TP ladder; SL is always attached). |
+| `FORCE_IPV4` | `true` | Pin outbound HTTPS to IPv4 so IP-whitelisted keys are seen from the whitelisted address. |
+| `LIVE_EPOCH_START` | *(blank)* | ISO-8601 moment the bot went live; the dashboard's "Live" view starts here, everything earlier is the Paper/Demo archive. |
 | `ANALYST_WHITELIST` | 10 names | Comma-separated analyst display names exactly as they appear in Discord notifications (e.g. `Soul Alerts,Prestige Alerts`) |
 | `RISK_PCT` | `0.01` | Fraction of account balance risked per trade (0.01 = 1%) |
 | `MAX_OPEN_POSITIONS` | `3` | Maximum concurrent open positions |
@@ -81,13 +86,29 @@ All configuration lives in `.env`. Copy `.env.example` as your starting point.
 | `LOCAL_LLM_BASE_URL` | `http://127.0.0.1:1234/v1` | LM Studio API endpoint |
 | `LOCAL_LLM_MODEL` | `qwen3.5-9b` | Model name as shown in LM Studio |
 
+## Execution modes
+
+The bot runs in exactly one of three modes, resolved at startup by `exec_mode.py` and printed as the first banner line (`EXEC MODE: ...`):
+
+| Mode | Selected by | What happens |
+|------|-------------|--------------|
+| **PAPER** | `PAPER_MODE=true` | No exchange orders at all. Positions are simulated in-process (order id `DRYRUN-<symbol>-<ts>`); a limit entry rests in the local pending queue until price trades through it. Balance/prices are still read from the endpoint in `BLOFIN_BASE_URL`. |
+| **DEMO** | `BLOFIN_BASE_URL` = demo endpoint (default) | **Real orders on the BloFin demo account** with the `Demo-*` keys, no brokerId. The full live code path: `set_leverage` -> `place_order` (real exchange orderId) -> amend/reduce/close on the exchange -> periodic reconciliation against exchange positions. The accounting (analyst ladder, virtual bots, R-ledger) settles from the same price path as live. |
+| **LIVE** | `BLOFIN_BASE_URL=https://openapi.blofin.com` | Same code as DEMO on the live endpoint with the live keys and a brokerId. Real money. |
+
+`DRY_RUN` is no longer a switch: it is derived (`dry_run = mode != LIVE`) and only tags records - `trades.dry_run`, the dashboard badge (PAPER/DEMO/LIVE) and the "Paper/Demo archive" view. PAPER and DEMO trades are both `dry_run=1`; only LIVE trades are `dry_run=0`. If `.env` still has a `DRY_RUN` that disagrees with the derived value the bot logs one warning and ignores it.
+
+The mode is pinned for the life of the process. Editing `BLOFIN_BASE_URL` or `PAPER_MODE` in `.env` while the bot runs logs a "needs restart" warning and changes nothing - the BloFin client, keys and price stream were built for the startup endpoint.
+
+Where DEMO still differs from LIVE: the demo account's fills, fees and funding are what BloFin's demo matching engine reports (thin books on some altcoins), a smaller instrument list, and no brokerId on orders. Run `python preflight.py --live` before going live to see which recent symbols exist on the live endpoint.
+
 ## Switching to live trading
 
-1. Set `BLOFIN_BASE_URL=https://openapi.blofin.com` in `.env`
-2. Set `DRY_RUN=false` in `.env`
+1. Run `python preflight.py --live` (read-only) and wait for `VERDICT: GO`
+2. Set `BLOFIN_BASE_URL=https://openapi.blofin.com` in `.env` (leave `PAPER_MODE` unset/false)
 3. Re-run `run_bot.bat`
 
-Test thoroughly on demo first. The demo endpoint is the default specifically so an accidental start never touches real funds.
+That is the only change. Test thoroughly on DEMO first - the demo endpoint is the default specifically so an accidental start never touches real funds.
 
 ## Signal routing
 

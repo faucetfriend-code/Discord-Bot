@@ -214,6 +214,58 @@ def verify_connected() -> bool:
         return False
 
 
+DISCORD_INBOX_URL = "https://discord.com/channels/@me"
+
+
+def open_discord_tab(url: str = DISCORD_INBOX_URL) -> bool:
+    """Open a NEW Chrome tab at the Discord inbox when the tab is genuinely gone.
+
+    Uses CDP Target.createTarget over the browser-level websocket advertised by
+    /json/version, falling back to the legacy PUT /json/new endpoint. Returns
+    True once a Discord tab is visible again in /json.
+    """
+    ws_url = None
+    try:
+        ver = requests.get(f"{CDP_BASE}/json/version", timeout=5).json()
+        ws_url = ver.get("webSocketDebuggerUrl")
+    except Exception as e:
+        log.warning(f"CDP /json/version unavailable ({e}) - trying /json/new")
+    created = False
+    if ws_url:
+        ws = None
+        try:
+            ws = websocket.create_connection(ws_url, timeout=10)
+            ws.send(json.dumps({
+                "id": 1,
+                "method": "Target.createTarget",
+                "params": {"url": url},
+            }))
+            data = json.loads(ws.recv())
+            created = bool(data.get("result", {}).get("targetId"))
+            if not created:
+                log.warning(f"Target.createTarget returned no targetId: {data}")
+        except Exception as e:
+            log.warning(f"Target.createTarget failed: {e}")
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+    if not created:
+        try:
+            resp = requests.put(f"{CDP_BASE}/json/new?{url}", timeout=5)
+            created = resp.status_code in (200, 201)
+            if not created:
+                log.warning(f"PUT /json/new returned HTTP {resp.status_code}")
+        except Exception as e:
+            log.warning(f"PUT /json/new failed: {e}")
+    if not created:
+        return False
+    time.sleep(4)  # let Discord load before anyone looks for the tab
+    return bool(_get_discord_ws_url())
+
+
 def ensure_discord_open() -> bool:
     """Navigate to Discord if it's not already the active page."""
     try:

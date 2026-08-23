@@ -59,8 +59,13 @@ try:
 except (TypeError, ValueError):
     _log_backup_count = 5
 
+# Root log level from LOG_LEVEL (DEBUG/INFO/WARNING/ERROR), default INFO.
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").strip().upper(), None)
+if not isinstance(_log_level, int):
+    _log_level = logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
@@ -80,6 +85,15 @@ for _h in logging.root.handlers:
     _h.setFormatter(_fmt)
 
 
+# Column order for signals_log.csv. `analyst` is the RESOLVED attribution key;
+# `author` is the raw Discord author string it was resolved from. Keeping both
+# matters: attribution overwrites the author, so without this column the
+# original poster is unrecoverable and matching changes cannot be replayed
+# against real data.
+_SIGNAL_FIELDS = ["ts", "analyst", "author", "raw_text", "symbol", "side",
+                  "entry", "sl", "tp", "parsed", "outcome", "order_id"]
+
+
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
@@ -87,6 +101,7 @@ def init_db():
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT,
             analyst     TEXT,
+            author      TEXT,
             raw_text    TEXT,
             symbol      TEXT,
             side        TEXT,
@@ -98,15 +113,45 @@ def init_db():
             order_id    TEXT
         )
     """)
+    # `author` was added after the table shipped; existing DBs need it grafted
+    # on. Nullable, so historic rows simply carry NULL.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(signals)")}
+    if "author" not in cols:
+        con.execute("ALTER TABLE signals ADD COLUMN author TEXT")
     con.commit()
     con.close()
+    _migrate_signals_header()
 
 
-def log_signal(analyst, raw_text, signal=None, outcome="seen", order_id=None):
+def _migrate_signals_header():
+    """If signals_log.csv predates a column addition, rewrite it in the new
+    layout (missing columns blank) so old and new rows stay aligned."""
+    if not CSV_PATH.exists():
+        return
+    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames == _SIGNAL_FIELDS:
+            return
+        old_rows = list(reader)
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_SIGNAL_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for r in old_rows:
+            writer.writerow({k: r.get(k, "") for k in _SIGNAL_FIELDS})
+
+
+def log_signal(analyst, raw_text, signal=None, outcome="seen", order_id=None,
+               author=None):
     ts = now_local().isoformat()
+    # signal.analyst is the RAW Discord author (signal_parser builds it from
+    # msg["author"]), so it is the correct default whenever the caller has a
+    # signal. Callers without one (chatter, POI watches) pass author=.
+    if author is None:
+        author = getattr(signal, "analyst", "") if signal is not None else ""
     row = {
         "ts": ts,
         "analyst": analyst,
+        "author": author or "",
         "raw_text": raw_text[:500],
         "symbol": signal.symbol if signal else "",
         "side": signal.side if signal else "",
@@ -120,15 +165,15 @@ def log_signal(analyst, raw_text, signal=None, outcome="seen", order_id=None):
 
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        INSERT INTO signals (ts, analyst, raw_text, symbol, side, entry, sl, tp, parsed, outcome, order_id)
-        VALUES (:ts, :analyst, :raw_text, :symbol, :side, :entry, :sl, :tp, :parsed, :outcome, :order_id)
+        INSERT INTO signals (ts, analyst, author, raw_text, symbol, side, entry, sl, tp, parsed, outcome, order_id)
+        VALUES (:ts, :analyst, :author, :raw_text, :symbol, :side, :entry, :sl, :tp, :parsed, :outcome, :order_id)
     """, row)
     con.commit()
     con.close()
 
     write_header = not CSV_PATH.exists()
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(f, fieldnames=_SIGNAL_FIELDS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerow(row)

@@ -1,9 +1,9 @@
 """
-Shadow-log outcome analyzer — turns strategy_shadow.csv from a list of filter
+Shadow-log outcome analyzer - turns strategy_shadow.csv from a list of filter
 opinions into measured results.
 
 For every shadow row it fetches what price ACTUALLY did after the alert
-(Gate.io public 5m candles — keyless, read-only; covers the micro-caps BloFin
+(Gate.io public 5m candles - keyless, read-only; covers the micro-caps BloFin
 demo doesn't list) and simulates the trade under the strategy's own rules:
 
   rsi_extreme : entry at alert/live price, SL -5%, scale-out TPs +5%/+10%,
@@ -27,9 +27,20 @@ would-be win rate & expectancy overall, per filter verdict, confirmation vs
 immediate entry, current vs alternate exits, decision-gate vetoes, and
 repeat-alert buckets.
 
-Usage:  python analyze_shadow.py [--horizon-hours 72] [--csv strategy_shadow.csv]
+MERGE, DON'T CLOBBER: Gate.io only retains ~34 days of 5m candles, so a row
+older than that re-simulates to "no_data" on every run even though its real
+outcome was already measured and recorded on an earlier run. Regeneration
+therefore MERGES into the existing --out file instead of overwriting it: for
+each row, whichever version of its 11 outcome columns is more informative
+(see outcome_rank()) is kept, and rows whose stored outcome is already
+terminal (loss_sl / tp_then_be / win_full) skip re-simulation and the
+network fetch entirely, since a closed trade's outcome can never change.
+Pass --force-resim to go back to the old rebuild-everything behaviour.
 
-Read-only: no orders, no DB writes, no BloFin auth — public market data only.
+Usage:  python analyze_shadow.py [--horizon-hours 72] [--csv strategy_shadow.csv]
+        [--out shadow_outcomes.csv] [--force-resim]
+
+Read-only: no orders, no DB writes, no BloFin auth - public market data only.
 """
 
 import argparse
@@ -37,6 +48,7 @@ import csv
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -49,13 +61,76 @@ load_dotenv()
 GATE_URL = ("https://api.gateio.ws/api/v4/spot/candlesticks"
             "?currency_pair={pair}&interval=5m&from={frm}&to={to}")
 
+# The last 11 columns of the 30-column shadow_outcomes.csv header. Always
+# copied/preserved together as one unit -- they are all derived from the
+# same candle fetch, so a merge must never mix columns from different runs.
+OUTCOME_COLUMNS = [
+    "outcome", "ret_pct", "r_mult", "mfe_pct", "mae_pct", "hours",
+    "confirm_fired", "confirm_outcome", "confirm_r", "alt_outcome", "alt_r",
+]
+
+# Subset of OUTCOME_COLUMNS that are numeric (as opposed to categorical
+# labels like outcome/confirm_fired/confirm_outcome/alt_outcome). Stored
+# rows are re-read from CSV as plain strings; coerce these back to float so
+# a merged-in stored row behaves like a freshly-simulated one downstream
+# (the tuning report's stats() only counts int/float r_mult values).
+NUMERIC_OUTCOME_COLUMNS = {
+    "ret_pct", "r_mult", "mfe_pct", "mae_pct", "hours", "confirm_r", "alt_r",
+}
+
+# Informativeness ladder for the "outcome" column (higher wins). A trade
+# that has hit its stop or a take-profit rung is TERMINAL and can never
+# change on a later run; "open" can still resolve; "no_data" / blank means
+# nothing was learned.
+TERMINAL_OUTCOMES = {"loss_sl", "tp_then_be", "win_full"}
+
 _candle_cache: dict = {}
+
+
+def outcome_rank(outcome) -> int:
+    """Rank an outcome value on the informativeness ladder (higher = better).
+
+    2 = terminal (loss_sl, tp_then_be, win_full)
+    1 = open
+    0 = no_data, no_entry_price, empty/missing
+    """
+    if outcome in TERMINAL_OUTCOMES:
+        return 2
+    if outcome == "open":
+        return 1
+    return 0
+
+
+def load_stored_outcomes(path: str) -> dict:
+    """Load (ts, symbol) -> stored 11-column outcome dict from a previous
+    run's --out file, so regeneration can merge instead of overwrite.
+    Returns {} if the file doesn't exist yet or can't be read."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        rows = list(csv.DictReader(open(path, encoding="utf-8")))
+    except OSError:
+        return {}
+    stored = {}
+    for row in rows:
+        key = (row.get("ts", ""), row.get("symbol", ""))
+        outc = {}
+        for col in OUTCOME_COLUMNS:
+            val = row.get(col) or ""
+            if col in NUMERIC_OUTCOME_COLUMNS and val != "":
+                try:
+                    val = float(val)
+                except ValueError:
+                    val = ""
+            outc[col] = val
+        stored[key] = outc
+    return stored
 
 
 def fetch_candles(symbol: str, start_ts: int, end_ts: int):
     """5m candles [(t, open, high, low, close), ...] from Gate.io public API.
     Returns [] when the pair isn't listed there either. Tries the exact ticker,
-    then with a trailing digit stripped (Discord renames like SKYAI1 → SKYAI)."""
+    then with a trailing digit stripped (Discord renames like SKYAI1 -> SKYAI)."""
     base = symbol.replace("-USDT", "")
     tries = [base]
     if base and base[-1].isdigit():
@@ -84,7 +159,7 @@ def fetch_candles(symbol: str, start_ts: int, end_ts: int):
 
 def simulate(side: str, entry: float, candles: list, sl_pct: float, tp_pcts: list):
     """Walk candles, applying the bot's scale-out engine: equal slice at each TP
-    rung, SL → break-even after the first. Intra-candle ambiguity (SL and a TP
+    rung, SL -> break-even after the first. Intra-candle ambiguity (SL and a TP
     rung both inside one candle) resolves CONSERVATIVELY as the stop.
 
     Returns dict(outcome, ret_pct, r_mult, mfe_pct, mae_pct, hours).
@@ -122,7 +197,7 @@ def simulate(side: str, entry: float, candles: list, sl_pct: float, tp_pcts: lis
                             mfe_pct=mfe * 100, mae_pct=mae * 100, hours=round(hours, 1))
             sl = entry                # ratchet to break-even after the first rung
 
-    # horizon exhausted — mark-to-market the remainder at the last close
+    # horizon exhausted -- mark-to-market the remainder at the last close
     if not candles:
         return dict(outcome="no_data", ret_pct=0, r_mult=0, mfe_pct=0, mae_pct=0, hours=0)
     last = candles[-1][4]
@@ -157,6 +232,10 @@ def main():
     ap.add_argument("--csv", default="strategy_shadow.csv")
     ap.add_argument("--out", default="shadow_outcomes.csv")
     ap.add_argument("--horizon-hours", type=float, default=72.0)
+    ap.add_argument("--force-resim", action="store_true",
+                     help="ignore any stored outcomes and re-simulate every "
+                          "row from scratch (old overwrite-everything "
+                          "behaviour, for a deliberate clean rebuild)")
     args = ap.parse_args()
 
     rsi_sl = float(os.getenv("RSI_SL_PCT", "0.05"))
@@ -195,7 +274,11 @@ def main():
                 if m:
                     r["entry_price"] = m.group("px").replace(",", "")
                     break
-    except (OSError, ImportError):
+    # Best-effort backfill: a malformed ts raises ValueError out of
+    # fromisoformat, and a short/mis-headered row raises KeyError. Neither is
+    # worth aborting the whole run for -- the outcome columns matter, this
+    # cosmetic backfill does not.
+    except (OSError, ImportError, ValueError, KeyError):
         pass
 
     # repeat-alert count: Nth alert for the same symbol within the prior 24h.
@@ -212,8 +295,29 @@ def main():
         else:
             r["repeat_n"] = sum(1 for t in times[sym] if 0 <= (ts - t).total_seconds() <= 86400)
 
+    stored_outcomes = {} if args.force_resim else load_stored_outcomes(args.out)
+    skipped_terminal = 0
+
     out_rows = []
     for r in rows:
+        key = (r["ts"], r["symbol"])
+        stored = stored_outcomes.get(key)
+        stored_rank = outcome_rank(stored["outcome"]) if stored else -1
+
+        if stored is not None and stored_rank == 2:
+            # Closed trade -- outcome can never change. Skip the network
+            # fetch and re-simulation entirely and carry the stored result
+            # forward untouched (never regress a real outcome to no_data
+            # once Gate.io's ~34-day candle window ages the row out).
+            out = dict(r)
+            out.update(stored)
+            out_rows.append(out)
+            skipped_terminal += 1
+            print(f"  {r['ts'][:16]} {r['source'][:6]:6} {r['symbol']:13} {r['side']:4} "
+                  f"-> {out['outcome']:12} R={out['r_mult'] if out['r_mult'] != '' else '-'} "
+                  f"(stored)")
+            continue
+
         ts = datetime.fromisoformat(r["ts"])
         start = int(ts.timestamp())
         end = int(min(datetime.now(ts.tzinfo), ts + timedelta(hours=args.horizon_hours)).timestamp())
@@ -238,21 +342,43 @@ def main():
             else:
                 res = {"outcome": "no_data", "ret_pct": "", "r_mult": "", "mfe_pct": "",
                        "mae_pct": "", "hours": ""}
+
+        fresh = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in res.items()}
+        fresh["confirm_fired"] = cf_fired
+        fresh["confirm_outcome"] = cf.get("outcome", "")
+        fresh["confirm_r"] = round(cf["r_mult"], 3) if cf.get("r_mult") is not None and cf else ""
+        fresh["alt_outcome"] = alt.get("outcome", "")
+        fresh["alt_r"] = round(alt["r_mult"], 3) if alt and alt.get("r_mult") is not None else ""
+
+        # MERGE, don't clobber: keep whichever of stored/fresh is more
+        # informative, always as the full 11-column unit (never mix
+        # columns from different simulation runs into one row).
+        if stored is not None and outcome_rank(fresh["outcome"]) < stored_rank:
+            chosen = stored
+        else:
+            chosen = fresh
+
         out = dict(r)
-        out.update({k: (round(v, 3) if isinstance(v, float) else v) for k, v in res.items()})
-        out["confirm_fired"] = cf_fired
-        out["confirm_outcome"] = cf.get("outcome", "")
-        out["confirm_r"] = round(cf["r_mult"], 3) if cf.get("r_mult") is not None and cf else ""
-        out["alt_outcome"] = alt.get("outcome", "")
-        out["alt_r"] = round(alt["r_mult"], 3) if alt and alt.get("r_mult") is not None else ""
+        out.update(chosen)
         out_rows.append(out)
         print(f"  {r['ts'][:16]} {r['source'][:6]:6} {r['symbol']:13} {r['side']:4} "
-              f"-> {out['outcome']:12} R={out['r_mult'] if out['r_mult']!='' else '—'}")
+              f"-> {out['outcome']:12} R={out['r_mult'] if out['r_mult'] != '' else '-'}")
+
+    if skipped_terminal:
+        print(f"\nskipped re-simulation for {skipped_terminal} row(s) with a "
+              f"stored terminal outcome")
 
     fields = list(out_rows[0].keys())
-    with open(args.out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader(); w.writerows(out_rows)
+    out_dir = os.path.dirname(os.path.abspath(args.out)) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader(); w.writerows(out_rows)
+        os.replace(tmp_path, args.out)
+    except OSError:
+        os.remove(tmp_path)
+        raise
     print(f"\nwrote {args.out} ({len(out_rows)} rows)\n")
 
     # ---- tuning report -------------------------------------------------

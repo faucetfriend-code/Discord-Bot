@@ -28,6 +28,7 @@ from flask import (Flask, Response, jsonify, redirect, request,
                    send_from_directory)
 
 import accounts  # virtual bot/user paper accounts
+import live_epoch  # paper -> live cutover (epoch + start balance)
 
 DB_PATH    = Path(__file__).parent / "bot.db"
 LOG_PATH   = Path(__file__).parent / "bot.log"
@@ -126,7 +127,7 @@ def api_oracle_positions():
     guard = _require_oracle_token()
     if guard:
         return guard
-    return _oracle_json({"data": _read_positions()})
+    return _oracle_json({"data": _read_positions(_view_arg(default=None))})
 
 
 @app.route("/api/oracle/trades")
@@ -136,7 +137,9 @@ def api_oracle_trades():
     if guard:
         return guard
     limit = min(int(request.args.get("limit", 100) or 100), 500)
-    return _oracle_json({"data": _read_trades(limit), "equity_curve": _read_equity_curve()})
+    view = _view_arg(default=None)
+    return _oracle_json({"data": _read_trades(limit, view=view),
+                         "equity_curve": _read_equity_curve(view=view)})
 
 
 @app.route("/api/oracle/analyst-stats")
@@ -197,8 +200,141 @@ def _read_log_tail() -> str:
         return "(log unavailable)"
 
 
-def _read_positions() -> list[dict]:
-    """Open positions with their scale-out progress and mark-to-market PnL."""
+# ---------------------------------------------------------------------------
+# Live epoch: "live" view = dry_run=0 trades closed at/after the epoch and
+# exchange-backed positions; "paper" view = everything else (the archive).
+# A view of None means "no filter" (legacy behaviour for the Oracle feeds).
+# ---------------------------------------------------------------------------
+
+def _view_arg(default: str | None = "live") -> str | None:
+    """Resolve ?view=live|paper; `default` applies when the param is absent."""
+    raw = request.args.get("view")
+    if raw is None or not raw.strip():
+        return default
+    return live_epoch.normalize_view(raw)
+
+
+def _epoch_info() -> dict:
+    """Epoch timestamp + live start balance (env first, then bot.db meta)."""
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        epoch = live_epoch.get_epoch(con)
+        start = live_epoch.get_start_balance(con)
+    except Exception:
+        epoch, start = live_epoch.get_epoch(None), live_epoch.get_start_balance(None)
+    finally:
+        if con is not None:
+            con.close()
+    return {
+        "epoch": epoch,
+        "epoch_iso": epoch.isoformat() if epoch else None,
+        "start_balance": start,
+    }
+
+
+def _read_all_trades() -> list[dict]:
+    """Every closed trade (oldest first) with the columns the views filter on."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT id, closed_at, symbol, side, analyst, entry, exit_price, size, "
+            "leverage, soft_stop, duration_s, reason, won, net_pnl, fees, funding, "
+            "dry_run FROM trades ORDER BY id ASC"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return []
+    keys = ("id", "closed_at", "symbol", "side", "analyst", "entry", "exit_price",
+            "size", "leverage", "soft_stop", "duration_s", "reason", "won",
+            "net_pnl", "fees", "funding", "dry_run")
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def _trades_for_view(view: str | None) -> list[dict]:
+    """Closed trades filtered to a view (oldest first); None = all trades."""
+    rows = _read_all_trades()
+    if view is None:
+        return rows
+    return live_epoch.split_trades(rows, _epoch_info()["epoch"], view)
+
+
+def _read_ledger_r(trade_ids: set[int]) -> dict[int, float]:
+    """trade_id -> R multiple from bot_ledger for the given trades."""
+    if not trade_ids:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute(
+            "SELECT trade_id, r_mult FROM bot_ledger WHERE trade_id IS NOT NULL"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    return {r[0]: float(r[1] or 0.0) for r in rows if r[0] in trade_ids}
+
+
+def _read_r_curve(view: str | None) -> list[float]:
+    """Cumulative R (bot_ledger r_mult) over the view's trades, oldest first."""
+    trades = _trades_for_view(view)
+    r_by_id = _read_ledger_r({t["id"] for t in trades})
+    cum, out = 0.0, []
+    for t in trades:
+        cum += r_by_id.get(t["id"], 0.0)
+        out.append(round(cum, 3))
+    return out
+
+
+def _read_ladder_leverage() -> dict[str, int]:
+    """analyst -> current leverage from the analyst_stats ladder."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        rows = con.execute("SELECT analyst, leverage FROM analyst_stats").fetchall()
+        con.close()
+        return {r[0]: r[1] for r in rows}
+    except Exception:
+        return {}
+
+
+def _read_source_stats(view: str) -> dict[str, dict]:
+    """Per-source stats computed from the view's trades (not analyst_stats):
+    n, wins, losses, net PnL, cumulative R, plus the current ladder leverage."""
+    trades = _trades_for_view(view)
+    r_by_id = _read_ledger_r({t["id"] for t in trades})
+    lev = _read_ladder_leverage()
+    start_lev = int(os.getenv("LEVERAGE_START", "75"))
+    out: dict[str, dict] = {}
+    for t in trades:
+        name = t["analyst"] or ""
+        s = out.setdefault(name, {"analyst": name, "wins": 0, "losses": 0,
+                                  "total": 0, "realized_pnl": 0.0, "r": 0.0,
+                                  "leverage": lev.get(name, start_lev)})
+        s["total"] += 1
+        if t["won"]:
+            s["wins"] += 1
+        else:
+            s["losses"] += 1
+        s["realized_pnl"] = round(s["realized_pnl"] + float(t["net_pnl"] or 0.0), 4)
+        s["r"] = round(s["r"] + r_by_id.get(t["id"], 0.0), 3)
+    for s in out.values():
+        s["win_rate"] = f"{(s['wins'] / s['total'] * 100):.0f}%" if s["total"] else "-"
+    return out
+
+
+def _read_open_counts(view: str | None = None) -> dict[str, int]:
+    """Open position count per source, so a source holding live exposure is never
+    hidden by the zero-closed-trades filter."""
+    counts: dict[str, int] = {}
+    for p in _read_positions(view):
+        counts[p["analyst"] or ""] = counts.get(p["analyst"] or "", 0) + 1
+    return counts
+
+
+def _read_positions(view: str | None = None) -> list[dict]:
+    """Open positions with their scale-out progress and mark-to-market PnL.
+    view="live" keeps exchange-backed orders only, "paper" the DRYRUN- ones.
+    While the bot runs in PAPER/DEMO (state dry_run=1) every open position is
+    non-live - DEMO orders carry real demo orderIds but are not real money."""
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         rows = con.execute(
@@ -209,6 +345,9 @@ def _read_positions() -> list[dict]:
         con.close()
         out = []
         for r in rows:
+            is_live = live_epoch.is_live_position(r[6]) and not _state.get("dry_run", False)
+            if view is not None and is_live != (view == "live"):
+                continue
             try:
                 tps = json.loads(r[9]) if r[9] else []
             except (ValueError, TypeError):
@@ -224,37 +363,28 @@ def _read_positions() -> list[dict]:
         return []
 
 
-def _read_trades(limit: int = 40) -> list[dict]:
-    """Most recent closed trades for the blotter, newest first."""
-    try:
-        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        rows = con.execute(
-            "SELECT closed_at, symbol, side, analyst, entry, exit_price, size, "
-            "leverage, soft_stop, duration_s, reason, won, net_pnl, fees, funding "
-            "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        con.close()
-        keys = ("closed_at", "symbol", "side", "analyst", "entry", "exit_price", "size",
-                "leverage", "soft_stop", "duration_s", "reason", "won", "net_pnl",
-                "fees", "funding")
-        return [dict(zip(keys, r)) for r in rows]
-    except Exception:
-        return []
+def _read_trades(limit: int = 40, view: str | None = None) -> list[dict]:
+    """Most recent closed trades for the blotter, newest first.
+    view=None returns every trade (legacy); "live"/"paper" filters by epoch."""
+    rows = _trades_for_view(view)
+    return list(reversed(rows))[:limit]
 
 
-def _read_equity_curve() -> list[float]:
-    """Running cumulative net PnL over all closed trades (oldest→newest)."""
-    try:
-        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        rows = con.execute("SELECT net_pnl FROM trades ORDER BY id ASC").fetchall()
-        con.close()
-        cum, out = 0.0, []
-        for (net,) in rows:
-            cum += (net or 0.0)
+def _read_equity_curve(view: str | None = None) -> list[float]:
+    """Running cumulative net PnL over the view's closed trades (oldest first).
+    The live curve is anchored at the live start balance (first point) when
+    one is configured; paper/None curves start at 0 as before."""
+    trades = _trades_for_view(view)
+    cum, out = 0.0, []
+    if view == "live":
+        start = _epoch_info()["start_balance"]
+        if start is not None:
+            cum = float(start)
             out.append(round(cum, 2))
-        return out
-    except Exception:
-        return []
+    for t in trades:
+        cum += float(t["net_pnl"] or 0.0)
+        out.append(round(cum, 2))
+    return out
 
 
 def _read_pending() -> list[dict]:
@@ -262,9 +392,26 @@ def _read_pending() -> list[dict]:
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         row = con.execute("SELECT v FROM strategy_state WHERE k='pending_entries'").fetchone()
-        con.close()
         items = json.loads(row[0]) if row and row[0] else []
-        return items if isinstance(items, list) else []
+        items = items if isinstance(items, list) else []
+        # Limits resting on the exchange (DEMO/LIVE) render as pending rows too:
+        # they are not positions until they fill, so they never reach the
+        # positions table, but the operator must see them.
+        row = con.execute("SELECT v FROM strategy_state WHERE k='resting_orders'").fetchone()
+        con.close()
+        resting = json.loads(row[0]) if row and row[0] else []
+        for r in resting if isinstance(resting, list) else []:
+            filled = float(r.get("filled_size") or 0)
+            cond = "resting on exchange"
+            if filled > 0:
+                cond += f" ({filled}/{r.get('size')} filled)"
+            items.append({
+                "symbol": r.get("symbol"), "side": r.get("side"),
+                "analyst_key": r.get("analyst_key"), "source": r.get("source"),
+                "condition": cond, "ref_price": r.get("entry"),
+                "created_at": r.get("placed_at"), "order_id": r.get("order_id"),
+            })
+        return items
     except Exception:
         return []
 
@@ -308,8 +455,33 @@ def _read_strategy_state() -> dict:
         return {}
 
 
-def _read_analyst_stats() -> list[dict]:
-    """Per-analyst/strategy leverage, win/loss tally and realized PnL, best PnL first."""
+def _read_analyst_stats(view: str | None = None) -> list[dict]:
+    """Per-analyst/strategy leverage, win/loss tally and realized PnL, best PnL first.
+
+    view="live" computes the tally from live trades since the epoch (leverage
+    still comes from the analyst_stats ladder); None/"paper" reads the stored
+    analyst_stats rows, which are the paper-era totals.
+
+    Sources with no activity at all (no closed trades and no open position) are
+    suppressed - an empty row is pure noise. Nothing is hidden by name: a source
+    that has traded always shows, so the display can never conceal real activity.
+    """
+    open_counts = _read_open_counts(view)
+    if view == "live":
+        stats = _read_source_stats("live")
+        ladder = _read_ladder_leverage()
+        start_lev = int(os.getenv("LEVERAGE_START", "75"))
+        for name in open_counts:
+            stats.setdefault(name, {"analyst": name, "wins": 0, "losses": 0, "total": 0,
+                                    "realized_pnl": 0.0, "r": 0.0, "win_rate": "-",
+                                    "leverage": ladder.get(name, start_lev)})
+        out = []
+        for s in stats.values():
+            s = dict(s)
+            s["open"] = open_counts.get(s["analyst"], 0)
+            out.append(s)
+        out.sort(key=lambda a: (a["realized_pnl"], a["leverage"]), reverse=True)
+        return out
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         cols = [c[1] for c in con.execute("PRAGMA table_info(analyst_stats)").fetchall()]
@@ -323,26 +495,31 @@ def _read_analyst_stats() -> list[dict]:
         for r in rows:
             wins, losses = r[2] or 0, r[3] or 0
             total = wins + losses
+            open_n = open_counts.get(r[0], 0)
+            if not total and not open_n:
+                continue
             wr = f"{(wins / total * 100):.0f}%" if total else "—"
             out.append({"analyst": r[0], "leverage": r[1], "wins": wins,
                         "losses": losses, "total": total, "win_rate": wr,
-                        "realized_pnl": r[4] or 0})
+                        "realized_pnl": r[4] or 0, "open": open_n})
         return out
     except Exception:
         return []
 
 
-def _read_roster() -> list[dict]:
+def _read_roster(view: str | None = None) -> list[dict]:
     """
-    One card per signal source: every whitelisted analyst PLUS the strategy feeds
-    (RSI Extreme, OracleAlgo). Merges current stats; sources with no trades yet
-    still appear at their starting leverage.
+    One card per signal source: the strategy feeds (RSI Extreme, OracleAlgo) PLUS
+    every whitelisted analyst that has actually traded. Analysts with no closed
+    trades and no open position are dropped; the strategy feeds always show,
+    even through a quiet stretch.
     """
     raw = os.getenv("ANALYST_WHITELIST", "")
     analysts = [n.strip() for n in raw.split(",") if n.strip()]
     strategies = ["RSI Extreme", "OracleAlgo"]
     start_lev = int(os.getenv("LEVERAGE_START", "75"))
-    stats = {a["analyst"]: a for a in _read_analyst_stats()}
+    stats = {a["analyst"]: a for a in _read_analyst_stats(view)}
+    open_counts = _read_open_counts(view)
 
     def card(name, kind):
         s = stats.get(name, {})
@@ -350,9 +527,11 @@ def _read_roster() -> list[dict]:
         total = wins + losses
         return {
             "name": name, "kind": kind, "closed": total, "wins": wins, "losses": losses,
+            "r": s.get("r"),
             "win_rate": f"{(wins / total * 100):.0f}%" if total else "—",
             "leverage": s.get("leverage", start_lev),
             "realized_pnl": s.get("realized_pnl", 0),
+            "open": open_counts.get(name, 0),
         }
 
     roster = [card(n, "strategy") for n in strategies] + [card(n, "analyst") for n in analysts]
@@ -361,6 +540,9 @@ def _read_roster() -> list[dict]:
     for name in stats:
         if name not in known:
             roster.append(card(name, "other"))
+    # drop dead weight: no closed trades and nothing live. Strategies are exempt.
+    roster = [c for c in roster
+              if c["kind"] == "strategy" or c["closed"] or c["open"]]
     # most active first, then by PnL
     roster.sort(key=lambda c: (c["closed"], c["realized_pnl"]), reverse=True)
     return roster
@@ -408,14 +590,21 @@ def _elapsed(iso: str | None) -> str:
 
 @app.route("/api/status")
 def api_status():
-    """JSON snapshot of process state, open positions, analyst stats and recent signals."""
+    """JSON snapshot of process state, open positions, analyst stats and recent signals.
+    ?view=live (default) restricts to the live book since the epoch; ?view=paper
+    returns the paper archive. Extra keys: view, epoch, r_curve."""
+    view = _view_arg()
+    info = _epoch_info()
     return jsonify({
         "state": _state,
-        "positions": _read_positions(),
-        "analyst_stats": _read_analyst_stats(),
+        "view": view,
+        "epoch": {"start": info["epoch_iso"], "start_balance": info["start_balance"]},
+        "positions": _read_positions(view),
+        "analyst_stats": _read_analyst_stats(view),
         "recent_signals": _read_signals(20),
-        "trades": _read_trades(40),
-        "equity_curve": _read_equity_curve(),
+        "trades": _read_trades(40, view=view),
+        "equity_curve": _read_equity_curve(view=view),
+        "r_curve": _read_r_curve(view),
         "pending": _read_pending(),
         "shadow": _read_shadow(30),
     })
@@ -774,13 +963,16 @@ def index():
     """Render the full dashboard page (self-contained HTML + CSS, no external assets)."""
     s        = _state
     show_all = request.args.get("all") == "1"
-    positions = _read_positions()
+    view     = _view_arg() or "live"
+    info     = _epoch_info()
+    positions = _read_positions(view)
     signals  = _read_signals(40, show_all=show_all)
-    analysts = _read_analyst_stats()
-    roster   = _read_roster()
+    analysts = _read_analyst_stats(view)
+    roster   = _read_roster(view)
     watches  = _read_watches()
     state    = _read_strategy_state()
-    trades   = _read_trades(40)
+    trades   = _read_trades(40, view=view)
+    r_curve  = _read_r_curve(view)
     # Live BTC 4H ADX regime — same cache as the bot; cache hit = free
     try:
         import market_regime as mr
@@ -791,18 +983,44 @@ def index():
                           "#f85149" if _btc_htf_dir == "bear" else "#8b949e")
     except Exception:
         _btc_adx_label, _btc_adx_color = "—", "#8b949e"
-    equity   = _read_equity_curve()
+    equity   = _read_equity_curve(view=view)
     pending  = _read_pending()
     shadow   = _read_shadow(30)
     log_tail = _read_log_tail()
 
-    mode_badge  = '<span class="badge dry">DRY RUN</span>' if s.get("dry_run") else '<span class="badge live">LIVE</span>'
+    exec_label  = s.get("exec_mode") or ("DRY RUN" if s.get("dry_run") else "LIVE")
+    mode_badge  = (f'<span class="badge dry">{exec_label}</span>' if s.get("dry_run")
+                   else '<span class="badge live">LIVE</span>')
     chrome_icon = "✅" if s.get("chrome_connected") else "❌"
     discord_icon= "✅" if s.get("discord_tab") else "❌"
     running     = s.get("poll_count", 0) > 0
 
-    # Aggregate PnL across strategies
+    # Aggregate PnL across strategies (live view: live trades only)
     total_realized = sum(a.get("realized_pnl", 0) for a in analysts)
+    total_r = r_curve[-1] if r_curve else 0.0
+    n_view_trades = len(_trades_for_view(view))
+
+    def _qs(**overrides):
+        """Rebuild the query string keeping the other toggle intact."""
+        params = {"view": view, "all": "1" if show_all else ""}
+        params.update(overrides)
+        return "?" + "&".join(f"{k}={v}" for k, v in params.items() if v)
+
+    if info["epoch"] is not None:
+        ep_txt = info["epoch"].strftime("%Y-%m-%d %H:%M")
+        bal_txt = (f", start balance ${info['start_balance']:,.2f}"
+                   if info["start_balance"] is not None else "")
+        banner_txt = f"Live since {ep_txt}{bal_txt}"
+    else:
+        banner_txt = "No live epoch set (LIVE_EPOCH_START / tools/set_live_epoch.py)"
+    live_cls = "view-on" if view == "live" else ""
+    paper_cls = "view-on" if view == "paper" else ""
+    view_bar = (
+        f'<div class="epoch-bar"><span class="epoch-txt">{banner_txt}</span>'
+        f'<span class="view-toggle"><a class="{live_cls}" href="{_qs(view="live")}">Live (since epoch)</a>'
+        f'<a class="{paper_cls}" href="{_qs(view="paper")}">Paper/Demo archive</a></span>'
+        f'<span class="small">{n_view_trades} closed trade{"" if n_view_trades == 1 else "s"} in this view</span></div>'
+    )
     total_unreal = sum(p.get("unrealized_pnl", 0) for p in positions)
 
     def _pnl_html(v):
@@ -813,15 +1031,22 @@ def index():
         tag = ('<span class="tcard-tag strat">SIGNAL</span>' if c["kind"] == "strategy"
                else '<span class="tcard-tag">ANALYST</span>')
         pnl_cls = "buy" if c["realized_pnl"] >= 0 else "sell"
+        # A card with 0 closed trades only survives the roster filter because it
+        # holds live exposure - say so, or it reads as an empty card.
+        open_n = c.get("open", 0)
+        closed_txt = f"{c['closed']} closed trade{'' if c['closed'] == 1 else 's'}"
+        if open_n:
+            closed_txt += f" - {open_n} open"
         return f"""<div class="tcard">
           <div class="tcard-name">{c['name']} {tag}</div>
-          <div class="tcard-closed">{c['closed']} closed trade{'' if c['closed']==1 else 's'}</div>
+          <div class="tcard-closed">{closed_txt}</div>
           <div class="tcard-stats">
             <span title="win rate">{c['win_rate']}</span>
             <span class="sep">·</span>
             <span title="leverage">{c['leverage']}x</span>
             <span class="sep">·</span>
             <span class="{pnl_cls}" title="realized PnL">${c['realized_pnl']:+,.2f}</span>
+            {f'<span class="sep">&middot;</span><span title="cumulative R">{c["r"]:+.2f}R</span>' if c.get("r") is not None else ""}
           </div>
         </div>"""
 
@@ -971,6 +1196,9 @@ def index():
 
     def equity_svg():
         if len(equity) < 2:
+            if view == "live" and info["start_balance"] is not None:
+                return (f'<div class="small" style="padding:14px;">Equity '
+                        f'<span class="buy">${info["start_balance"]:,.2f}</span> - no live trades closed yet.</div>')
             return '<div class="small" style="padding:14px;">Need at least 2 closed trades to chart.</div>'
         w, h, pad = 720, 120, 8
         lo, hi = min(equity), max(equity)
@@ -982,16 +1210,22 @@ def index():
             y = h - pad - (v - lo) / rng * (h - 2 * pad)
             pts.append(f"{x:.1f},{y:.1f}")
         last = equity[-1]
-        colour = "#3fb950" if last >= 0 else "#f85149"
-        zero_y = h - pad - (0 - lo) / rng * (h - 2 * pad) if lo <= 0 <= hi else None
+        base = equity[0] if (view == "live" and info["start_balance"] is not None) else 0.0
+        colour = "#3fb950" if last >= base else "#f85149"
+        zero_y = h - pad - (base - lo) / rng * (h - 2 * pad) if lo <= base <= hi else None
         zero_line = (f'<line x1="{pad}" y1="{zero_y:.1f}" x2="{w-pad}" y2="{zero_y:.1f}" '
                      'stroke="#30363d" stroke-dasharray="3,3"/>') if zero_y is not None else ""
+        if base:
+            foot = (f'Equity: <span class="{"buy" if last>=base else "sell"}">${last:,.2f}</span> '
+                    f'(net <span class="{"buy" if last>=base else "sell"}">${last-base:+,.2f}</span>, '
+                    f'{total_r:+.2f}R) over {n-1} live trades from ${base:,.2f}')
+        else:
+            foot = (f'Cumulative net PnL: <span class="{"buy" if last>=0 else "sell"}">${last:+,.2f}</span> '
+                    f'({total_r:+.2f}R) over {n} trades')
         return (f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" '
                 f'style="width:100%;height:{h}px;">{zero_line}'
                 f'<polyline fill="none" stroke="{colour}" stroke-width="2" points="{" ".join(pts)}"/>'
-                f'</svg><div class="small" style="padding:0 14px 12px;">Cumulative net PnL: '
-                f'<span class="{"buy" if last>=0 else "sell"}">${last:+,.2f}</span> '
-                f'over {n} trades</div>')
+                f'</svg><div class="small" style="padding:0 14px 12px;">{foot}</div>')
 
     def watch_rows():
         if not watches:
@@ -1086,6 +1320,10 @@ def index():
     .tcard-stats .sep {{ color: #6e7681; }}
     .tcard-tag {{ font-size: 9px; font-weight: 700; letter-spacing: .5px; padding: 1px 5px; border-radius: 6px; background: #21262d; color: #8b949e; }}
     .tcard-tag.strat {{ background: #1f2d3d; color: #58a6ff; }}
+    .epoch-bar {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 18px; display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }}
+    .epoch-txt {{ color: #f0f6fc; font-weight: 600; }}
+    .view-toggle a {{ padding: 3px 10px; border: 1px solid #30363d; border-radius: 12px; font-size: 12px; text-decoration: none; color: #8b949e; margin-right: 6px; }}
+    .view-toggle a.view-on {{ background: #238636; border-color: #238636; color: #fff; }}
     .status-bar {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 18px; display: flex; gap: 28px; flex-wrap: wrap; }}
     .stat {{ display: flex; flex-direction: column; gap: 2px; }}
     .stat .label {{ font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; }}
@@ -1129,6 +1367,8 @@ def index():
 
   <div class="container">
 
+    {view_bar}
+
     {roster_rows()}
 
     <div class="status-bar">
@@ -1140,7 +1380,8 @@ def index():
       <div class="stat"><span class="label">Balance</span><span class="value">{f"${s['balance']:,.2f}" if s.get('balance') is not None else '—'}</span></div>
       <div class="stat"><span class="label">Equity</span><span class="value">{f"${s['equity']:,.2f}" if s.get('equity') is not None else '—'}</span></div>
       <div class="stat"><span class="label">Free Margin</span><span class="value">{f"${s['free_margin']:,.2f}" if s.get('free_margin') is not None else '—'}</span></div>
-      <div class="stat"><span class="label">Realized PnL</span><span class="value">{_pnl_html(total_realized)}</span></div>
+      <div class="stat"><span class="label">Realized PnL ({view})</span><span class="value">{_pnl_html(total_realized)}</span></div>
+      <div class="stat"><span class="label">Cum. R ({view})</span><span class="value">{total_r:+.2f}R</span></div>
       <div class="stat"><span class="label">Unrealized PnL</span><span class="value">{_pnl_html(total_unreal)}</span></div>
     </div>
 
@@ -1159,7 +1400,7 @@ def index():
     </div>
 
     <div class="card">
-      <div class="card-title">Open Positions ({len(positions)})</div>
+      <div class="card-title">Open Positions ({len(positions)}) - {view}</div>
       <table>
         <thead><tr><th>Symbol / Strategy</th><th>Side</th><th>Entry</th><th>SL</th><th>TPs</th><th>Size</th><th>Last</th><th>Unreal. PnL</th><th>Progress</th></tr></thead>
         <tbody>{pos_rows()}</tbody>
@@ -1167,12 +1408,12 @@ def index():
     </div>
 
     <div class="card">
-      <div class="card-title">Equity Curve — Cumulative Net PnL</div>
+      <div class="card-title">Equity Curve - {"live book since epoch" if view == "live" else "paper archive, cumulative net PnL"}</div>
       {equity_svg()}
     </div>
 
     <div class="card">
-      <div class="card-title">Closed Trades ({len(trades)})</div>
+      <div class="card-title">Closed Trades ({len(trades)} of {n_view_trades}) - {view}</div>
       <table>
         <thead><tr><th>Closed</th><th>Symbol / Source</th><th>Side</th><th>Entry → Exit</th><th>Held</th><th>Reason</th><th>W/L</th><th>Lev</th><th>Net&nbsp;PnL</th></tr></thead>
         <tbody>{trade_rows()}</tbody>
@@ -1196,7 +1437,7 @@ def index():
     </div>
 
     <div class="card">
-      <div class="card-title">Analyst &amp; Strategy Performance ({len(analysts)})</div>
+      <div class="card-title">Analyst &amp; Strategy Performance ({len(analysts)}) - {view}</div>
       <table>
         <thead><tr><th>Analyst / Strategy</th><th>Leverage (50–125x)</th><th>Wins</th><th>Losses</th><th>Win&nbsp;Rate</th><th>Realized&nbsp;PnL</th></tr></thead>
         <tbody>{analyst_rows()}</tbody>
@@ -1212,7 +1453,7 @@ def index():
     </div>
 
     <div class="card">
-      <div class="card-title">Recent Signals (last 40){' — all' if show_all else ''} &nbsp;<a href="{'?' if show_all else '?all=1'}" class="small">[{'hide chatter' if show_all else 'show all'}]</a></div>
+      <div class="card-title">Recent Signals (last 40){' — all' if show_all else ''} &nbsp;<a href="{_qs(all="" if show_all else "1")}" class="small">[{'hide chatter' if show_all else 'show all'}]</a></div>
       <table>
         <thead><tr><th>Time</th><th>Analyst</th><th>Symbol</th><th>Side</th><th>Outcome</th><th>Message</th></tr></thead>
         <tbody>{sig_rows()}</tbody>
